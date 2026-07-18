@@ -101,6 +101,7 @@ class PreferenceInterpreter(Protocol):
         snapshot: PreferenceSnapshot,
         *,
         local_timestamp: str,
+        language: str = "en",
     ) -> PreferenceProposal: ...
 
     async def close(self) -> None: ...

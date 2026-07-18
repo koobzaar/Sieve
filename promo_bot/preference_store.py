@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS telegram_reply_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
     text TEXT NOT NULL,
+    parse_mode TEXT,
     reply_markup_json TEXT,
     callback_query_id TEXT,
     created_at REAL NOT NULL,
@@ -133,6 +134,7 @@ class OutboxReply:
     text: str
     reply_markup: Mapping[str, Any] | None = None
     callback_query_id: str | None = None
+    parse_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +142,7 @@ class OutboxMessage:
     id: int
     chat_id: int
     text: str
+    parse_mode: str | None
     reply_markup: dict[str, Any] | None
     callback_query_id: str | None
     attempts: int
@@ -231,6 +234,16 @@ class SQLitePreferenceStore:
             self._lock = state._lock
         with self._lock:
             self._connection.executescript(PREFERENCE_SCHEMA)
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(telegram_reply_outbox)"
+                )
+            }
+            if "parse_mode" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE telegram_reply_outbox ADD COLUMN parse_mode TEXT"
+                )
 
     def attach_provider(self, provider: AtomicPreferenceProvider) -> None:
         self.provider = provider
@@ -433,10 +446,12 @@ class SQLitePreferenceStore:
             raise PreferenceStoreError("outbox reply text cannot be empty")
         self._connection.execute(
             "INSERT INTO telegram_reply_outbox("
-            "chat_id,text,reply_markup_json,callback_query_id,created_at) VALUES(?,?,?,?,?)",
+            "chat_id,text,parse_mode,reply_markup_json,callback_query_id,created_at) "
+            "VALUES(?,?,?,?,?,?)",
             (
                 reply.chat_id,
                 text[:4096],
+                reply.parse_mode,
                 _json(reply.reply_markup) if reply.reply_markup is not None else None,
                 reply.callback_query_id,
                 self.clock(),
@@ -897,6 +912,43 @@ class SQLitePreferenceStore:
             ).fetchone()
             return int(row[0]) if row else 0
 
+    @staticmethod
+    def _normalize_ui_language(value: str | None) -> str:
+        normalized = str(value or "").strip().replace("_", "-").casefold()
+        return "pt-BR" if normalized == "pt-br" or normalized.startswith("pt") else "en"
+
+    def ui_language(self, actor_id: int) -> str:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM preference_meta WHERE name=?",
+                (f"ui_language:{actor_id}",),
+            ).fetchone()
+        return self._normalize_ui_language(str(row[0]) if row else None)
+
+    def ensure_ui_language(self, actor_id: int, telegram_language: str | None) -> str:
+        key = f"ui_language:{actor_id}"
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM preference_meta WHERE name=?", (key,)
+            ).fetchone()
+            if row is not None:
+                return self._normalize_ui_language(str(row[0]))
+            language = self._normalize_ui_language(telegram_language)
+            self._connection.execute(
+                "INSERT INTO preference_meta(name,value) VALUES(?,?)", (key, language)
+            )
+            return language
+
+    def set_ui_language(self, actor_id: int, language: str) -> str:
+        normalized = self._normalize_ui_language(language)
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO preference_meta(name,value) VALUES(?,?) "
+                "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                (f"ui_language:{actor_id}", normalized),
+            )
+        return normalized
+
     def rate_limit_available(
         self,
         actor_id: int,
@@ -946,7 +998,7 @@ class SQLitePreferenceStore:
     def next_outbox(self, limit: int = 20) -> list[OutboxMessage]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id,chat_id,text,reply_markup_json,callback_query_id,attempts "
+                "SELECT id,chat_id,text,parse_mode,reply_markup_json,callback_query_id,attempts "
                 "FROM telegram_reply_outbox ORDER BY id LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -955,6 +1007,7 @@ class SQLitePreferenceStore:
                 id=int(row["id"]),
                 chat_id=int(row["chat_id"]),
                 text=str(row["text"]),
+                parse_mode=(str(row["parse_mode"]) if row["parse_mode"] else None),
                 reply_markup=(
                     json.loads(row["reply_markup_json"])
                     if row["reply_markup_json"] is not None

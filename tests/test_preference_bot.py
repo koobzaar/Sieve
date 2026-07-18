@@ -7,6 +7,7 @@ import pytest
 
 from promo_bot.preference_bot import (
     BOT_COMMANDS,
+    BOT_COMMANDS_PT_BR,
     PreferenceCommandProcessor,
     TelegramBotAPI,
     TelegramPreferenceBot,
@@ -30,8 +31,8 @@ class FakeInterpreter:
         self.summary = summary
         self.calls = []
 
-    async def interpret(self, message, snapshot, *, local_timestamp):
-        self.calls.append((message, snapshot.revision, local_timestamp))
+    async def interpret(self, message, snapshot, *, local_timestamp, language="en"):
+        self.calls.append((message, snapshot.revision, local_timestamp, language))
         return PreferenceProposal(
             self.intent,
             snapshot.revision,
@@ -54,14 +55,14 @@ class FakeAPI:
     async def get_webhook_info(self):
         return {"url": self.webhook_url}
 
-    async def send_message(self, chat_id, text, *, reply_markup=None):
-        self.sent.append((chat_id, text, reply_markup))
+    async def send_message(self, chat_id, text, *, reply_markup=None, parse_mode=None):
+        self.sent.append((chat_id, text, reply_markup, parse_mode))
 
     async def answer_callback_query(self, callback_query_id):
         self.answered.append(callback_query_id)
 
-    async def set_my_commands(self, commands, *, chat_id=None):
-        self.commands.append((commands, chat_id))
+    async def set_my_commands(self, commands, *, chat_id=None, language_code=None):
+        self.commands.append((commands, chat_id, language_code))
 
     async def get_updates(self, *, offset, timeout, limit):
         return []
@@ -70,23 +71,37 @@ class FakeAPI:
         self.closed = True
 
 
-def message(update_id, text, *, chat_id=42, user_id=42):
+def message(update_id, text, *, chat_id=42, user_id=42, language_code=None):
+    sender = {"id": user_id}
+    if language_code is not None:
+        sender["language_code"] = language_code
     return {
         "update_id": update_id,
         "message": {
             "chat": {"id": chat_id},
-            "from": {"id": user_id},
+            "from": sender,
             "text": text,
         },
     }
 
 
-def callback(update_id, data, *, chat_id=42, user_id=42, callback_id="cb-1"):
+def callback(
+    update_id,
+    data,
+    *,
+    chat_id=42,
+    user_id=42,
+    callback_id="cb-1",
+    language_code=None,
+):
+    sender = {"id": user_id}
+    if language_code is not None:
+        sender["language_code"] = language_code
     return {
         "update_id": update_id,
         "callback_query": {
             "id": callback_id,
-            "from": {"id": user_id},
+            "from": sender,
             "message": {"chat": {"id": chat_id}},
             "data": data,
         },
@@ -176,7 +191,7 @@ async def test_hard_rule_requires_id_bound_confirmation_and_bare_yes_is_rejected
     callback_reply = next(
         item for item in store.next_outbox() if item.callback_query_id == "cb-confirm"
     )
-    assert "aplicado" in callback_reply.text
+    assert "Preferences updated" in callback_reply.text
     state.close()
 
 
@@ -192,7 +207,7 @@ async def test_persistent_sliding_limit_blocks_before_another_gemini_call(tmp_pa
     await processor.process_update(message(2, "segundo"))
     assert len(interpreter.calls) == 1
     assert store.current_snapshot().revision == 1
-    assert "Limite" in store.next_outbox()[-1].text
+    assert "AI command limit" in store.next_outbox()[-1].text
     state.close()
 
 
@@ -221,11 +236,12 @@ async def test_onboarding_queries_and_unknown_commands_are_deterministic(tmp_pat
     outbox = store.next_outbox()
     replies = [item.text for item in outbox]
     assert interpreter.calls == []
-    assert "Comandos rápidos" in replies[0]
-    assert "Comandos rápidos" in replies[1]
-    assert "Preferências ativas" in replies[2]
-    assert "Comando desconhecido" in replies[3]
-    assert "Preferências ativas" in replies[4]
+    assert "Welcome to Sieve" in replies[0]
+    assert "How to use Sieve" in replies[1]
+    assert "Your preferences" in replies[2]
+    assert "Unknown command" in replies[3]
+    assert "Your preferences" in replies[4]
+    assert all(item.parse_mode == "HTML" for item in outbox)
     assert outbox[4].callback_query_id == "cb-menu"
     assert outbox[4].reply_markup["inline_keyboard"][0][0]["callback_data"] == (
         "pref:menu:preferences"
@@ -239,7 +255,7 @@ async def test_gemini_query_renders_authoritative_preferences(tmp_path) -> None:
     await processor.process_update(message(1, "pode me dizer o que voce sabe sobre meus gostos?"))
     reply = store.next_outbox()[0].text
     assert len(interpreter.calls) == 1
-    assert "Preferências ativas" in reply
+    assert "Your preferences" in reply
     assert "resumo sem estado" not in reply
     state.close()
 
@@ -273,7 +289,8 @@ async def test_outbox_recovers_callbacks_and_webhook_conflict_alerts(tmp_path) -
     )
     with pytest.raises(WebhookConflictError):
         await conflict.check_webhook()
-    assert "webhook ativo" in conflict_api.sent[0][1]
+    assert "active webhook" in conflict_api.sent[0][1]
+    assert conflict_api.sent[0][3] == "HTML"
     state.close()
 
 
@@ -306,10 +323,48 @@ async def test_direct_bot_api_sets_owner_scoped_command_menu() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         api = TelegramBotAPI(token="token", api_url="https://telegram.test", client=client)
-        await api.set_my_commands(BOT_COMMANDS, chat_id=42)
+        await api.set_my_commands(BOT_COMMANDS, chat_id=42, language_code="en")
     path, body = bodies[0]
     assert path.endswith("/bottoken/setMyCommands")
     assert body == {
         "commands": list(BOT_COMMANDS),
         "scope": {"type": "chat", "chat_id": 42},
+        "language_code": "en",
     }
+
+
+async def test_language_is_detected_selectable_and_persistent(tmp_path) -> None:
+    interpreter = FakeInterpreter()
+    state, store, processor = setup(tmp_path, interpreter)
+    await processor.process_update(message(1, "/start", language_code="pt-BR"))
+    first = store.next_outbox()[0]
+    assert "Bem-vindo ao Sieve" in first.text
+    assert store.ui_language(42) == "pt-BR"
+
+    await processor.process_update(
+        callback(2, "pref:language:en", callback_id="cb-language")
+    )
+    changed = store.next_outbox()[-1]
+    assert "Language changed to English" in changed.text
+    assert changed.callback_query_id == "cb-language"
+    assert store.ui_language(42) == "en"
+
+    reloaded = SQLitePreferenceStore(state)
+    assert reloaded.ui_language(42) == "en"
+    await processor.process_update(message(3, "/language", language_code="pt"))
+    assert "Choose your language" in store.next_outbox()[-1].text
+    state.close()
+
+
+async def test_portuguese_command_menu_uses_telegram_language_code() -> None:
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        api = TelegramBotAPI(token="token", api_url="https://telegram.test", client=client)
+        await api.set_my_commands(BOT_COMMANDS_PT_BR, chat_id=42, language_code="pt")
+    assert bodies[0]["language_code"] == "pt"
+    assert bodies[0]["commands"] == list(BOT_COMMANDS_PT_BR)

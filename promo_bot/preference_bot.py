@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from contextlib import suppress
 from datetime import datetime
+from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -25,21 +26,32 @@ from .preferences import (
     PreferenceProposal,
     StaleRevisionError,
     changed_entry_count,
-    iter_entry_lines,
     requires_confirmation,
 )
 from .protocols import PreferenceInterpreter
+from .telegram_formatter import TelegramFormatter
 
 logger = logging.getLogger(__name__)
 
-BOT_COMMANDS: tuple[dict[str, str], ...] = (
-    {"command": "start", "description": "Apresentação e comandos disponíveis"},
-    {"command": "preferences", "description": "Mostrar preferências ativas"},
-    {"command": "history", "description": "Mostrar histórico de alterações"},
-    {"command": "preview", "description": "Validar uma alteração sem aplicar"},
-    {"command": "undo", "description": "Desfazer a última alteração"},
-    {"command": "help", "description": "Mostrar ajuda"},
+BOT_COMMANDS_EN: tuple[dict[str, str], ...] = (
+    {"command": "start", "description": "Open the welcome screen"},
+    {"command": "preferences", "description": "Review your current preferences"},
+    {"command": "history", "description": "Review recent changes"},
+    {"command": "preview", "description": "Test a change without saving"},
+    {"command": "undo", "description": "Reverse the latest change"},
+    {"command": "language", "description": "Choose English or Portuguese"},
+    {"command": "help", "description": "Learn how to use Sieve"},
 )
+BOT_COMMANDS_PT_BR: tuple[dict[str, str], ...] = (
+    {"command": "start", "description": "Abrir a tela de boas-vindas"},
+    {"command": "preferences", "description": "Revisar suas preferências atuais"},
+    {"command": "history", "description": "Revisar alterações recentes"},
+    {"command": "preview", "description": "Testar uma mudança sem salvar"},
+    {"command": "undo", "description": "Desfazer a última alteração"},
+    {"command": "language", "description": "Escolher inglês ou português"},
+    {"command": "help", "description": "Aprender a usar o Sieve"},
+)
+BOT_COMMANDS = BOT_COMMANDS_EN
 
 
 class TelegramBotError(RuntimeError):
@@ -113,8 +125,12 @@ class TelegramBotAPI:
         text: str,
         *,
         reply_markup: Mapping[str, Any] | None = None,
+        parse_mode: str | None = None,
     ) -> Any:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
+            payload["link_preview_options"] = {"is_disabled": True}
         if reply_markup is not None:
             payload["reply_markup"] = dict(reply_markup)
         return await self._call("sendMessage", payload)
@@ -123,11 +139,17 @@ class TelegramBotAPI:
         return await self._call("answerCallbackQuery", {"callback_query_id": callback_query_id})
 
     async def set_my_commands(
-        self, commands: tuple[dict[str, str], ...], *, chat_id: int | None = None
+        self,
+        commands: tuple[dict[str, str], ...],
+        *,
+        chat_id: int | None = None,
+        language_code: str | None = None,
     ) -> Any:
         payload: dict[str, Any] = {"commands": [dict(item) for item in commands]}
         if chat_id is not None:
             payload["scope"] = {"type": "chat", "chat_id": chat_id}
+        if language_code is not None:
+            payload["language_code"] = language_code
         return await self._call("setMyCommands", payload)
 
     async def close(self) -> None:
@@ -142,35 +164,6 @@ def _command_name(text: str) -> tuple[str, str]:
     head, _, tail = stripped.partition(" ")
     name = head.split("@", 1)[0].casefold()
     return name, tail.strip()
-
-
-def _confirmation_markup(confirmation_id: str) -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "Confirmar",
-                    "callback_data": f"pref:confirm:{confirmation_id}",
-                },
-                {
-                    "text": "Cancelar",
-                    "callback_data": f"pref:cancel:{confirmation_id}",
-                },
-            ]
-        ]
-    }
-
-
-def _menu_markup() -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📋 Preferências", "callback_data": "pref:menu:preferences"},
-                {"text": "🕘 Histórico", "callback_data": "pref:menu:history"},
-            ],
-            [{"text": "❓ Ajuda", "callback_data": "pref:menu:help"}],
-        ]
-    }
 
 
 class PreferenceCommandProcessor:
@@ -194,7 +187,9 @@ class PreferenceCommandProcessor:
         self.zone = ZoneInfo(timezone_name)
 
     @staticmethod
-    def _envelope(update: Mapping[str, Any]) -> tuple[int, int | None, int | None, str, str | None]:
+    def _envelope(
+        update: Mapping[str, Any],
+    ) -> tuple[int, int | None, int | None, str, str | None, str | None]:
         update_id = int(update.get("update_id", -1))
         callback = update.get("callback_query")
         if isinstance(callback, Mapping):
@@ -207,6 +202,9 @@ class PreferenceCommandProcessor:
                 int(sender["id"]) if isinstance(sender, Mapping) and "id" in sender else None,
                 str(callback.get("data", "")),
                 str(callback.get("id", "")) or None,
+                str(sender.get("language_code", "")) or None
+                if isinstance(sender, Mapping)
+                else None,
             )
         message = update.get("message")
         if isinstance(message, Mapping):
@@ -218,8 +216,11 @@ class PreferenceCommandProcessor:
                 int(sender["id"]) if isinstance(sender, Mapping) and "id" in sender else None,
                 str(message.get("text", "")),
                 None,
+                str(sender.get("language_code", "")) or None
+                if isinstance(sender, Mapping)
+                else None,
             )
-        return update_id, None, None, "", None
+        return update_id, None, None, "", None, None
 
     def _reply(
         self,
@@ -227,43 +228,25 @@ class PreferenceCommandProcessor:
         *,
         callback_query_id: str | None = None,
         reply_markup: Mapping[str, Any] | None = None,
+        parse_mode: str | None = "HTML",
     ) -> OutboxReply:
         return OutboxReply(
             chat_id=self.owner_chat_id,
             text=text,
+            parse_mode=parse_mode,
             reply_markup=reply_markup,
             callback_query_id=callback_query_id,
         )
 
-    def _preferences_text(self) -> str:
-        snapshot = self.store.current_snapshot()
-        lines = [
-            "📋 Preferências ativas",
-            f"Revisão {snapshot.revision} • {len(snapshot.entries)} entradas",
-            "",
-        ]
-        lines.extend(iter_entry_lines(snapshot))
-        if not snapshot.entries:
-            lines.append("Nenhuma entrada ativa.")
-        text = "\n".join(lines)
-        return text[:4093] + ("..." if len(text) > 4093 else "")
+    def _ui(self, actor_id: int) -> TelegramFormatter:
+        return TelegramFormatter(self.store.ui_language(actor_id))
 
-    def _help_text(self) -> str:
-        snapshot = self.store.current_snapshot()
-        return (
-            "👋 Olá! Eu sou o Sieve.\n"
-            "Filtro promoções usando suas preferências e aplico mudanças sem reiniciar.\n\n"
-            f"📊 Estado atual: revisão {snapshot.revision} • {len(snapshot.entries)} entradas\n\n"
-            "⚡ Comandos rápidos\n"
-            "/preferences — preferências ativas\n"
-            "/history — alterações recentes\n"
-            "/preview <instrução> — testar sem aplicar\n"
-            "/undo — desfazer a última alteração\n"
-            "/confirm <id> • /cancel <id> — responder a uma confirmação\n"
-            "/help — abrir esta ajuda\n\n"
-            "💬 Ou escreva naturalmente, por exemplo: "
-            '“adicione interesse em monitores OLED” ou “não quero perfumes”.'
-        )
+    def _preferences_screen(
+        self, actor_id: int, page: int = 1
+    ) -> tuple[str, dict[str, Any]]:
+        ui = self._ui(actor_id)
+        text, page, pages = ui.preferences(self.store.current_snapshot(), page)
+        return text, ui.menu_markup(preference_page=page, preference_pages=pages)
 
     @staticmethod
     def _deterministic_text_intent(text: str) -> str | None:
@@ -295,19 +278,8 @@ class PreferenceCommandProcessor:
             return "preferences"
         return None
 
-    def _history_text(self) -> str:
-        lines = ["🕘 HISTÓRICO DE PREFERÊNCIAS", ""]
-        for item in self.store.history(10):
-            stamp = datetime.fromtimestamp(float(item["created_at"]), self.zone)
-            rollback = (
-                f" → restaura r{item['rollback_target']}"
-                if item.get("rollback_target") is not None
-                else ""
-            )
-            lines.append(
-                f"• r{item['revision']} • {stamp:%d/%m %H:%M}\n  {item['summary']}{rollback}"
-            )
-        return "\n".join(lines)[:4096]
+    def _history_text(self, actor_id: int) -> str:
+        return self._ui(actor_id).history(self.store.history(10), self.zone)
 
     def _record_reply(
         self,
@@ -319,6 +291,7 @@ class PreferenceCommandProcessor:
         *,
         callback_query_id: str | None = None,
         reply_markup: Mapping[str, Any] | None = None,
+        parse_mode: str | None = "HTML",
     ) -> None:
         self.store.record_update(
             update_id,
@@ -329,6 +302,7 @@ class PreferenceCommandProcessor:
                 text,
                 callback_query_id=callback_query_id,
                 reply_markup=reply_markup,
+                parse_mode=parse_mode,
             ),
         )
 
@@ -341,6 +315,7 @@ class PreferenceCommandProcessor:
         original: str,
         callback_query_id: str | None,
     ) -> None:
+        ui = self._ui(actor_id)
         try:
             pending = self.store.get_confirmation(confirmation_id)
             revision = pending.base_revision + 1
@@ -350,7 +325,10 @@ class PreferenceCommandProcessor:
                 update_id=update_id,
                 original_message=original,
                 reply=self._reply(
-                    f"Confirmado e aplicado na revisão {revision}.",
+                    ui.applied(
+                        revision,
+                        ui.pick("Confirmed change", "Alteração confirmada"),
+                    ),
                     callback_query_id=callback_query_id,
                 ),
             )
@@ -360,7 +338,14 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "confirmation_expired",
-                "Essa confirmação expirou. Envie a instrução novamente.",
+                ui.notice(
+                    "Confirmation expired",
+                    "Confirmação expirada",
+                    "This request was not applied.",
+                    "Esta solicitação não foi aplicada.",
+                    next_en="Send the original instruction again to create a new request.",
+                    next_pt="Envie a instrução original novamente para criar uma nova solicitação.",
+                ),
                 callback_query_id=callback_query_id,
             )
         except (ConfirmationError, StaleRevisionError) as exc:
@@ -369,7 +354,14 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "confirmation_invalid",
-                f"Confirmação inválida: {exc}",
+                ui.notice(
+                    "Confirmation unavailable",
+                    "Confirmação indisponível",
+                    f"The request could not be confirmed: {escape(str(exc))}",
+                    f"A solicitação não pôde ser confirmada: {escape(str(exc))}",
+                    next_en="Open Preferences to review the current state.",
+                    next_pt="Abra Preferências para revisar o estado atual.",
+                ),
                 callback_query_id=callback_query_id,
             )
 
@@ -382,6 +374,7 @@ class PreferenceCommandProcessor:
         original: str,
         callback_query_id: str | None,
     ) -> None:
+        ui = self._ui(actor_id)
         try:
             self.store.cancel_confirmation_durable(
                 confirmation_id,
@@ -389,7 +382,13 @@ class PreferenceCommandProcessor:
                 update_id=update_id,
                 original_message=original,
                 reply=self._reply(
-                    "Alteração cancelada.", callback_query_id=callback_query_id
+                    ui.notice(
+                        "Change cancelled",
+                        "Alteração cancelada",
+                        "Nothing was changed.",
+                        "Nada foi alterado.",
+                    ),
+                    callback_query_id=callback_query_id,
                 ),
             )
         except ConfirmationError as exc:
@@ -398,7 +397,12 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "confirmation_invalid",
-                f"Confirmação inválida: {exc}",
+                ui.notice(
+                    "Cancellation unavailable",
+                    "Cancelamento indisponível",
+                    f"The request could not be cancelled: {escape(str(exc))}",
+                    f"A solicitação não pôde ser cancelada: {escape(str(exc))}",
+                ),
                 callback_query_id=callback_query_id,
             )
 
@@ -413,15 +417,16 @@ class PreferenceCommandProcessor:
         target_revision: int | None = None,
         detail: str = "",
     ) -> None:
+        ui = self._ui(actor_id)
+
         def reply_factory(confirmation_id: str) -> OutboxReply:
             ttl_minutes = max(1, self.store.confirmation_ttl_seconds // 60)
-            text = (
-                f"Confirmação necessária ({confirmation_id}).\n{summary}"
-                + (f"\n{detail}" if detail else "")
-                + f"\nExpira em {ttl_minutes} minutos. Use /confirm {confirmation_id} "
-                f"ou /cancel {confirmation_id}."
+            return self._reply(
+                ui.confirmation_required(
+                    confirmation_id, summary, detail, ttl_minutes
+                ),
+                reply_markup=ui.confirmation_markup(confirmation_id, ui.language),
             )
-            return self._reply(text, reply_markup=_confirmation_markup(confirmation_id))
 
         self.store.create_confirmation(
             proposal,
@@ -441,6 +446,7 @@ class PreferenceCommandProcessor:
         actor_id: int,
         original: str,
     ) -> None:
+        ui = self._ui(actor_id)
         current = self.store.current_snapshot()
         target, target_revision = self.store.undo_target()
         count = changed_entry_count(current, target)
@@ -450,9 +456,15 @@ class PreferenceCommandProcessor:
                 actor_id=actor_id,
                 update_id=update_id,
                 original=original,
-                summary=f"Desfazer a última revisão, restaurando r{target_revision}.",
+                summary=ui.pick(
+                    f"Reverse the latest change and restore revision {target_revision}.",
+                    f"Desfazer a última mudança e restaurar a revisão {target_revision}.",
+                ),
                 target_revision=target_revision,
-                detail=f"{count} entradas serão afetadas.",
+                detail=ui.pick(
+                    f"{count} preferences will be affected.",
+                    f"{count} preferências serão afetadas.",
+                ),
             )
             return
         self.store.restore_revision(
@@ -461,8 +473,16 @@ class PreferenceCommandProcessor:
             original_message=original,
             actor_id=actor_id,
             update_id=update_id,
-            summary=f"Undo para r{target_revision}",
-            reply=self._reply(f"Última alteração desfeita na revisão {current.revision + 1}."),
+            summary=ui.pick(
+                f"Undo to revision {target_revision}",
+                f"Desfazer para a revisão {target_revision}",
+            ),
+            reply=self._reply(
+                ui.applied(
+                    current.revision + 1,
+                    ui.pick("Latest change reversed", "Última mudança desfeita"),
+                )
+            ),
         )
 
     def _select_revert_target(self, original: str):
@@ -479,6 +499,7 @@ class PreferenceCommandProcessor:
         return target, target_revision
 
     def _revert(self, *, update_id: int, actor_id: int, original: str) -> None:
+        ui = self._ui(actor_id)
         current = self.store.current_snapshot()
         target, target_revision = self._select_revert_target(original)
         count = changed_entry_count(current, target)
@@ -487,9 +508,15 @@ class PreferenceCommandProcessor:
             actor_id=actor_id,
             update_id=update_id,
             original=original,
-            summary=f"Restaurar o estado da revisão {target_revision}, anterior à meia-noite local.",
+            summary=ui.pick(
+                f"Restore the state from revision {target_revision}, before local midnight.",
+                f"Restaurar o estado da revisão {target_revision}, anterior à meia-noite local.",
+            ),
             target_revision=target_revision,
-            detail=f"Prévia: {count} entradas serão afetadas.",
+            detail=ui.pick(
+                f"Preview: {count} preferences will be affected.",
+                f"Prévia: {count} preferências serão afetadas.",
+            ),
         )
 
     async def _interpret(
@@ -501,6 +528,7 @@ class PreferenceCommandProcessor:
         original: str,
         preview: bool,
     ) -> None:
+        ui = self._ui(actor_id)
         allowed, window = self.store.rate_limit_available(
             actor_id,
             per_minute=self.rate_per_minute,
@@ -512,7 +540,14 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "rate_limited",
-                f"Limite de comandos Gemini atingido por {window}. Tente novamente depois.",
+                ui.notice(
+                    "AI command limit reached",
+                    "Limite de comandos de IA atingido",
+                    f"The {escape(str(window))} safety limit has been reached.",
+                    f"O limite de segurança de {escape(str(window))} foi atingido.",
+                    next_en="Wait a little and try again. Reviews and confirmations still work.",
+                    next_pt="Aguarde um pouco e tente novamente. Consultas e confirmações continuam funcionando.",
+                ),
             )
             return
         if preview:
@@ -524,6 +559,7 @@ class PreferenceCommandProcessor:
                 instruction,
                 snapshot,
                 local_timestamp=datetime.now(self.zone).isoformat(),
+                language=ui.language,
             )
             if not preview and proposal.intent != PreferenceIntent.QUERY:
                 self.store.record_rate_event(actor_id)
@@ -538,9 +574,13 @@ class PreferenceCommandProcessor:
                         actor_id,
                         original,
                         "preview",
-                        f"Prévia sem aplicar: {proposal.summary or 'alteração válida'}\n"
-                        f"Revisão base: {snapshot.revision}; operações: {len(operations)}; "
-                        f"entradas resultantes: {len(candidate.entries)}.",
+                        ui.preview(
+                            proposal.summary
+                            or ui.pick("Valid preference change", "Alteração válida"),
+                            snapshot.revision,
+                            len(operations),
+                            len(candidate.entries),
+                        ),
                     )
                     return
                 confirm, reason = requires_confirmation(
@@ -552,8 +592,9 @@ class PreferenceCommandProcessor:
                         actor_id=actor_id,
                         update_id=update_id,
                         original=original,
-                        summary=proposal.summary or "Alteração de preferências",
-                        detail=f"Motivo da confirmação: {reason}.",
+                        summary=proposal.summary
+                        or ui.pick("Preference change", "Alteração de preferências"),
+                        detail=ui.reason_for_confirmation(reason),
                     )
                     return
                 self.store.apply(
@@ -562,10 +603,14 @@ class PreferenceCommandProcessor:
                     original_message=original,
                     actor_id=actor_id,
                     update_id=update_id,
-                    summary=proposal.summary or "Alteração de preferências",
+                    summary=proposal.summary
+                    or ui.pick("Preference change", "Alteração de preferências"),
                     reply=self._reply(
-                        f"Preferências atualizadas na revisão {snapshot.revision + 1}: "
-                        f"{proposal.summary or 'alteração aplicada'}."
+                        ui.applied(
+                            snapshot.revision + 1,
+                            proposal.summary
+                            or ui.pick("Change applied", "Alteração aplicada"),
+                        )
                     ),
                 )
                 return
@@ -573,22 +618,36 @@ class PreferenceCommandProcessor:
                 if proposal.intent == PreferenceIntent.UNDO:
                     target, target_revision = self.store.undo_target()
                     count = changed_entry_count(snapshot, target)
-                    text = (
-                        f"Undo restauraria r{target_revision} e afetaria {count} entradas; "
-                        "nada foi aplicado."
+                    text = ui.pick(
+                        f"Undo would restore revision {target_revision} and affect {count} preferences.",
+                        f"Desfazer restauraria a revisão {target_revision} e afetaria {count} preferências.",
                     )
                 elif proposal.intent == PreferenceIntent.REVERT:
                     target, target_revision = self._select_revert_target(instruction)
                     count = changed_entry_count(snapshot, target)
-                    text = (
-                        f"Reversão restauraria r{target_revision} e afetaria {count} entradas; "
-                        "nada foi aplicado."
+                    text = ui.pick(
+                        f"The restore would use revision {target_revision} and affect {count} preferences.",
+                        f"A restauração usaria a revisão {target_revision} e afetaria {count} preferências.",
                     )
                 else:
                     text = proposal.clarification_question or proposal.summary or (
-                        f"A instrução foi interpretada como {proposal.intent.value}; nada seria aplicado."
+                        ui.pick(
+                            f"The instruction was interpreted as {proposal.intent.value}.",
+                            f"A instrução foi interpretada como {proposal.intent.value}.",
+                        )
                     )
-                self._record_reply(update_id, actor_id, original, "preview", f"Prévia: {text}")
+                self._record_reply(
+                    update_id,
+                    actor_id,
+                    original,
+                    "preview",
+                    ui.notice(
+                        "Preview only — nothing was saved",
+                        "Somente prévia — nada foi salvo",
+                        escape(text),
+                        escape(text),
+                    ),
+                )
                 return
             if proposal.intent in {PreferenceIntent.UNDO, PreferenceIntent.REVERT}:
                 if proposal.intent == PreferenceIntent.UNDO:
@@ -597,15 +656,33 @@ class PreferenceCommandProcessor:
                     self._revert(update_id=update_id, actor_id=actor_id, original=original)
                 return
             if proposal.intent == PreferenceIntent.CLARIFY:
-                text = proposal.clarification_question or "Pode esclarecer a alteração desejada?"
+                text = ui.notice(
+                    "I need one detail",
+                    "Preciso de um detalhe",
+                    escape(
+                        proposal.clarification_question
+                        or "Please clarify the preference you want to change."
+                    ),
+                    escape(
+                        proposal.clarification_question
+                        or "Esclareça a preferência que deseja alterar."
+                    ),
+                    next_en="Reply with the missing detail in a normal sentence.",
+                    next_pt="Responda com o detalhe que falta em uma frase comum.",
+                )
                 outcome = "clarify"
             elif proposal.intent == PreferenceIntent.QUERY:
                 # Gemini classifies natural-language queries, but application code
                 # renders authoritative state instead of echoing a model summary.
-                text = self._preferences_text()
+                text, markup = self._preferences_screen(actor_id)
                 outcome = "query"
             else:
-                text = proposal.summary or "Nenhuma alteração foi solicitada."
+                text = ui.notice(
+                    "No change requested",
+                    "Nenhuma alteração solicitada",
+                    escape(proposal.summary or "Your preferences were not changed."),
+                    escape(proposal.summary or "Suas preferências não foram alteradas."),
+                )
                 outcome = "noop"
             self._record_reply(
                 update_id,
@@ -614,7 +691,7 @@ class PreferenceCommandProcessor:
                 outcome,
                 text,
                 reply_markup=(
-                    _menu_markup() if proposal.intent == PreferenceIntent.QUERY else None
+                    markup if proposal.intent == PreferenceIntent.QUERY else None
                 ),
             )
         except (PreferenceError, StaleRevisionError) as exc:
@@ -625,7 +702,14 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "clarify",
-                f"Não consegui validar a instrução sem ambiguidade: {exc}",
+                ui.notice(
+                    "I could not validate that request",
+                    "Não consegui validar a solicitação",
+                    f"No change was made. Details: {escape(str(exc))}",
+                    f"Nenhuma mudança foi feita. Detalhes: {escape(str(exc))}",
+                    next_en="Rephrase it with one product, action, and any limit you need.",
+                    next_pt="Reescreva com um produto, uma ação e o limite desejado.",
+                ),
             )
         except GeminiError:
             if not consumed:
@@ -635,11 +719,25 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "parser_failure",
-                "Não consegui interpretar a instrução agora; nenhuma alteração foi aplicada.",
+                ui.notice(
+                    "I could not interpret that request",
+                    "Não consegui interpretar a solicitação",
+                    "The AI service did not return a usable answer. Nothing was changed.",
+                    "O serviço de IA não retornou uma resposta utilizável. Nada foi alterado.",
+                    next_en="Try again in a moment, or use /preferences to review the current state.",
+                    next_pt="Tente novamente em instantes ou use /preferences para revisar o estado atual.",
+                ),
             )
 
     async def process_update(self, update: Mapping[str, Any]) -> None:
-        update_id, chat_id, actor_id, text, callback_query_id = self._envelope(update)
+        (
+            update_id,
+            chat_id,
+            actor_id,
+            text,
+            callback_query_id,
+            telegram_language,
+        ) = self._envelope(update)
         if update_id < 0:
             return
         if self.store.is_update_processed(update_id):
@@ -653,14 +751,24 @@ class PreferenceCommandProcessor:
             )
             return
         assert actor_id is not None
+        self.store.ensure_ui_language(actor_id, telegram_language)
+        ui = self._ui(actor_id)
         if not text.strip():
             self._record_reply(
                 update_id,
                 actor_id,
                 text,
                 "ignored",
-                "Envie uma instrução de texto sobre preferências.",
+                ui.notice(
+                    "Text message needed",
+                    "É necessária uma mensagem de texto",
+                    "This interface understands text instructions and the buttons below.",
+                    "Esta interface entende instruções de texto e os botões abaixo.",
+                    next_en="Select Help to see examples.",
+                    next_pt="Escolha Ajuda para ver exemplos.",
+                ),
                 callback_query_id=callback_query_id,
+                reply_markup=ui.menu_markup(),
             )
             return
 
@@ -685,51 +793,94 @@ class PreferenceCommandProcessor:
                 )
             return
 
-        menu_match = re.fullmatch(
-            r"pref:menu:(preferences|history|help)", text.casefold()
-        )
-        if menu_match:
-            destination = menu_match.group(1)
-            rendered = (
-                self._preferences_text()
-                if destination == "preferences"
-                else self._history_text()
-                if destination == "history"
-                else self._help_text()
-            )
+        language_match = re.fullmatch(r"pref:language:(en|pt-br)", text.casefold())
+        if language_match:
+            self.store.set_ui_language(actor_id, language_match.group(1))
+            ui = self._ui(actor_id)
             self._record_reply(
                 update_id,
                 actor_id,
                 text,
-                "query" if destination != "help" else "help",
-                rendered,
+                "language_changed",
+                ui.language_changed(),
                 callback_query_id=callback_query_id,
-                reply_markup=_menu_markup(),
+                reply_markup=ui.menu_markup(),
             )
             return
 
-        command, argument = _command_name(text)
-        deterministic_intent = self._deterministic_text_intent(text)
-        if command in {"/start", "/help"} or deterministic_intent == "help":
-            self._record_reply(
-                update_id,
-                actor_id,
-                text,
-                "help",
-                self._help_text(),
-                reply_markup=_menu_markup(),
+        page_match = re.fullmatch(r"pref:preferences:(\d+)", text.casefold())
+        if page_match:
+            rendered, markup = self._preferences_screen(
+                actor_id, int(page_match.group(1))
             )
-            return
-        if command in {"/preferences", "/preferencias", "/prefs"} or (
-            deterministic_intent == "preferences"
-        ):
             self._record_reply(
                 update_id,
                 actor_id,
                 text,
                 "query",
-                self._preferences_text(),
-                reply_markup=_menu_markup(),
+                rendered,
+                callback_query_id=callback_query_id,
+                reply_markup=markup,
+            )
+            return
+
+        menu_match = re.fullmatch(
+            r"pref:menu:(preferences|history|help|language)", text.casefold()
+        )
+        if menu_match:
+            destination = menu_match.group(1)
+            if destination == "preferences":
+                rendered, markup = self._preferences_screen(actor_id)
+            elif destination == "history":
+                rendered, markup = self._history_text(actor_id), ui.menu_markup()
+            elif destination == "language":
+                rendered, markup = ui.language_screen(), ui.language_markup()
+            else:
+                rendered, markup = ui.help(self.store.current_snapshot()), ui.menu_markup()
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                "query" if destination in {"preferences", "history"} else destination,
+                rendered,
+                callback_query_id=callback_query_id,
+                reply_markup=markup,
+            )
+            return
+
+        command, argument = _command_name(text)
+        deterministic_intent = self._deterministic_text_intent(text)
+        if command == "/start":
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                "start",
+                ui.home(self.store.current_snapshot()),
+                reply_markup=ui.menu_markup(),
+            )
+            return
+        if command == "/help" or deterministic_intent == "help":
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                "help",
+                ui.help(self.store.current_snapshot()),
+                reply_markup=ui.menu_markup(),
+            )
+            return
+        if command in {"/preferences", "/preferencias", "/prefs"} or (
+            deterministic_intent == "preferences"
+        ):
+            rendered, markup = self._preferences_screen(actor_id)
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                "query",
+                rendered,
+                reply_markup=markup,
             )
             return
         if command in {"/history", "/historico"}:
@@ -738,8 +889,18 @@ class PreferenceCommandProcessor:
                 actor_id,
                 text,
                 "query",
-                self._history_text(),
-                reply_markup=_menu_markup(),
+                self._history_text(actor_id),
+                reply_markup=ui.menu_markup(),
+            )
+            return
+        if command in {"/language", "/idioma"}:
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                "language",
+                ui.language_screen(),
+                reply_markup=ui.language_markup(),
             )
             return
         explicit = re.fullmatch(r"/?(confirm|cancel)\s+([0-9a-fA-F]{8})", text.strip())
@@ -753,7 +914,12 @@ class PreferenceCommandProcessor:
                     actor_id,
                     text,
                     "invalid_confirmation",
-                    "Use /confirm <id> ou /cancel <id>.",
+                    ui.notice(
+                        "Confirmation reference needed",
+                        "Referência de confirmação necessária",
+                        "Use <code>/confirm &lt;id&gt;</code> or <code>/cancel &lt;id&gt;</code>.",
+                        "Use <code>/confirm &lt;id&gt;</code> ou <code>/cancel &lt;id&gt;</code>.",
+                    ),
                 )
                 return
         elif explicit:
@@ -768,7 +934,12 @@ class PreferenceCommandProcessor:
                     actor_id,
                     text,
                     "invalid_confirmation",
-                    "Use confirm <id> ou cancel <id>.",
+                    ui.notice(
+                        "Confirmation reference needed",
+                        "Referência de confirmação necessária",
+                        "Use <code>confirm &lt;id&gt;</code> or <code>cancel &lt;id&gt;</code>.",
+                        "Use <code>confirm &lt;id&gt;</code> ou <code>cancel &lt;id&gt;</code>.",
+                    ),
                 )
                 return
         if action:
@@ -795,14 +966,32 @@ class PreferenceCommandProcessor:
                 actor_id,
                 text,
                 "bare_confirmation_rejected",
-                "Confirmação genérica não é aceita. Use /confirm <id>.",
+                ui.notice(
+                    "A specific confirmation is required",
+                    "É necessária uma confirmação específica",
+                    "A generic “yes” cannot approve a risky change.",
+                    "Um “sim” genérico não pode aprovar uma mudança arriscada.",
+                    next_en="Use the Confirm change button on the pending request.",
+                    next_pt="Use o botão Confirmar alteração na solicitação pendente.",
+                ),
             )
             return
         if command == "/undo":
             try:
                 self._undo(update_id=update_id, actor_id=actor_id, original=text)
             except PreferenceError as exc:
-                self._record_reply(update_id, actor_id, text, "undo_unavailable", str(exc))
+                self._record_reply(
+                    update_id,
+                    actor_id,
+                    text,
+                    "undo_unavailable",
+                    ui.notice(
+                        "Nothing to undo",
+                        "Nada para desfazer",
+                        escape(str(exc)),
+                        escape(str(exc)),
+                    ),
+                )
             return
         if command == "/preview":
             if not argument:
@@ -811,7 +1000,14 @@ class PreferenceCommandProcessor:
                     actor_id,
                     text,
                     "invalid_preview",
-                    "Use /preview <instrução>.",
+                    ui.notice(
+                        "Instruction needed",
+                        "Instrução necessária",
+                        "Add the change you want to test after <code>/preview</code>.",
+                        "Adicione a mudança que deseja testar depois de <code>/preview</code>.",
+                        next_en="Example: <code>/preview add an interest in OLED monitors</code>",
+                        next_pt="Exemplo: <code>/preview adicione interesse em monitores OLED</code>",
+                    ),
                 )
                 return
             await self._interpret(
@@ -828,8 +1024,15 @@ class PreferenceCommandProcessor:
                 actor_id,
                 text,
                 "unknown_command",
-                "Comando desconhecido.\n\n" + self._help_text(),
-                reply_markup=_menu_markup(),
+                ui.notice(
+                    "Unknown command",
+                    "Comando desconhecido",
+                    "That command is not available. You can also write what you want naturally.",
+                    "Esse comando não está disponível. Você também pode escrever naturalmente o que deseja.",
+                    next_en="Select Help to see every option.",
+                    next_pt="Escolha Ajuda para ver todas as opções.",
+                ),
+                reply_markup=ui.menu_markup(),
             )
             return
         await self._interpret(
@@ -867,9 +1070,19 @@ class TelegramPreferenceBot:
     async def check_webhook(self) -> None:
         info = await self.api.get_webhook_info()
         if str(info.get("url", "")).strip():
-            message = "ALERTA: o bot de preferências possui webhook ativo; long polling não foi iniciado."
+            ui = TelegramFormatter(self.store.ui_language(self.processor.owner_user_id))
+            message = ui.notice(
+                "Sieve could not start",
+                "O Sieve não pôde iniciar",
+                "This bot has an active webhook, so private preference polling was not started.",
+                "Este bot possui um webhook ativo; por isso, a consulta privada de preferências não foi iniciada.",
+                next_en="Remove the webhook explicitly, then restart Sieve.",
+                next_pt="Remova o webhook explicitamente e reinicie o Sieve.",
+            )
             with suppress(Exception):
-                await self.api.send_message(self.owner_chat_id, message)
+                await self.api.send_message(
+                    self.owner_chat_id, message, parse_mode="HTML"
+                )
             raise WebhookConflictError(message)
         self._webhook_checked = True
 
@@ -879,7 +1092,10 @@ class TelegramPreferenceBot:
             for item in self.store.next_outbox(20):
                 try:
                     await self.api.send_message(
-                        item.chat_id, item.text, reply_markup=item.reply_markup
+                        item.chat_id,
+                        item.text,
+                        reply_markup=item.reply_markup,
+                        parse_mode=item.parse_mode,
                     )
                 except TelegramBotError as exc:
                     self.store.fail_outbox(item.id, str(exc))
@@ -968,7 +1184,14 @@ class TelegramPreferenceBot:
         if not self._webhook_checked:
             await self.check_webhook()
         try:
-            await self.api.set_my_commands(BOT_COMMANDS, chat_id=self.owner_chat_id)
+            await self.api.set_my_commands(
+                BOT_COMMANDS_EN, chat_id=self.owner_chat_id
+            )
+            await self.api.set_my_commands(
+                BOT_COMMANDS_PT_BR,
+                chat_id=self.owner_chat_id,
+                language_code="pt",
+            )
         except TelegramBotError as exc:
             logger.warning(
                 "preference_command_menu_failure",

@@ -108,6 +108,7 @@ class Service:
         )
         self.preference_interpreter = None
         self.preference_bot = None
+        self.preference_owner_id: int | None = None
         if preference_settings.enabled:
             owner_id = (
                 preference_settings.owner_id
@@ -119,6 +120,16 @@ class Service:
                 if preference_settings.chat_id is not None
                 else int(env_secret(preference_settings.chat_id_env))
             )
+            self.preference_owner_id = owner_id
+            def language_provider() -> str:
+                return self.preference_store.ui_language(owner_id)
+
+            evaluator_language = getattr(self.evaluator, "set_language_provider", None)
+            if callable(evaluator_language):
+                evaluator_language(language_provider)
+            sink_language = getattr(self.sink, "set_language_provider", None)
+            if callable(sink_language):
+                sink_language(language_provider)
             parser_settings = dict(config.evaluator)
             parser_settings.update(preference_settings.parser)
             parser_settings["max_operations"] = preference_settings.max_operations
@@ -165,6 +176,13 @@ class Service:
         if previous is None or dict(snapshot.aliases) != dict(previous.aliases):
             self.store.start_alias_rebuild(dict(snapshot.aliases))
 
+    def _pick(self, english: str, portuguese: str) -> str:
+        if self.preference_owner_id is not None and self.preference_store.ui_language(
+            self.preference_owner_id
+        ) == "pt-BR":
+            return portuguese
+        return english
+
     async def report_health(self, name: str, error: Exception | None) -> None:
         try:
             failures = self.store.record_health(name, None if error is None else str(error))
@@ -175,7 +193,8 @@ class Service:
             )
             with suppress(Exception):
                 await self.sink.alert(
-                    f"database: {type(store_error).__name__}: {str(store_error)[:350]}"
+                    self._pick("Database", "Banco de dados")
+                    + f": {type(store_error).__name__}: {str(store_error)[:350]}"
                 )
             return
         if error is None:
@@ -201,7 +220,10 @@ class Service:
             with suppress(Exception):
                 await self.sink.alert(
                     f"{name}: {type(error).__name__}: {str(error)[:350]} "
-                    f"(falhas consecutivas: {failures})"
+                    + self._pick(
+                        f"(consecutive failures: {failures})",
+                        f"(falhas consecutivas: {failures})",
+                    )
                 )
 
     async def emit(self, promotion: Promotion) -> None:
@@ -299,7 +321,10 @@ class Service:
                 )
                 with suppress(Exception):
                     await self.sink.alert(
-                        f"Pressão de memória: {used / 1024 / 1024:.1f} MB; reinício preventivo."
+                        self._pick(
+                            f"Memory pressure: {used / 1024 / 1024:.1f} MB; preventive restart.",
+                            f"Pressão de memória: {used / 1024 / 1024:.1f} MB; reinício preventivo.",
+                        )
                     )
                 self.store.flush()
                 self.stop.set()

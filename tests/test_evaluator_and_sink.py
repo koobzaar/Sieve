@@ -117,9 +117,49 @@ async def test_telegram_sink_formats_shadow_and_silences_notification() -> None:
         sink = TelegramBotSink(token="token", chat_id="42", client=client)
         await sink.send(promotion, "Menor preço.", shadow=True)
         await sink.alert("parser alterado")
-    assert "🔎 SHADOW" in bodies[0]["text"]
-    assert "R$ 1.299,90" in bodies[0]["text"]
+    assert "Test delivery" in bodies[0]["text"]
+    assert "R$ 1,299.90" in bodies[0]["text"]
+    assert bodies[0]["parse_mode"] == "HTML"
     assert bodies[0]["disable_notification"] is True
     assert bodies[1]["disable_notification"] is False
-    assert "ALERTA" in bodies[1]["text"]
-    assert format_promotion(promotion, "x").startswith("SSD")
+    assert "SIEVE ALERT" in bodies[1]["text"]
+    assert format_promotion(promotion, "x").startswith("<b>SSD</b>")
+
+
+async def test_sink_and_evaluator_follow_persistent_ui_language() -> None:
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    promotion = Promotion(
+        id="1",
+        source="pelando & cia",
+        title="SSD <rápido>",
+        price=Decimal("1299.90"),
+        url="https://x.test/p?a=1&b=2",
+    )
+    language = "pt-BR"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sink = TelegramBotSink(
+            token="token",
+            chat_id="42",
+            client=client,
+            language_provider=lambda: language,
+        )
+        await sink.send(promotion, "Combina <muito>.")
+    text = bodies[0]["text"]
+    assert "<b>Preço:</b> R$ 1.299,90" in text
+    assert "Por que combinou" in text
+    assert "&lt;rápido&gt;" in text and "&amp;" in text
+
+    evaluator = GeminiEvaluator(
+        api_key="x",
+        model="gemini-test",
+        language_provider=lambda: language,
+    )
+    request = evaluator._request(promotion, "ssd")
+    prompt = request["contents"][0]["parts"][0]["text"]
+    assert "Brazilian Portuguese" in prompt
+    await evaluator.close()

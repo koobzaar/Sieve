@@ -75,6 +75,32 @@ def test_revision_zero_is_lossless_and_yaml_is_never_reimported(tmp_path) -> Non
     state.close()
 
 
+def test_ui_language_and_html_outbox_are_durable(tmp_path) -> None:
+    state, store, _ = make_store(tmp_path)
+    assert store.ensure_ui_language(7, "pt_BR") == "pt-BR"
+    assert store.ensure_ui_language(7, "en") == "pt-BR"
+    assert store.set_ui_language(7, "en-US") == "en"
+    store.record_update(
+        1,
+        outcome="formatted",
+        actor_id=7,
+        command="/start",
+        reply=OutboxReply(
+            7,
+            "<b>Hello</b>",
+            parse_mode="HTML",
+            reply_markup={"inline_keyboard": []},
+        ),
+    )
+
+    reopened = SQLitePreferenceStore(state)
+    assert reopened.ui_language(7) == "en"
+    message = reopened.next_outbox()[0]
+    assert message.parse_mode == "HTML"
+    assert message.reply_markup == {"inline_keyboard": []}
+    state.close()
+
+
 def test_crud_validation_atomic_provider_and_optimistic_revision(tmp_path) -> None:
     state, store, provider = make_store(tmp_path)
     applied = store.apply(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -9,6 +10,7 @@ import httpx
 from .config import env_secret
 from .gemini import GeminiError, GeminiStructuredClient, RetryableGeminiError
 from .models import Decision, Evaluation, Promotion
+from .telegram_formatter import normalize_ui_language
 
 
 class EvaluationError(RuntimeError):
@@ -34,9 +36,11 @@ class GeminiEvaluator:
         retries: int = 3,
         client: httpx.AsyncClient | None = None,
         random_source: Any | None = None,
+        language_provider: Callable[[], str] | None = None,
     ) -> None:
         self.profile = profile
         self.max_output_tokens = max_output_tokens
+        self.language_provider = language_provider
         self.structured_client = GeminiStructuredClient(
             api_key=api_key,
             model=model,
@@ -46,6 +50,9 @@ class GeminiEvaluator:
             client=client,
             random_source=random_source,
         )
+
+    def set_language_provider(self, provider: Callable[[], str]) -> None:
+        self.language_provider = provider
 
     def _request(
         self,
@@ -58,13 +65,17 @@ class GeminiEvaluator:
             "price": str(promotion.price) if promotion.price is not None else None,
             "temperature": promotion.temperature,
         }
+        language = normalize_ui_language(
+            self.language_provider() if self.language_provider is not None else "en"
+        )
+        reason_language = "Brazilian Portuguese" if language == "pt-BR" else "English"
         prompt = (
-            "Você avalia promoções para uma única pessoa. Use todo o perfil abaixo. "
-            "Responda encaminhar somente quando a oferta combinar de forma concreta com o perfil. "
-            "A razão deve ter uma frase curta, sem markdown.\n\n"
-            f"PERFIL COMPLETO:\n{preference_context if preference_context is not None else self.profile}\n\n"
-            f"PROMOÇÃO NORMALIZADA:\n{normalized}\n\n"
-            f"METADADOS ESSENCIAIS:\n{json.dumps(metadata, ensure_ascii=False)}"
+            "You evaluate promotions for one person. Use the complete preference profile below. "
+            "Return forward only when the offer concretely matches that profile. Write reason as "
+            f"one short plain-text sentence in {reason_language}.\n\n"
+            f"COMPLETE PROFILE:\n{preference_context if preference_context is not None else self.profile}\n\n"
+            f"NORMALIZED PROMOTION:\n{normalized}\n\n"
+            f"ESSENTIAL METADATA:\n{json.dumps(metadata, ensure_ascii=False)}"
         )
         schema = {
             "type": "object",
@@ -72,7 +83,7 @@ class GeminiEvaluator:
                 "decision": {"type": "string", "enum": ["forward", "discard"]},
                 "reason": {
                     "type": "string",
-                    "description": "Uma única frase curta em português.",
+                    "description": f"One short sentence in {reason_language}.",
                 },
             },
             "required": ["decision", "reason"],

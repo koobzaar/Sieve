@@ -133,6 +133,7 @@ async def test_structured_client_retries_malformed_json_in_the_same_request() ->
         body = json.loads(request.content)
         assert body["generationConfig"]["responseMimeType"] == "application/json"
         assert "responseSchema" in body["generationConfig"]
+        assert "Brazilian Portuguese" in body["contents"][0]["parts"][0]["text"]
         text = "not-json" if calls == 1 else json.dumps(
             {
                 "intent": "query",
@@ -157,6 +158,7 @@ async def test_structured_client_retries_malformed_json_in_the_same_request() ->
             "quais são minhas preferências?",
             snapshot(),
             local_timestamp="2026-07-18T12:00:00-03:00",
+            language="pt-BR",
         )
     assert calls == 2
     assert result.intent == PreferenceIntent.QUERY

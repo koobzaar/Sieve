@@ -92,24 +92,30 @@ class GeminiPreferenceInterpreter:
 
     @staticmethod
     def _prompt(
-        message: str, snapshot: PreferenceSnapshot, local_timestamp: str
+        message: str,
+        snapshot: PreferenceSnapshot,
+        local_timestamp: str,
+        language: str = "en",
     ) -> str:
         state = {
             "revision": snapshot.revision,
             "entries": [entry.to_dict() for entry in snapshot.entries],
             "rendered_profile": snapshot.rendered_profile,
         }
+        response_language = (
+            "Brazilian Portuguese" if str(language).casefold().startswith("pt") else "English"
+        )
         return (
-            "Você interpreta comandos privados de preferências de promoções. "
-            "Não autorize, não confirme e não persista nada: apenas converta a mensagem em uma proposta. "
-            "Use somente IDs existentes para update/remove. Para add, não invente ID; informe kind e data. "
-            "Se houver ambiguidade material, use intent clarify e faça uma pergunta específica. "
-            "Use intent query para perguntas sobre o estado, apply para mudanças, undo para desfazer a "
-            "última revisão, revert para voltar a uma data/estado anterior, e noop quando nada foi pedido. "
-            "No máximo 25 operações. A summary deve ser curta e fiel.\n\n"
-            f"HORÁRIO LOCAL: {local_timestamp}\n"
-            f"MENSAGEM ORIGINAL: {message}\n\n"
-            "ESTADO ATIVO COMPLETO:\n"
+            "You interpret private natural-language commands that manage promotion preferences. "
+            "Do not authorize, confirm, or persist anything; only convert the message into a proposal. "
+            "Use only existing IDs for update/remove. For add, do not invent an ID; provide kind and data. "
+            "If there is material ambiguity, use intent clarify and ask one specific question. "
+            "Use query for questions about current state, apply for changes, undo for the latest revision, "
+            "revert for a prior date/state, and noop when no action was requested. Return at most 25 "
+            f"operations. Write summary and clarification_question in {response_language}.\n\n"
+            f"LOCAL TIMESTAMP: {local_timestamp}\n"
+            f"ORIGINAL MESSAGE: {message}\n\n"
+            "COMPLETE ACTIVE STATE:\n"
             + json.dumps(state, ensure_ascii=False, sort_keys=True)
         )
 
@@ -172,10 +178,11 @@ class GeminiPreferenceInterpreter:
         snapshot: PreferenceSnapshot,
         *,
         local_timestamp: str | None = None,
+        language: str = "en",
     ) -> PreferenceProposal:
         timestamp = local_timestamp or datetime.now().astimezone().isoformat()
         payload = await self.client.generate_json(
-            self._prompt(message, snapshot, timestamp),
+            self._prompt(message, snapshot, timestamp, language),
             INTERPRETER_SCHEMA,
             max_output_tokens=self.max_output_tokens,
             temperature=0,
