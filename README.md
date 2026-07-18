@@ -6,6 +6,24 @@
 
 **Filtro de promoções para Telegram e Pelando com preferências ao vivo, BM25 e decisão final do Gemini.**
 
+<p>
+  <a href="#como-funciona">Como funciona</a> •
+  <a href="#instalação-rápida">Instalação rápida</a> •
+  <a href="#configuração-principal">Configuração</a> •
+  <a href="#cli">CLI</a> •
+  <a href="#testes">Testes</a>
+</p>
+
+<p>
+  <img src="https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12+" />
+  <img src="https://img.shields.io/badge/runtime-asyncio-1f6feb" alt="asyncio" />
+  <img src="https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose" />
+  <img src="https://img.shields.io/badge/target-Raspberry%20Pi%204B%202GB-C51A4A?logo=raspberrypi&logoColor=white" alt="Raspberry Pi 4B" />
+  <img src="https://img.shields.io/github/stars/koobzaar/Sieve?style=flat" alt="Stars" />
+</p>
+
+<img src="assets/sieve_preview.gif" alt="Demonstração do Sieve" width="100%" />
+
 </div>
 
 O Sieve acompanha grupos do Telegram e a página `/recentes` do Pelando, descarta ruído e envia
