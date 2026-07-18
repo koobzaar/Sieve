@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import json
-import random
 import re
 from typing import Any
 
 import httpx
 
 from .config import env_secret
+from .gemini import GeminiError, GeminiStructuredClient, RetryableGeminiError
 from .models import Decision, Evaluation, Promotion
 
 
@@ -25,7 +24,7 @@ class GeminiEvaluator:
         self,
         *,
         api_key: str,
-        profile: str,
+        profile: str = "",
         model: str,
         provider_url: str = (
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -34,23 +33,26 @@ class GeminiEvaluator:
         max_output_tokens: int = 160,
         retries: int = 3,
         client: httpx.AsyncClient | None = None,
-        random_source: random.Random | None = None,
+        random_source: Any | None = None,
     ) -> None:
-        self.api_key = api_key
         self.profile = profile
-        self.model = model
-        self.url = provider_url.format(model=model)
         self.max_output_tokens = max_output_tokens
-        self.retries = retries
-        self.random = random_source or random.Random()
-        self._owns_client = client is None
-        self.client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout_seconds, connect=min(10, timeout_seconds)),
-            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
-            headers={"User-Agent": "sieve/1.0"},
+        self.structured_client = GeminiStructuredClient(
+            api_key=api_key,
+            model=model,
+            provider_url=provider_url,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+            client=client,
+            random_source=random_source,
         )
 
-    def _request(self, promotion: Promotion, normalized: str) -> dict[str, Any]:
+    def _request(
+        self,
+        promotion: Promotion,
+        normalized: str,
+        preference_context: str | None = None,
+    ) -> dict[str, Any]:
         metadata = {
             "source": promotion.source,
             "price": str(promotion.price) if promotion.price is not None else None,
@@ -60,37 +62,37 @@ class GeminiEvaluator:
             "Você avalia promoções para uma única pessoa. Use todo o perfil abaixo. "
             "Responda encaminhar somente quando a oferta combinar de forma concreta com o perfil. "
             "A razão deve ter uma frase curta, sem markdown.\n\n"
-            f"PERFIL COMPLETO:\n{self.profile}\n\n"
+            f"PERFIL COMPLETO:\n{preference_context if preference_context is not None else self.profile}\n\n"
             f"PROMOÇÃO NORMALIZADA:\n{normalized}\n\n"
             f"METADADOS ESSENCIAIS:\n{json.dumps(metadata, ensure_ascii=False)}"
         )
-        return {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": self.max_output_tokens,
-                "responseMimeType": "application/json",
-                "responseJsonSchema": {
-                    "type": "object",
-                    "properties": {
-                        "decision": {"type": "string", "enum": ["forward", "discard"]},
-                        "reason": {
-                            "type": "string",
-                            "description": "Uma única frase curta em português.",
-                        },
-                    },
-                    "required": ["decision", "reason"],
-                    "additionalProperties": False,
+        schema = {
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "enum": ["forward", "discard"]},
+                "reason": {
+                    "type": "string",
+                    "description": "Uma única frase curta em português.",
                 },
-                "thinkingConfig": {"thinkingLevel": "minimal"},
             },
+            "required": ["decision", "reason"],
         }
+        return GeminiStructuredClient.request_body(
+            prompt,
+            schema,
+            max_output_tokens=self.max_output_tokens,
+            temperature=0.1,
+            thinking_level="minimal",
+        )
 
     @staticmethod
     def _parse(payload: dict[str, Any]) -> Evaluation:
         try:
-            text = payload["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(text)
+            parsed = (
+                GeminiStructuredClient.parse_response(payload)
+                if "candidates" in payload
+                else payload
+            )
             decision = Decision(str(parsed["decision"]).casefold())
             reason = re.sub(r"\s+", " ", str(parsed["reason"])).strip()
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -104,33 +106,24 @@ class GeminiEvaluator:
             reason = reason[:237].rstrip() + "..."
         return Evaluation(decision, reason)
 
-    async def evaluate(self, promotion: Promotion, normalized: str) -> Evaluation:
-        last_error = "Gemini request failed"
-        for attempt in range(self.retries):
-            try:
-                response = await self.client.post(
-                    self.url,
-                    headers={"x-goog-api-key": self.api_key},
-                    json=self._request(promotion, normalized),
-                )
-                if response.status_code in {408, 409, 425, 429} or response.status_code >= 500:
-                    last_error = f"transient Gemini HTTP {response.status_code}"
-                elif response.is_error:
-                    raise EvaluationError(f"Gemini HTTP {response.status_code}")
-                else:
-                    return self._parse(response.json())
-            except EvaluationError:
-                raise
-            except (httpx.TimeoutException, httpx.NetworkError, json.JSONDecodeError) as exc:
-                last_error = f"transient Gemini transport failure: {type(exc).__name__}"
-            if attempt + 1 < self.retries:
-                delay = min(8.0, 0.5 * (2**attempt)) + self.random.uniform(0, 0.25)
-                await asyncio.sleep(delay)
-        raise RetryableEvaluationError(last_error)
+    async def evaluate(
+        self,
+        promotion: Promotion,
+        normalized: str,
+        preference_context: str | None = None,
+    ) -> Evaluation:
+        try:
+            payload = await self.structured_client.request_json(
+                self._request(promotion, normalized, preference_context)
+            )
+            return self._parse(payload)
+        except RetryableGeminiError as exc:
+            raise RetryableEvaluationError(str(exc)) from exc
+        except GeminiError as exc:
+            raise EvaluationError(str(exc)) from exc
 
     async def close(self) -> None:
-        if self._owns_client:
-            await self.client.aclose()
+        await self.structured_client.close()
 
 
 def create_gemini_evaluator(

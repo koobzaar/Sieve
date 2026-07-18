@@ -25,6 +25,24 @@ def test_saved_pelando_jsonld_fixture_is_parsed_strictly() -> None:
     assert promotion.url == "https://www.pelando.com.br/d/ssd-123"
 
 
+def test_current_pelando_collection_page_is_paired_with_rendered_cards() -> None:
+    html = """
+    <script id="feed-schema" type="application/ld+json">
+      {"@type":"WebPage","mainEntity":{"@type":"CollectionPage","hasPart":[
+        {"@type":"WebPage","url":"https://www.pelando.com.br/d/ssd-123","name":"SSD NVMe"}
+      ]}}
+    </script>
+    <a href="https://www.pelando.com.br/d/ssd-123" data-deal-id="deal-123">SSD NVMe</a>
+    <span class="_deal-card-stamp_hash"><small>R$</small>299,90</span>
+    <div data-temperature-level="hot"><button>+</button><span>321°</span></div>
+    """
+    promotions = parse_feed_schema(html)
+    assert len(promotions) == 1
+    assert promotions[0].id == "deal-123"
+    assert str(promotions[0].price) == "299.90"
+    assert promotions[0].temperature == 321
+
+
 @pytest.mark.parametrize(
     "html",
     [

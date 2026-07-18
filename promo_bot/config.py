@@ -32,6 +32,26 @@ class HardFilterRule:
 
 
 @dataclass(frozen=True, slots=True)
+class PreferenceConfig:
+    enabled: bool = False
+    owner_id: int | None = None
+    owner_id_env: str = "TELEGRAM_PRIVATE_CHAT_ID"
+    chat_id: int | None = None
+    chat_id_env: str = "TELEGRAM_PRIVATE_CHAT_ID"
+    token_env: str = "TELEGRAM_BOT_TOKEN"
+    api_url: str = "https://api.telegram.org"
+    polling_timeout: int = 30
+    queue_capacity: int = 20
+    rate_per_minute: int = 5
+    rate_per_hour: int = 20
+    confirmation_ttl_seconds: int = 600
+    max_entries: int = 500
+    max_operations: int = 25
+    max_state_bytes: int = 128 * 1024
+    parser: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     mode: str
     queue_capacity: int
@@ -55,6 +75,7 @@ class AppConfig:
     evaluator: dict[str, Any]
     sink_factory: str
     sink: dict[str, Any]
+    preferences: PreferenceConfig = field(default_factory=PreferenceConfig)
     failure_alert_threshold: int = 3
     llm_outage_alert_seconds: int = 300
 
@@ -188,6 +209,7 @@ def load_config(path: str | Path) -> AppConfig:
     pipeline = _mapping(root.get("pipeline", {}), "pipeline")
     llm = _mapping(root.get("evaluator", {}), "evaluator")
     sink = _mapping(root.get("sink", {}), "sink")
+    preference_raw = _mapping(root.get("preferences", {}), "preferences")
     sources_raw = root.get("sources", [])
     if not isinstance(sources_raw, list):
         raise ConfigurationError("sources must be a list")
@@ -208,6 +230,57 @@ def load_config(path: str | Path) -> AppConfig:
     evaluator_settings = _mapping(llm.get("settings", {}), "evaluator.settings")
     if not str(evaluator_settings.get("model", "")).strip():
         raise ConfigurationError("evaluator.settings.model must be explicitly configured")
+    preference_parser = _mapping(
+        preference_raw.get("parser", {}), "preferences.parser"
+    )
+    preference_config = PreferenceConfig(
+        enabled=bool(preference_raw.get("enabled", False)),
+        owner_id=(
+            int(preference_raw["owner_id"])
+            if preference_raw.get("owner_id") is not None
+            else None
+        ),
+        owner_id_env=str(
+            preference_raw.get("owner_id_env", "TELEGRAM_PRIVATE_CHAT_ID")
+        ),
+        chat_id=(
+            int(preference_raw["chat_id"])
+            if preference_raw.get("chat_id") is not None
+            else None
+        ),
+        chat_id_env=str(
+            preference_raw.get("chat_id_env", "TELEGRAM_PRIVATE_CHAT_ID")
+        ),
+        token_env=str(preference_raw.get("token_env", "TELEGRAM_BOT_TOKEN")),
+        api_url=str(preference_raw.get("api_url", "https://api.telegram.org")),
+        polling_timeout=int(preference_raw.get("polling_timeout", 30)),
+        queue_capacity=int(preference_raw.get("queue_capacity", 20)),
+        rate_per_minute=int(preference_raw.get("rate_per_minute", 5)),
+        rate_per_hour=int(preference_raw.get("rate_per_hour", 20)),
+        confirmation_ttl_seconds=int(
+            preference_raw.get("confirmation_ttl_seconds", 600)
+        ),
+        max_entries=int(preference_raw.get("max_entries", 500)),
+        max_operations=int(preference_raw.get("max_operations", 25)),
+        max_state_bytes=int(preference_raw.get("max_state_bytes", 128 * 1024)),
+        parser=dict(preference_parser),
+    )
+    if not 1 <= preference_config.queue_capacity <= 100:
+        raise ConfigurationError("preferences.queue_capacity must be between 1 and 100")
+    if not 1 <= preference_config.polling_timeout <= 50:
+        raise ConfigurationError("preferences.polling_timeout must be between 1 and 50")
+    if preference_config.confirmation_ttl_seconds <= 0:
+        raise ConfigurationError("preferences.confirmation_ttl_seconds must be positive")
+    if not 1 <= preference_config.max_operations <= 25:
+        raise ConfigurationError("preferences.max_operations must be between 1 and 25")
+    if not 1 <= preference_config.max_entries <= 500:
+        raise ConfigurationError("preferences.max_entries must be between 1 and 500")
+    if not 1 <= preference_config.max_state_bytes <= 128 * 1024:
+        raise ConfigurationError(
+            "preferences.max_state_bytes must be between 1 and 131072"
+        )
+    if preference_config.rate_per_minute <= 0 or preference_config.rate_per_hour <= 0:
+        raise ConfigurationError("preference rate limits must be positive")
     return AppConfig(
         mode=mode,
         queue_capacity=int(runtime.get("queue_capacity", 256)),
@@ -231,6 +304,7 @@ def load_config(path: str | Path) -> AppConfig:
         evaluator=evaluator_settings,
         sink_factory=str(sink.get("factory", "promo_bot.sink:create_telegram_sink")),
         sink=_mapping(sink.get("settings", {}), "sink.settings"),
+        preferences=preference_config,
         failure_alert_threshold=int(runtime.get("failure_alert_threshold", 3)),
         llm_outage_alert_seconds=int(runtime.get("llm_outage_alert_seconds", 300)),
     )

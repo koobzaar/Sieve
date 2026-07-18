@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .models import Evaluation, PipelineResult, Promotion, RetryJob
+from .preferences import PreferenceProposal, PreferenceSnapshot
 
 PromotionEmitter = Callable[[Promotion], Awaitable[None]]
 FailureReporter = Callable[[str, Exception], Awaitable[None]]
@@ -25,7 +26,12 @@ class PipelineStage(Protocol):
 
 @runtime_checkable
 class LLMEvaluator(Protocol):
-    async def evaluate(self, promotion: Promotion, normalized: str) -> Evaluation: ...
+    async def evaluate(
+        self,
+        promotion: Promotion,
+        normalized: str,
+        preference_context: str | None = None,
+    ) -> Evaluation: ...
 
     async def close(self) -> None: ...
 
@@ -64,3 +70,37 @@ class StateStore(Protocol):
     def prune(self) -> dict[str, int]: ...
 
     def close(self) -> None: ...
+
+
+@runtime_checkable
+class PreferenceProvider(Protocol):
+    def get_snapshot(self) -> PreferenceSnapshot: ...
+
+
+@runtime_checkable
+class PreferenceStore(Protocol):
+    def current_snapshot(self) -> PreferenceSnapshot: ...
+
+    def apply(
+        self,
+        operations: Sequence[Any],
+        *,
+        base_revision: int,
+        original_message: str,
+        actor_id: int | None,
+        update_id: int | None,
+        summary: str,
+    ) -> PreferenceSnapshot: ...
+
+
+@runtime_checkable
+class PreferenceInterpreter(Protocol):
+    async def interpret(
+        self,
+        message: str,
+        snapshot: PreferenceSnapshot,
+        *,
+        local_timestamp: str,
+    ) -> PreferenceProposal: ...
+
+    async def close(self) -> None: ...

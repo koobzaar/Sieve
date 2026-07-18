@@ -10,10 +10,18 @@ from typing import Any
 
 import httpx
 
-from .config import AppConfig, load_factory
+from .config import AppConfig, env_secret, load_factory
 from .evaluator import RetryableEvaluationError
 from .models import Decision, Promotion
 from .pipeline import PromotionPipeline
+from .preference_bot import (
+    PreferenceCommandProcessor,
+    TelegramBotAPI,
+    TelegramPreferenceBot,
+)
+from .preference_interpreter import create_gemini_preference_interpreter
+from .preference_store import SQLitePreferenceStore
+from .preferences import AtomicPreferenceProvider, PreferenceSnapshot
 from .sources.pelando import PelandoSchemaError
 from .store import SQLiteStateStore, StoreError
 
@@ -57,6 +65,24 @@ class Service:
             follow_redirects=True,
             headers={"User-Agent": "sieve/1.0"},
         )
+        preference_settings = config.preferences
+        self.preference_store = SQLitePreferenceStore(
+            self.store,
+            max_entries=preference_settings.max_entries,
+            max_operations=preference_settings.max_operations,
+            max_state_bytes=preference_settings.max_state_bytes,
+            confirmation_ttl_seconds=preference_settings.confirmation_ttl_seconds,
+            outbox_capacity=preference_settings.queue_capacity,
+            on_snapshot=self._preference_snapshot_changed,
+        )
+        initial_snapshot = self.preference_store.initialize(
+            profile=config.profile,
+            aliases=config.aliases,
+            hard_rules=config.hard_rules,
+        )
+        self.preference_provider = AtomicPreferenceProvider(initial_snapshot)
+        self.preference_store.provider = self.preference_provider
+        self.store.ensure_alias_generation(dict(initial_snapshot.aliases))
         evaluator_factory = load_factory(config.evaluator_factory)
         sink_factory = load_factory(config.sink_factory)
         self.evaluator = evaluator_factory(config.evaluator, profile=config.profile, client=self.http)
@@ -78,7 +104,48 @@ class Service:
             exceptional_temperature=config.exceptional_temperature,
             default_mode=config.mode,
             source_modes=source_modes,
+            preference_provider=self.preference_provider,
         )
+        self.preference_interpreter = None
+        self.preference_bot = None
+        if preference_settings.enabled:
+            owner_id = (
+                preference_settings.owner_id
+                if preference_settings.owner_id is not None
+                else int(env_secret(preference_settings.owner_id_env))
+            )
+            owner_chat_id = (
+                preference_settings.chat_id
+                if preference_settings.chat_id is not None
+                else int(env_secret(preference_settings.chat_id_env))
+            )
+            parser_settings = dict(config.evaluator)
+            parser_settings.update(preference_settings.parser)
+            parser_settings["max_operations"] = preference_settings.max_operations
+            self.preference_interpreter = create_gemini_preference_interpreter(
+                parser_settings, client=self.http
+            )
+            bot_api = TelegramBotAPI(
+                token=env_secret(preference_settings.token_env),
+                api_url=preference_settings.api_url,
+                timeout_seconds=max(40, preference_settings.polling_timeout + 10),
+            )
+            processor = PreferenceCommandProcessor(
+                store=self.preference_store,
+                interpreter=self.preference_interpreter,
+                owner_chat_id=owner_chat_id,
+                owner_user_id=owner_id,
+                rate_per_minute=preference_settings.rate_per_minute,
+                rate_per_hour=preference_settings.rate_per_hour,
+            )
+            self.preference_bot = TelegramPreferenceBot(
+                api=bot_api,
+                processor=processor,
+                store=self.preference_store,
+                owner_chat_id=owner_chat_id,
+                polling_timeout=preference_settings.polling_timeout,
+                queue_capacity=preference_settings.queue_capacity,
+            )
         self.sources = [
             load_factory(item.factory)(
                 item.settings,
@@ -89,6 +156,14 @@ class Service:
             for item in config.sources
             if item.enabled
         ]
+
+    def _preference_snapshot_changed(
+        self,
+        snapshot: PreferenceSnapshot,
+        previous: PreferenceSnapshot | None,
+    ) -> None:
+        if previous is None or dict(snapshot.aliases) != dict(previous.aliases):
+            self.store.start_alias_rebuild(dict(snapshot.aliases))
 
     async def report_health(self, name: str, error: Exception | None) -> None:
         try:
@@ -181,6 +256,12 @@ class Service:
         while not self.stop.is_set():
             try:
                 removed = self.store.prune()
+                removed.update(
+                    {
+                        f"preferences_{key}": value
+                        for key, value in self.preference_store.prune_transient().items()
+                    }
+                )
                 self.store.record_health("runtime")
                 logger.info(
                     "maintenance",
@@ -190,6 +271,20 @@ class Service:
                 await self.report_health("database", exc)
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=60)
+            except TimeoutError:
+                pass
+
+    async def _alias_rebuild_worker(self) -> None:
+        while not self.stop.is_set():
+            try:
+                result = self.store.rebuild_alias_batch(250)
+                if result["processed"]:
+                    await asyncio.sleep(0)
+                    continue
+            except Exception as exc:
+                await self.report_health("alias_rebuild", exc)
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=5)
             except TimeoutError:
                 pass
 
@@ -217,6 +312,9 @@ class Service:
     async def run(self) -> None:
         if not self.sources:
             raise RuntimeError("no enabled promotion sources")
+        if self.preference_bot is not None:
+            await self.preference_bot.drain_outbox()
+            await self.preference_bot.check_webhook()
         loop = asyncio.get_running_loop()
         for signal_name in (signal.SIGINT, signal.SIGTERM):
             with suppress(NotImplementedError):
@@ -226,11 +324,18 @@ class Service:
             asyncio.create_task(self._retry_worker(), name="retry"),
             asyncio.create_task(self._maintenance(), name="maintenance"),
             asyncio.create_task(self._memory_monitor(), name="memory"),
+            asyncio.create_task(self._alias_rebuild_worker(), name="alias-rebuild"),
             *[
                 asyncio.create_task(source.run(self.emit, self.stop), name=f"source:{source.name}")
                 for source in self.sources
             ],
         ]
+        if self.preference_bot is not None:
+            tasks.append(
+                asyncio.create_task(
+                    self.preference_bot.run(self.stop), name="preference-bot"
+                )
+            )
         logger.info("service_started", extra={"event": "service_started", "sources": len(self.sources)})
         try:
             while not self.stop.is_set():
@@ -251,7 +356,14 @@ class Service:
                 await self.evaluator.close()
             with suppress(Exception):
                 await self.sink.close()
+            if self.preference_interpreter is not None:
+                with suppress(Exception):
+                    await self.preference_interpreter.close()
+            if self.preference_bot is not None:
+                with suppress(Exception):
+                    await self.preference_bot.close()
             await self.http.aclose()
+            self.preference_store.close()
             self.store.close()
             logger.info("service_stopped", extra={"event": "service_stopped"})
 

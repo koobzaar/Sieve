@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 
 def okapi_bm25(
@@ -12,6 +12,7 @@ def okapi_bm25(
     corpus_size: int,
     average_length: float,
     document_frequencies: dict[str, int],
+    term_weights: Mapping[str, float] | None = None,
     k1: float = 1.2,
     b: float = 0.75,
 ) -> float:
@@ -28,7 +29,8 @@ def okapi_bm25(
         inverse_frequency = math.log(
             1.0 + (corpus_size - document_frequency + 0.5) / (document_frequency + 0.5)
         )
-        score += inverse_frequency * (
+        weight = float(term_weights.get(term, 1.0)) if term_weights is not None else 1.0
+        score += weight * inverse_frequency * (
             frequency * (k1 + 1.0) / (frequency + k1 * length_norm)
         )
     return score

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 import time
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from .models import PipelineResult, Promotion, RetryJob
+from .normalization import expand_aliases
 
 
 class StoreError(RuntimeError):
@@ -64,6 +66,34 @@ CREATE TABLE IF NOT EXISTS corpus_df (
     term TEXT PRIMARY KEY,
     frequency INTEGER NOT NULL CHECK(frequency >= 0)
 );
+CREATE TABLE IF NOT EXISTS corpus_raw_tokens (
+    doc_id INTEGER PRIMARY KEY REFERENCES corpus_docs(id) ON DELETE CASCADE,
+    tokens_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS corpus_generations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    aliases_json TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active','building')),
+    cursor_doc_id INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corpus_generation_status
+    ON corpus_generations(status);
+CREATE TABLE IF NOT EXISTS corpus_generation_docs (
+    generation_id INTEGER NOT NULL REFERENCES corpus_generations(id) ON DELETE CASCADE,
+    doc_id INTEGER NOT NULL REFERENCES corpus_docs(id) ON DELETE CASCADE,
+    length INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, doc_id)
+);
+CREATE TABLE IF NOT EXISTS corpus_generation_terms (
+    generation_id INTEGER NOT NULL REFERENCES corpus_generations(id) ON DELETE CASCADE,
+    doc_id INTEGER NOT NULL REFERENCES corpus_docs(id) ON DELETE CASCADE,
+    term TEXT NOT NULL,
+    PRIMARY KEY (generation_id, doc_id, term)
+);
+CREATE INDEX IF NOT EXISTS idx_corpus_generation_terms_term
+    ON corpus_generation_terms(generation_id, term);
 CREATE TABLE IF NOT EXISTS retry_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     promotion_json TEXT NOT NULL,
@@ -117,12 +147,154 @@ class SQLiteStateStore:
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA busy_timeout=10000")
             self._connection.executescript(SCHEMA)
+            missing = self._connection.execute(
+                "SELECT d.id FROM corpus_docs d LEFT JOIN corpus_raw_tokens r ON r.doc_id=d.id "
+                "WHERE r.doc_id IS NULL"
+            ).fetchall()
+            for row in missing:
+                doc_id = int(row[0])
+                terms = [
+                    str(item[0])
+                    for item in self._connection.execute(
+                        "SELECT term FROM corpus_terms WHERE doc_id=? ORDER BY term", (doc_id,)
+                    )
+                ]
+                self._connection.execute(
+                    "INSERT INTO corpus_raw_tokens(doc_id,tokens_json) VALUES(?,?)",
+                    (doc_id, json.dumps(terms, ensure_ascii=False, separators=(",", ":"))),
+                )
         except sqlite3.Error as exc:
             raise StoreError(f"cannot initialize SQLite store: {exc}") from exc
 
     def _begin(self) -> sqlite3.Connection:
         self._connection.execute("BEGIN IMMEDIATE")
         return self._connection
+
+    @staticmethod
+    def _aliases_material(aliases: dict[str, list[str]] | dict[str, tuple[str, ...]]) -> tuple[str, str]:
+        payload = {
+            str(key): [str(item) for item in values]
+            for key, values in sorted(aliases.items())
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def ensure_alias_generation(
+        self, aliases: dict[str, list[str]] | dict[str, tuple[str, ...]]
+    ) -> bool:
+        """Ensure an active alias fingerprint exists; return whether it is ready."""
+        _, fingerprint = self._aliases_material(aliases)
+        with self._lock:
+            active = self._connection.execute(
+                "SELECT fingerprint FROM corpus_generations WHERE status='active'"
+            ).fetchone()
+            building = self._connection.execute(
+                "SELECT 1 FROM corpus_generations WHERE status='building'"
+            ).fetchone()
+            if (
+                active is not None
+                and str(active[0]) == fingerprint
+                and building is None
+            ):
+                return True
+        self.start_alias_rebuild(aliases)
+        return self.alias_generation_ready(aliases)
+
+    def start_alias_rebuild(
+        self, aliases: dict[str, list[str]] | dict[str, tuple[str, ...]]
+    ) -> int | None:
+        encoded, fingerprint = self._aliases_material(aliases)
+        with self._lock:
+            connection = self._begin()
+            try:
+                active = connection.execute(
+                    "SELECT id,fingerprint FROM corpus_generations WHERE status='active'"
+                ).fetchone()
+                building = connection.execute(
+                    "SELECT id,fingerprint FROM corpus_generations WHERE status='building'"
+                ).fetchone()
+                if active is None:
+                    document_count = int(
+                        connection.execute("SELECT COUNT(*) FROM corpus_docs").fetchone()[0]
+                    )
+                    if document_count == 0:
+                        cursor = connection.execute(
+                            "INSERT INTO corpus_generations(aliases_json,fingerprint,status,cursor_doc_id,created_at) "
+                            "VALUES(?,?,'active',0,?)",
+                            (encoded, fingerprint, self.clock()),
+                        )
+                        generation_id = int(cursor.lastrowid or 0)
+                        connection.execute("COMMIT")
+                        return generation_id
+                    legacy_encoded, legacy_fingerprint = self._aliases_material({})
+                    connection.execute(
+                        "INSERT INTO corpus_generations(aliases_json,fingerprint,status,cursor_doc_id,created_at) "
+                        "VALUES(?,?,'active',0,?)",
+                        (
+                            legacy_encoded,
+                            f"legacy:{legacy_fingerprint}",
+                            self.clock(),
+                        ),
+                    )
+                if active is not None and str(active["fingerprint"]) == fingerprint:
+                    if building is not None:
+                        connection.execute(
+                            "DELETE FROM corpus_generations WHERE id=?",
+                            (int(building["id"]),),
+                        )
+                    connection.execute("COMMIT")
+                    return None
+                if building is not None and str(building["fingerprint"]) == fingerprint:
+                    connection.execute("COMMIT")
+                    return int(building["id"])
+                if building is not None:
+                    connection.execute(
+                        "DELETE FROM corpus_generations WHERE id=?", (int(building["id"]),)
+                    )
+                cursor = connection.execute(
+                    "INSERT INTO corpus_generations(aliases_json,fingerprint,status,cursor_doc_id,created_at) "
+                    "VALUES(?,?,'building',0,?)",
+                    (encoded, fingerprint, self.clock()),
+                )
+                generation_id = int(cursor.lastrowid or 0)
+                connection.execute("COMMIT")
+                return generation_id
+            except sqlite3.Error as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(f"cannot start alias rebuild: {exc}") from exc
+
+    def alias_generation_ready(
+        self, aliases: dict[str, list[str]] | dict[str, tuple[str, ...]]
+    ) -> bool:
+        _, fingerprint = self._aliases_material(aliases)
+        with self._lock:
+            active = self._connection.execute(
+                "SELECT fingerprint FROM corpus_generations WHERE status='active'"
+            ).fetchone()
+            return bool(active and str(active[0]) == fingerprint)
+
+    @staticmethod
+    def _index_generation_document_locked(
+        connection: sqlite3.Connection,
+        generation_id: int,
+        doc_id: int,
+        tokens: Sequence[str],
+    ) -> None:
+        connection.execute(
+            "INSERT OR REPLACE INTO corpus_generation_docs(generation_id,doc_id,length) "
+            "VALUES(?,?,?)",
+            (generation_id, doc_id, len(tokens)),
+        )
+        connection.execute(
+            "DELETE FROM corpus_generation_terms WHERE generation_id=? AND doc_id=?",
+            (generation_id, doc_id),
+        )
+        connection.executemany(
+            "INSERT INTO corpus_generation_terms(generation_id,doc_id,term) VALUES(?,?,?)",
+            ((generation_id, doc_id, term) for term in sorted(set(tokens))),
+        )
 
     def check_and_mark_seen(self, promotion: Promotion, content_hash: str) -> bool:
         with self._lock:
@@ -152,16 +324,31 @@ class SQLiteStateStore:
                 connection.execute("ROLLBACK")
                 raise StoreError(f"deduplication transaction failed: {exc}") from exc
 
-    def add_corpus_document(self, tokens: Sequence[str], now: float | None = None) -> int:
-        unique_terms = sorted(set(tokens))
+    def add_corpus_document(
+        self,
+        tokens: Sequence[str],
+        now: float | None = None,
+        *,
+        raw_tokens: Sequence[str] | None = None,
+    ) -> int:
+        raw = list(raw_tokens if raw_tokens is not None else tokens)
+        indexed = list(tokens)
+        unique_terms = sorted(set(indexed))
         with self._lock:
             connection = self._begin()
             try:
                 cursor = connection.execute(
                     "INSERT INTO corpus_docs(created_at,length) VALUES(?,?)",
-                    (self.clock() if now is None else now, len(tokens)),
+                    (self.clock() if now is None else now, len(indexed)),
                 )
                 doc_id = int(cursor.lastrowid or 0)
+                connection.execute(
+                    "INSERT INTO corpus_raw_tokens(doc_id,tokens_json) VALUES(?,?)",
+                    (
+                        doc_id,
+                        json.dumps(raw, ensure_ascii=False, separators=(",", ":")),
+                    ),
+                )
                 connection.executemany(
                     "INSERT INTO corpus_terms(doc_id,term) VALUES(?,?)",
                     ((doc_id, term) for term in unique_terms),
@@ -171,6 +358,15 @@ class SQLiteStateStore:
                     "ON CONFLICT(term) DO UPDATE SET frequency=frequency+1",
                     ((term,) for term in unique_terms),
                 )
+                building = connection.execute(
+                    "SELECT id,aliases_json FROM corpus_generations WHERE status='building'"
+                ).fetchone()
+                if building is not None:
+                    aliases = json.loads(str(building["aliases_json"]))
+                    rebuilt = expand_aliases(raw, aliases)
+                    self._index_generation_document_locked(
+                        connection, int(building["id"]), doc_id, rebuilt
+                    )
                 count = int(connection.execute("SELECT COUNT(*) FROM corpus_docs").fetchone()[0])
                 overflow = max(0, count - self.corpus_limit)
                 if overflow:
@@ -187,6 +383,27 @@ class SQLiteStateStore:
             except sqlite3.Error as exc:
                 connection.execute("ROLLBACK")
                 raise StoreError(f"corpus update failed: {exc}") from exc
+
+    def add_corpus_document_dynamic(
+        self,
+        raw_tokens: Sequence[str],
+        aliases: dict[str, list[str]] | dict[str, tuple[str, ...]],
+        now: float | None = None,
+    ) -> tuple[int, bool]:
+        _, requested_fingerprint = self._aliases_material(aliases)
+        with self._lock:
+            active = self._connection.execute(
+                "SELECT aliases_json,fingerprint FROM corpus_generations WHERE status='active'"
+            ).fetchone()
+        if active is None:
+            ready = self.ensure_alias_generation(aliases)
+            active_aliases = aliases
+        else:
+            ready = str(active["fingerprint"]) == requested_fingerprint
+            active_aliases = json.loads(str(active["aliases_json"]))
+        indexed = expand_aliases(raw_tokens, active_aliases)
+        count = self.add_corpus_document(indexed, now=now, raw_tokens=raw_tokens)
+        return count, ready and self.alias_generation_ready(aliases)
 
     @staticmethod
     def _delete_corpus_docs(connection: sqlite3.Connection, doc_ids: Sequence[int]) -> None:
@@ -218,6 +435,90 @@ class SQLiteStateStore:
                     )
                 }
             return int(row[0]), float(row[1]), frequencies
+
+    def rebuild_alias_batch(self, batch_size: int = 250) -> dict[str, int | bool | None]:
+        batch_size = max(1, min(int(batch_size), 1_000))
+        with self._lock:
+            connection = self._begin()
+            try:
+                generation = connection.execute(
+                    "SELECT id,aliases_json,cursor_doc_id FROM corpus_generations "
+                    "WHERE status='building'"
+                ).fetchone()
+                if generation is None:
+                    connection.execute("COMMIT")
+                    return {"processed": 0, "complete": True, "generation": None}
+                generation_id = int(generation["id"])
+                cursor_doc_id = int(generation["cursor_doc_id"])
+                aliases = json.loads(str(generation["aliases_json"]))
+                rows = connection.execute(
+                    "SELECT d.id,r.tokens_json FROM corpus_docs d "
+                    "JOIN corpus_raw_tokens r ON r.doc_id=d.id "
+                    "WHERE d.id>? ORDER BY d.id LIMIT ?",
+                    (cursor_doc_id, batch_size),
+                ).fetchall()
+                for row in rows:
+                    raw = json.loads(str(row["tokens_json"]))
+                    tokens = expand_aliases(raw, aliases)
+                    self._index_generation_document_locked(
+                        connection, generation_id, int(row["id"]), tokens
+                    )
+                if rows:
+                    cursor_doc_id = int(rows[-1]["id"])
+                    connection.execute(
+                        "UPDATE corpus_generations SET cursor_doc_id=? WHERE id=?",
+                        (cursor_doc_id, generation_id),
+                    )
+                remaining = connection.execute(
+                    "SELECT 1 FROM corpus_docs d JOIN corpus_raw_tokens r ON r.doc_id=d.id "
+                    "WHERE d.id>? LIMIT 1",
+                    (cursor_doc_id,),
+                ).fetchone()
+                complete = remaining is None
+                if complete:
+                    connection.execute("DELETE FROM corpus_terms")
+                    connection.execute("DELETE FROM corpus_df")
+                    connection.execute(
+                        "UPDATE corpus_docs SET length=COALESCE(("
+                        "SELECT length FROM corpus_generation_docs g "
+                        "WHERE g.generation_id=? AND g.doc_id=corpus_docs.id),length)",
+                        (generation_id,),
+                    )
+                    connection.execute(
+                        "INSERT INTO corpus_terms(doc_id,term) "
+                        "SELECT doc_id,term FROM corpus_generation_terms WHERE generation_id=?",
+                        (generation_id,),
+                    )
+                    connection.execute(
+                        "INSERT INTO corpus_df(term,frequency) "
+                        "SELECT term,COUNT(*) FROM corpus_generation_terms "
+                        "WHERE generation_id=? GROUP BY term",
+                        (generation_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM corpus_generations WHERE status='active'"
+                    )
+                    connection.execute(
+                        "UPDATE corpus_generations SET status='active' WHERE id=?",
+                        (generation_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM corpus_generation_docs WHERE generation_id=?",
+                        (generation_id,),
+                    )
+                    connection.execute(
+                        "DELETE FROM corpus_generation_terms WHERE generation_id=?",
+                        (generation_id,),
+                    )
+                connection.execute("COMMIT")
+                return {
+                    "processed": len(rows),
+                    "complete": complete,
+                    "generation": generation_id,
+                }
+            except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(f"alias rebuild batch failed: {exc}") from exc
 
     def add_decision(self, promotion: Promotion, result: PipelineResult) -> None:
         with self._lock:

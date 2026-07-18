@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from .config import ConfigurationError, env_secret, load_config
 from .logging import configure_logging
@@ -54,11 +55,20 @@ async def _auth_telegram(config_path: str, source_name: str | None, phone: str |
     Path(session_path).parent.mkdir(parents=True, exist_ok=True)
     client = TelegramClient(session_path, api_id, api_hash)
     try:
-        await client.start(phone=phone)
+        await _start_telegram_client(client, phone)
         me = await client.get_me()
         print(f"Authorized Telegram session for user id {me.id} at {session_path}.session")
     finally:
         await client.disconnect()
+
+
+async def _start_telegram_client(client: Any, phone: str | None) -> None:
+    # Telethon's omitted phone argument is an interactive input callback.
+    # Passing None explicitly disables that callback and raises ValueError.
+    if phone is None:
+        await client.start()
+    else:
+        await client.start(phone=phone)
 
 
 def _health(config_path: str) -> int:

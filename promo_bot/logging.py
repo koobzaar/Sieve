@@ -30,3 +30,7 @@ def configure_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level.upper())
+    # httpx logs full request URLs at INFO. Telegram embeds the bot token in
+    # the URL path, so provider request logs must never inherit INFO output.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)

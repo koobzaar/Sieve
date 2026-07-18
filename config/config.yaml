@@ -42,6 +42,22 @@ evaluator:
     max_output_tokens: 160
     retries: 3
 
+preferences:
+  enabled: true
+  owner_id_env: TELEGRAM_PRIVATE_CHAT_ID
+  chat_id_env: TELEGRAM_PRIVATE_CHAT_ID
+  token_env: TELEGRAM_BOT_TOKEN
+  api_url: https://api.telegram.org
+  polling_timeout: 30
+  queue_capacity: 20
+  rate_per_minute: 5
+  rate_per_hour: 20
+  confirmation_ttl_seconds: 600
+  max_entries: 500
+  max_operations: 25
+  max_state_bytes: 131072
+  parser: {}
+
 sink:
   factory: promo_bot.sink:create_telegram_sink
   settings:

@@ -42,7 +42,7 @@ async def test_gemini_sends_minimal_structured_stateless_request() -> None:
     config = body["generationConfig"]
     assert config["thinkingConfig"]["thinkingLevel"] == "minimal"
     assert config["responseMimeType"] == "application/json"
-    assert config["responseJsonSchema"]["required"] == ["decision", "reason"]
+    assert config["responseSchema"]["required"] == ["decision", "reason"]
     prompt = body["contents"][0]["parts"][0]["text"]
     assert "perfil completo" in prompt and "ssd brl 299" in prompt
     assert len(body["contents"]) == 1

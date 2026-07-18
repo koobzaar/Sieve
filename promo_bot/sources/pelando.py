@@ -45,6 +45,81 @@ class _FeedScriptParser(HTMLParser):
             self._capturing = False
 
 
+class _RenderedCardParser(HTMLParser):
+    """Extract the fields Pelando renders beside its CollectionPage JSON-LD."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.cards: list[dict[str, str]] = []
+        self._current: dict[str, str] | None = None
+        self._title_depth = 0
+        self._price_depth = 0
+        self._temperature_depth = 0
+        self._title_chunks: list[str] = []
+        self._price_chunks: list[str] = []
+        self._temperature_chunks: list[str] = []
+
+    def _finish_current(self) -> None:
+        if self._current is None:
+            return
+        self._current["title"] = " ".join("".join(self._title_chunks).split())
+        self._current["price"] = " ".join("".join(self._price_chunks).split())
+        temperature = re.search(r"-?\d+", "".join(self._temperature_chunks))
+        self._current["temperature"] = temperature.group() if temperature else ""
+        self.cards.append(self._current)
+        self._current = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if self._title_depth:
+            self._title_depth += 1
+        if self._price_depth:
+            self._price_depth += 1
+        if self._temperature_depth:
+            self._temperature_depth += 1
+
+        href = attributes.get("href", "") or ""
+        deal_id = attributes.get("data-deal-id")
+        if tag.casefold() == "a" and deal_id and "/d/" in href:
+            self._finish_current()
+            self._current = {"id": deal_id, "url": href}
+            self._title_chunks = []
+            self._price_chunks = []
+            self._temperature_chunks = []
+            self._title_depth = 1
+            return
+
+        classes = attributes.get("class", "") or ""
+        if (
+            self._current is not None
+            and tag.casefold() == "span"
+            and "deal-card-stamp" in classes
+        ):
+            self._price_depth = 1
+        if self._current is not None and attributes.get("data-temperature-level") is not None:
+            self._temperature_depth = 1
+
+    def handle_data(self, data: str) -> None:
+        if self._title_depth:
+            self._title_chunks.append(data)
+        if self._price_depth:
+            self._price_chunks.append(data)
+        if self._temperature_depth:
+            self._temperature_chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._title_depth:
+            self._title_depth -= 1
+        if self._price_depth:
+            self._price_depth -= 1
+        if self._temperature_depth:
+            self._temperature_depth -= 1
+
+    def close(self) -> None:
+        super().close()
+        self._finish_current()
+
+
 def _item_list(root: Any) -> list[Any]:
     if isinstance(root, dict) and isinstance(root.get("itemListElement"), list):
         return root["itemListElement"]
@@ -57,6 +132,68 @@ def _item_list(root: Any) -> list[Any]:
         if len(matches) == 1:
             return matches[0]["itemListElement"]
     raise PelandoSchemaError("feed-schema does not contain one ItemList")
+
+
+def _collection_parts(root: Any) -> list[Any] | None:
+    if not isinstance(root, dict):
+        return None
+    entity = root.get("mainEntity")
+    if not isinstance(entity, dict) or entity.get("@type") != "CollectionPage":
+        return None
+    parts = entity.get("hasPart")
+    return parts if isinstance(parts, list) else None
+
+
+def _parse_rendered_collection(
+    root: Any, html: str, *, source_name: str
+) -> list[Promotion] | None:
+    parts = _collection_parts(root)
+    if parts is None:
+        return None
+    if not parts:
+        raise PelandoSchemaError("feed-schema CollectionPage is empty")
+
+    parser = _RenderedCardParser()
+    parser.feed(html)
+    parser.close()
+    cards_by_url: dict[str, dict[str, str]] = {}
+    for card in parser.cards:
+        url = card["url"].rstrip("/")
+        if url in cards_by_url:
+            raise PelandoSchemaError(f"rendered feed contains duplicate URL: {url}")
+        cards_by_url[url] = card
+
+    promotions: list[Promotion] = []
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            raise PelandoSchemaError(f"CollectionPage item {index} is not an object")
+        title = str(part.get("name") or "").strip()
+        url = str(part.get("url") or part.get("@id") or "").strip().rstrip("/")
+        card = cards_by_url.get(url)
+        if not title or not url or card is None:
+            raise PelandoSchemaError(
+                f"CollectionPage item {index} is missing title, URL, or rendered card"
+            )
+        if not card.get("id") or not card.get("temperature"):
+            raise PelandoSchemaError(
+                f"CollectionPage item {index} is missing ID or temperature"
+            )
+        rendered_title = card.get("title", "")
+        if rendered_title and rendered_title != title:
+            raise PelandoSchemaError(f"CollectionPage item {index} title does not match its card")
+        promotions.append(
+            Promotion(
+                id=card["id"],
+                source=source_name,
+                title=title,
+                price=parse_price(card.get("price")),
+                url=url,
+                temperature=int(card["temperature"]),
+                timestamp=utc_now(),
+                metadata={"position": index + 1, "currency": "BRL"},
+            )
+        )
+    return promotions
 
 
 def _temperature(product: dict[str, Any], entry: dict[str, Any]) -> int | None:
@@ -106,6 +243,9 @@ def parse_feed_schema(html: str, *, source_name: str = "pelando") -> list[Promot
         root = json.loads(parser.feed_schema)
     except json.JSONDecodeError as exc:
         raise PelandoSchemaError("script#feed-schema is not valid JSON") from exc
+    rendered = _parse_rendered_collection(root, html, source_name=source_name)
+    if rendered is not None:
+        return rendered
     entries = _item_list(root)
     if not entries:
         raise PelandoSchemaError("feed-schema ItemList is empty")

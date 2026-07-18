@@ -43,6 +43,13 @@ def _matches_rule(tokens: list[str], rule: HardFilterRule) -> bool:
 def hard_filter(
     promotion: Promotion, hard_rules: tuple[HardFilterRule, ...]
 ) -> FilterResult:
+    fixed = fixed_filter(promotion)
+    if fixed.rejected:
+        return fixed
+    return hard_rules_filter(promotion, hard_rules)
+
+
+def fixed_filter(promotion: Promotion) -> FilterResult:
     text = normalize_text(f"{promotion.title} {promotion.text}")
     if not text or not any(char.isalnum() for char in text):
         return FilterResult(True, "empty_text_or_caption")
@@ -53,6 +60,13 @@ def hard_filter(
         return FilterResult(True, "link_spam")
     if re.search(r"(.)\1{9,}", text):
         return FilterResult(True, "repeated_character_spam")
+    return FilterResult(False)
+
+
+def hard_rules_filter(
+    promotion: Promotion, hard_rules: tuple[HardFilterRule, ...]
+) -> FilterResult:
+    text = normalize_text(f"{promotion.title} {promotion.text}")
     tokens = tokenize(text)
     for rule in hard_rules:
         if _matches_rule(tokens, rule):

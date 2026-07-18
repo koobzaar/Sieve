@@ -8,6 +8,9 @@ import pytest
 
 from promo_bot.models import Promotion
 from promo_bot.normalization import promotion_hash, tokenize
+from promo_bot.preference_store import SQLitePreferenceStore
+from promo_bot.preferences import OperationAction, PreferenceKind, PreferenceOperation
+from promo_bot.runtime import resident_memory_bytes
 from promo_bot.store import SQLiteStateStore
 
 
@@ -46,3 +49,63 @@ async def test_100k_promotions_keep_queue_state_and_memory_bounded(tmp_path) -> 
     assert corpus <= 1_000
     assert peak < 220 * 1024 * 1024
     store.close()
+
+
+@pytest.mark.soak
+@pytest.mark.skipif(os.environ.get("RUN_SOAK") != "1", reason="set RUN_SOAK=1")
+async def test_500_preferences_10k_alias_rebuild_and_command_flood_stay_bounded(
+    tmp_path,
+) -> None:
+    queue: asyncio.Queue[int] = asyncio.Queue(maxsize=20)
+    state = SQLiteStateStore(tmp_path / "preference-soak.db", corpus_limit=10_000)
+    preferences = SQLitePreferenceStore(state, max_entries=500)
+    preferences.initialize(profile="storage", aliases={}, hard_rules=())
+    tracemalloc.start()
+
+    revision = 0
+    remaining = 499
+    number = 0
+    while remaining:
+        batch_size = min(25, remaining)
+        operations = [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.CONTEXT,
+                data={"text": f"context-{number + index}"},
+            )
+            for index in range(batch_size)
+        ]
+        snapshot = preferences.apply(
+            operations,
+            base_revision=revision,
+            original_message="soak",
+            actor_id=1,
+            update_id=None,
+            summary="soak",
+        )
+        revision = snapshot.revision
+        number += batch_size
+        remaining -= batch_size
+    assert len(preferences.current_snapshot().entries) == 500
+
+    state.ensure_alias_generation({})
+    for document in range(10_000):
+        state.add_corpus_document_dynamic(["ssd", str(document)], {})
+    state.start_alias_rebuild({"storage": ["ssd"]})
+    while not state.rebuild_alias_batch(250)["complete"]:
+        pass
+    assert state.alias_generation_ready({"storage": ["ssd"]})
+
+    maximum_queue = 0
+    for command in range(10_000):
+        await queue.put(command)
+        maximum_queue = max(maximum_queue, queue.qsize())
+        queue.get_nowait()
+        queue.task_done()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    rss = resident_memory_bytes()
+    assert maximum_queue <= 20
+    assert peak < 220 * 1024 * 1024
+    assert not rss or rss < 220 * 1024 * 1024
+    state.close()

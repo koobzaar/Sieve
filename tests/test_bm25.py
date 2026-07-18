@@ -29,3 +29,16 @@ def test_empty_or_uninitialized_corpus_scores_zero() -> None:
         )
         == 0
     )
+
+
+def test_term_weights_scale_contribution_linearly() -> None:
+    common = {
+        "corpus_size": 10,
+        "average_length": 1,
+        "document_frequencies": {"ssd": 2},
+    }
+    low = okapi_bm25(["ssd"], ["ssd"], term_weights={"ssd": 0.5}, **common)
+    neutral = okapi_bm25(["ssd"], ["ssd"], term_weights={"ssd": 1.0}, **common)
+    high = okapi_bm25(["ssd"], ["ssd"], term_weights={"ssd": 1.5}, **common)
+    assert low == neutral * 0.5
+    assert high == neutral * 1.5

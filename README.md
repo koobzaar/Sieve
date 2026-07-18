@@ -55,12 +55,15 @@ flowchart TD
     PL[Pelando /recentes<br/><i>JSON-LD polling</i>] --> Q
     Q[Bounded asyncio queue<br/>capacity 256]
 
-    Q --> HF{Hard filter}
-    HF -->|prioritized deny rule,<br/>chatter, link spam| X1[discard]
+    Q --> PS[Atomic preference snapshot]
+    PS --> HF{Spam / exclusion / hard rule}
+    HF -->|fixed spam, explicit exclusion,<br/>prioritized deny rule| X1[discard]
     HF --> DD{Seen before?}
     DD -->|content hash / native id| X2[discard]
 
-    DD --> EX{Exceptional?}
+    DD --> PC{Constraint violation?}
+    PC -->|reliable price / attribute mismatch| X5[discard]
+    PC --> EX{Exceptional?}
     EX -->|price error, historical low,<br/>&gt;50% stated discount,<br/>Pelando temp &ge; 300| DEL[Deliver]
 
     EX --> BM{BM25 vs profile}
@@ -80,10 +83,11 @@ flowchart TD
 
 | Stage                  | Behaviour                                                                                                                                                                                                                                                                                                                              |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Hard filter**        | Fixed spam checks run first. Ordered, token-aware `allow`/`deny` rules then use the first matching priority, so narrow exceptions can precede broader category denials without competing regex and substring systems. Rules live in YAML. |
+| **Spam / exclusions / hard rules** | Fixed spam checks run first, followed by live explicit exclusions. Ordered, token-aware `allow`/`deny` rules use the first matching priority, so narrow exceptions can precede broader category denials. |
 | **Deduplication**      | Exact content hash and native source ID, persisted in SQLite.                                                                                                                                                                                                                                                                          |
-| **Exceptional bypass** | Skips BM25 _and_ the LLM entirely. Triggers: Pelando temperature ≥ `exceptional_temperature`, explicit phrases (`erro de preço`, `menor preço histórico`, `price error`, …), or a parsed stated discount above 50%.                                                                                                                    |
-| **BM25**               | In-project Okapi BM25 (`k1=1.2`, `b=0.75`) against a rolling 10,000-document corpus, with bidirectional alias expansion. **Fails open** while the corpus holds fewer than `cold_start_documents` (500) — everything reaches the LLM until statistics are meaningful.                                                                   |
+| **Constraints**        | Reliably matched interest price violations and excluded attributes are discarded before any exceptional bypass. Missing required attributes remain undecided. |
+| **Exceptional bypass** | Normally skips BM25 and the LLM. If a promotion may match an interest but its required attributes cannot be proven, it skips BM25 and goes to Gemini instead. |
+| **BM25**               | In-project weighted Okapi BM25 (`k1=1.2`, `b=0.75`) against a rolling 10,000-document corpus. Importance `0–100` maps to `0.5×–1.5×`; `50` preserves the old score. BM25 fails open during cold start and alias-generation rebuilds. |
 | **Gemini**             | Structured JSON decision, minimal thinking budget, ≤160 output tokens, no conversation history, 3 retries on transient failure.                                                                                                                                                                                                        |
 | **Delivery**           | Single-claim delivery per promotion, so a restart mid-send can't double-post.                                                                                                                                                                                                                                                          |
 
@@ -92,8 +96,10 @@ flowchart TD
 - **Source-neutral core.** A `Promotion` dataclass plus `PromotionSource`, `PipelineStage`,
   `LLMEvaluator`, `PromotionSink` and `StateStore` protocols. Every implementation is resolved from
   a `module:factory` string in YAML — a new source drops in without touching the pipeline.
-- **Bounded everywhere.** Input queue 256, retry queue 100 items / 1 hour TTL, corpus 10,000 docs,
-  audit history 30 days or 50,000 rows, incremental pruning.
+- **Bounded everywhere.** Input queue 256, preference queue/outbox 20, retry queue 100 items / 1
+  hour TTL, corpus 10,000 docs, preference state 500 entries / 128 KB, incremental pruning.
+- **Live revisioned preferences.** YAML seeds revision zero once. SQLite is authoritative after
+  that, every mutation is audited, and each promotion keeps one immutable snapshot for its full run.
 - **No media downloads.** Telegram ingestion reads text and media captions only.
 - **Locked-down container.** Non-root user, read-only root filesystem, all capabilities dropped,
   `no-new-privileges`, 64 PIDs, 16 MB tmpfs, 10 MB × 3 log rotation.
@@ -195,6 +201,7 @@ environment variables named _by_ the config, never stored in either file.
 | `state`     | `path`, `retention_days`, `retention_cap`, `corpus_limit`, `retry_limit`, `retry_ttl_seconds`                               |
 | `pipeline`  | `bm25_threshold`, `bm25_k1`, `bm25_b`, `cold_start_documents`, `exceptional_temperature`, `profile`, `aliases`, `hard_rules` |
 | `evaluator` | `factory`, model name, provider URL, timeout, `max_output_tokens`, `retries`                                                |
+| `preferences` | enablement, owner/chat ID env vars, polling/queue limits, confirmation TTL, entry/operation/state caps, optional parser overrides |
 | `sink`      | `factory`, token/chat-ID env var names, API URL, timeout                                                                    |
 | `sources`   | list of `{name, factory, enabled, mode, settings}`                                                                          |
 
@@ -214,6 +221,36 @@ allows predictable and leaves generic products to broader denials.
 
 Per-source `mode` overrides `runtime.mode`, which is what lets you promote one Telegram group to
 `live` while everything else stays in shadow.
+
+### Live preference commands
+
+On the first startup for a database, Sieve imports the YAML profile losslessly as a baseline note
+and imports each alias and hard rule as its own revision-zero entry. It never imports YAML again for
+that database; deleting the preference database is the automatic reseed path.
+
+The configured private owner can send natural-language instructions to the delivery bot. The app
+checks both private chat and sender IDs before Gemini sees a message. The private chat includes an
+owner-scoped command menu and inline navigation buttons. Deterministic commands are:
+
+- `/start` and `/help`
+- `/preferences` and `/history`
+- `/preview <instruction>` (validates without changing state)
+- `/undo`
+- `/confirm <id>` and `/cancel <id>`
+
+Greetings, help requests, obvious preference-display requests and unknown slash commands are also
+handled locally. Gemini classifies more flexible natural-language queries, but application code
+always renders the authoritative SQLite preference snapshot in the reply.
+
+Risky changes receive inline Confirm/Cancel buttons and expire after ten minutes. Bare “yes” is not
+accepted. Hard-rule edits, bulk/category deletion, changes affecting more than five entries, dated
+reverts, and multi-entry undo always require an ID-bound confirmation. Applied revisions are kept
+indefinitely and rollback always creates a new revision.
+
+Telegram commands use Bot API long polling (`getUpdates`, 30 seconds, 20 updates) and refuse to
+start if the bot has an active webhook. The durable SQLite outbox and processed-update offset make
+restarts safe. Gemini-backed mutations are limited persistently to five per minute and twenty per
+hour; previews consume the limit, while queries and confirmations do not.
 
 ---
 
@@ -266,9 +303,9 @@ On Windows PowerShell, use `.venv\Scripts\pip` and `.venv\Scripts\python`.
 
 Tests never touch live services. They run against saved HTML/JSON-LD fixtures, synthetic events,
 mocked HTTP transports, deterministic clocks and temporary SQLite files. The suite covers BM25,
-normalization, filters and exceptional detection, source parsing, evaluator and sink contracts,
-store behaviour, Telegram reconnection, pipeline integration, replay, and a `soak`-marked
-100,000-promotion bounded-memory run.
+normalization, filters and exceptional detection, revisioned preference CRUD, Gemini parsing,
+Telegram authorization and outbox recovery, restart-safe alias generations, pipeline integration,
+replay, and `soak`-marked promotion, 500-entry, 10,000-document rebuild and command-flood runs.
 
 ```bash
 .venv/bin/python -m pytest -m "not soak"   # skip the long one
@@ -283,7 +320,7 @@ Advance one step at a time:
 
 - [ ] Run the full suite — fixture, contract, integration, recovery and soak tests
 - [ ] Run **all** sources in shadow for seven days
-- [ ] Review replay metrics; tune only profile, aliases, hard rules and thresholds
+- [ ] Review replay metrics; tune initial YAML before the first seed, then use live preference commands
 - [ ] Promote **one** Telegram source to `live` for 48 hours
 - [ ] Enable remaining Telegram sources, then Pelando
 
@@ -298,15 +335,20 @@ growth, clean recovery across restarts, and the 90% rejection / 95% retention ta
 promo_bot/
 ├── cli.py            # argparse entrypoint, subcommands
 ├── runtime.py        # service orchestration, queues, alerts, memory tripwire
-├── pipeline.py       # filter → dedup → exceptional → BM25 → LLM → deliver
+├── pipeline.py       # snapshot → filters → constraints → exceptional → BM25 → LLM
 ├── models.py         # Promotion, Decision, Evaluation, PipelineResult, RetryJob
+├── preferences.py    # immutable preference domain, validation, constraints, weights
+├── preference_store.py # SQLite entries, revisions, confirmations, rate state, outbox
+├── preference_interpreter.py # Gemini natural-language operation parser
+├── preference_bot.py # authorized Telegram Bot API long polling and commands
+├── gemini.py         # shared structured-output REST client
 ├── protocols.py      # Source / Stage / Evaluator / Sink / Store interfaces
 ├── config.py         # YAML loading, factory resolution, env secrets
 ├── filters.py        # fixed spam checks and prioritized token-aware hard rules
 ├── exceptional.py    # price-error / historical-low / discount bypasses
 ├── bm25.py           # Okapi BM25
 ├── normalization.py  # tokenization, alias expansion, content hashing
-├── store.py          # SQLite WAL: corpus, dedup, retries, audit, health
+├── store.py          # SQLite WAL: corpus generations, dedup, retries, audit, health
 ├── evaluator.py      # Gemini structured-decision client
 ├── sink.py           # Telegram bot delivery + alerts
 ├── replay.py         # offline calibration metrics
