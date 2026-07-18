@@ -1,0 +1,2 @@
+{"id":"relevant-1","source":"fixture","title":"SSD NVMe 1 TB em promoção","text":"Oferta de armazenamento para notebook","price":"299.90","url":"https://example.invalid/ssd","temperature":null,"timestamp":"2026-07-18T12:00:00+00:00","metadata":{},"relevant":true}
+{"id":"irrelevant-1","source":"fixture","title":"Perfume floral importado","text":"Fragrância de uso pessoal","price":"199.90","url":"https://example.invalid/perfume","temperature":null,"timestamp":"2026-07-18T12:01:00+00:00","metadata":{},"relevant":false}

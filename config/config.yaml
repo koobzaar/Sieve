@@ -1,0 +1,72 @@
+runtime:
+  mode: shadow
+  queue_capacity: 256
+  memory_limit_mb: 220
+  failure_alert_threshold: 3
+  llm_outage_alert_seconds: 300
+
+state:
+  path: /state/sieve.db
+  retention_days: 30
+  retention_cap: 50000
+  corpus_limit: 10000
+  retry_limit: 100
+  retry_ttl_seconds: 3600
+
+pipeline:
+  bm25_threshold: 2.0
+  bm25_k1: 1.2
+  bm25_b: 0.75
+  cold_start_documents: 500
+  exceptional_temperature: 300
+  profile: |
+    Replace this example with your promotion interests in config.local.yaml.
+  aliases: {}
+  hard_rules:
+    - id: prohibited_promotions
+      priority: 100
+      action: deny
+      any:
+        - aposta
+        - cassino
+        - bet
+        - renda extra
+
+evaluator:
+  factory: promo_bot.evaluator:create_gemini_evaluator
+  settings:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-3.1-flash-lite
+    provider_url: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+    timeout_seconds: 20
+    max_output_tokens: 160
+    retries: 3
+
+sink:
+  factory: promo_bot.sink:create_telegram_sink
+  settings:
+    token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_PRIVATE_CHAT_ID
+    api_url: https://api.telegram.org
+    timeout_seconds: 15
+
+sources:
+  - name: telegram-principal
+    factory: promo_bot.sources.telegram:create_telegram_source
+    enabled: false
+    mode: shadow
+    settings:
+      api_id_env: TELEGRAM_API_ID
+      api_hash_env: TELEGRAM_API_HASH
+      session_path: /state/telegram-user
+      chat_ids: []
+
+  - name: pelando
+    factory: promo_bot.sources.pelando:create_pelando_source
+    enabled: true
+    mode: shadow
+    settings:
+      url: https://www.pelando.com.br/recentes
+      interval_seconds: 120
+      timeout_seconds: 20
+      user_agent: sieve/1.0 (+private-use)

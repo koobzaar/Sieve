@@ -1,0 +1,25 @@
+extends: config.yaml
+
+pipeline:
+  profile: |
+    Describe the products, brands, and deal characteristics you want.
+  aliases:
+    canonical_product: ["synonym", "alternate phrase"]
+  hard_rules:
+    - id: preferred_exception
+      priority: 10
+      action: allow
+      all:
+        - ["product family"]
+        - ["replacement", "refill"]
+    - id: excluded_category
+      priority: 200
+      action: deny
+      any: ["unwanted category"]
+
+sources:
+  - name: telegram-principal
+    enabled: true
+    settings:
+      chat_ids:
+        - -1001234567890

@@ -1,0 +1,36 @@
+name: sieve
+
+services:
+  sieve:
+    container_name: sieve
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["--config", "/app/config/config.local.yaml", "run"]
+    volumes:
+      - sieve-state:/state
+      - ./config:/app/config:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    mem_limit: 256m
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "sieve", "--config", "/app/config/config.local.yaml", "health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  sieve-state:

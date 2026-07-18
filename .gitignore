@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+.env
+/config/config.local.yaml
+state/
+*.session
+*.session-journal
