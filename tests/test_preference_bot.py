@@ -5,6 +5,7 @@ import json
 import httpx
 import pytest
 
+from promo_bot.preference_interpreter import GeminiPreferenceInterpreter
 from promo_bot.preference_bot import (
     BOT_COMMANDS,
     BOT_COMMANDS_PT_BR,
@@ -154,6 +155,160 @@ async def test_narrow_apply_is_live_once_and_preview_is_a_dry_run(tmp_path) -> N
         "SELECT COUNT(*) FROM preference_revisions"
     ).fetchone()[0] == revision_count
     assert store.telegram_offset() == 3
+    state.close()
+
+
+async def test_malformed_multi_interest_response_is_repaired_and_applied_atomically(
+    tmp_path,
+) -> None:
+    malformed = {
+        "intent": "apply",
+        "operations": [
+            {
+                "op": "add",
+                "kind": "interest",
+                "data": {
+                    "importance": 80,
+                    "search_terms": ["figurinhas da Copa do Mundo"],
+                },
+            },
+            {
+                "op": "add",
+                "kind": "interest",
+                "data": {
+                    "name": "sofás",
+                    "constraints": {"max_price": 3000},
+                },
+            },
+        ],
+        "summary": "Adicionar dois interesses",
+        "clarification_question": None,
+    }
+    replacement = {
+        **malformed,
+        "operations": [
+            {
+                "op": "add",
+                "kind": "interest",
+                "data": {
+                    "name": "figurinhas da Copa do Mundo",
+                    "importance": 80,
+                    "search_terms": ["figurinhas da Copa do Mundo"],
+                },
+            },
+            malformed["operations"][1],
+        ],
+    }
+    responses = [malformed, replacement]
+    prompts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompts.append(body["contents"][0]["parts"][0]["text"])
+        payload = responses[len(prompts) - 1]
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {"content": {"parts": [{"text": json.dumps(payload)}]}}
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        interpreter = GeminiPreferenceInterpreter(
+            api_key="secret",
+            model="gemini-test",
+            retries=1,
+            client=client,
+        )
+        state, store, processor = setup(tmp_path, interpreter)
+        await processor.process_update(
+            message(
+                1,
+                (
+                    "Adicione interesse em figurinhas da Copa do Mundo e em sofás, "
+                    "mas para sofás limite o preço a R$ 3.000."
+                ),
+                language_code="pt-BR",
+            )
+        )
+
+    current = store.current_snapshot()
+    assert current.revision == 1
+    assert {entry.data["name"] for entry in current.interests} == {
+        "figurinhas da Copa do Mundo",
+        "sofás",
+    }
+    sofa = next(entry for entry in current.interests if entry.data["name"] == "sofás")
+    assert sofa.data["constraints"]["max_price"] == "3000"
+    assert len(prompts) == 2
+    assert prompts[1].startswith(
+        "Your previous proposal had a validation error and was not applied."
+    )
+    state.close()
+
+
+async def test_two_invalid_interpretations_use_generic_failure_and_persist_nothing(
+    tmp_path,
+) -> None:
+    invalid = {
+        "intent": "apply",
+        "operations": [
+            {"op": "add", "kind": "interest", "data": {"name": ""}},
+            {
+                "op": "add",
+                "kind": "interest",
+                "data": {
+                    "name": "sofás",
+                    "constraints": {"max_price": 3000},
+                },
+            },
+        ],
+        "summary": "Adicionar dois interesses",
+        "clarification_question": None,
+    }
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {"content": {"parts": [{"text": json.dumps(invalid)}]}}
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        interpreter = GeminiPreferenceInterpreter(
+            api_key="secret",
+            model="gemini-test",
+            retries=1,
+            client=client,
+        )
+        state, store, processor = setup(tmp_path, interpreter)
+        await processor.process_update(
+            message(
+                1,
+                "Adicione figurinhas da Copa do Mundo e sofás até R$ 3.000.",
+                language_code="pt-BR",
+            )
+        )
+
+    current = store.current_snapshot()
+    assert calls == 2
+    assert current.revision == 0
+    assert current.interests == ()
+    reply = store.next_outbox()[0].text
+    assert "Não consegui interpretar a solicitação" in reply
+    assert "interest name must be nonempty" not in reply
+    outcome = store._connection.execute(
+        "SELECT outcome FROM telegram_processed_updates WHERE update_id = 1"
+    ).fetchone()[0]
+    assert outcome == "parser_failure"
     state.close()
 
 
