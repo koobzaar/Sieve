@@ -1,4 +1,7 @@
-**English** | [Português (Brasil)](README.md)
+<p align="right">
+  <a href="README.md"><img src="https://img.shields.io/badge/PT--BR-Português-6C757D?style=flat-square" alt="Português (Brasil)" /></a>
+  <a href="README.en.md"><img src="https://img.shields.io/badge/EN-English-1F6FEB?style=flat-square" alt="English" /></a>
+</p>
 
 <div align="center">
 
