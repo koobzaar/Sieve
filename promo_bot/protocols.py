@@ -4,7 +4,11 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .models import Evaluation, PipelineResult, Promotion, RetryJob
-from .preferences import PreferenceProposal, PreferenceSnapshot
+from .preferences import (
+    PreferenceClarificationContext,
+    PreferenceProposal,
+    PreferenceSnapshot,
+)
 
 PromotionEmitter = Callable[[Promotion], Awaitable[None]]
 FailureReporter = Callable[[str, Exception], Awaitable[None]]
@@ -102,6 +106,7 @@ class PreferenceInterpreter(Protocol):
         *,
         local_timestamp: str,
         language: str = "en",
+        clarification_context: PreferenceClarificationContext | None = None,
     ) -> PreferenceProposal: ...
 
     async def close(self) -> None: ...

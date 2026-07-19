@@ -11,6 +11,7 @@ from promo_bot.preference_interpreter import (
     GeminiPreferenceInterpreter,
 )
 from promo_bot.preferences import (
+    PreferenceClarificationContext,
     PreferenceError,
     PreferenceIntent,
     PreferenceKind,
@@ -189,6 +190,8 @@ def test_schema_and_prompt_require_canonical_separate_interests() -> None:
     )
     assert "Every interest add must include a trimmed, nonempty data.name" in prompt
     assert "each distinct product or category with a separate operation" in prompt
+    assert "SELECTED RESPONSE LANGUAGE: Brazilian Portuguese" in prompt
+    assert "selected UI language is authoritative" in prompt
 
 
 async def test_semantic_repair_returns_a_complete_valid_replacement(caplog) -> None:
@@ -287,6 +290,74 @@ async def test_valid_first_proposal_does_not_make_a_repair_call() -> None:
 
     assert result.intent == PreferenceIntent.APPLY
     assert len(client.calls) == 1
+
+
+async def test_follow_up_prompt_reconstructs_the_complete_clarification_history() -> None:
+    valid = apply_payload(
+        {
+            "op": "add",
+            "kind": "interest",
+            "data": {"name": "geladeira"},
+        }
+    )
+    client = SequenceStructuredClient(valid)
+    interpreter = GeminiPreferenceInterpreter(structured_client=client)
+    context = PreferenceClarificationContext(
+        original_message="Quero uma geladeira.",
+        question="Você tem um preço máximo?",
+        prior_turns=(("Prefere alguma cor?", "Qualquer cor."),),
+    )
+
+    result = await interpreter.interpret(
+        "Só uma geladeira.",
+        snapshot(),
+        clarification_context=context,
+    )
+
+    assert result.intent == PreferenceIntent.APPLY
+    prompt = client.calls[0][0]
+    assert "PENDING CLARIFICATION CONVERSATION" in prompt
+    assert '"text": "Quero uma geladeira."' in prompt
+    assert '"text": "Prefere alguma cor?"' in prompt
+    assert '"text": "Qualquer cor."' in prompt
+    assert '"text": "Você tem um preço máximo?"' in prompt
+    assert '"text": "Só uma geladeira."' in prompt
+    assert "optional constraint should be omitted" in prompt
+    assert "Do not ask a question that the user already answered" in prompt
+    assert "SELECTED RESPONSE LANGUAGE: English" in prompt
+    assert "regardless of the language used in the message" in prompt
+
+
+async def test_repeated_follow_up_question_gets_one_semantic_repair() -> None:
+    repeated = {
+        "intent": "clarify",
+        "operations": [],
+        "summary": "Perguntar preço",
+        "clarification_question": "Você tem um preço máximo?",
+    }
+    replacement = apply_payload(
+        {
+            "op": "add",
+            "kind": "interest",
+            "data": {"name": "geladeira"},
+        }
+    )
+    client = SequenceStructuredClient(repeated, replacement)
+    interpreter = GeminiPreferenceInterpreter(structured_client=client)
+    context = PreferenceClarificationContext(
+        original_message="Quero uma geladeira.",
+        question="Você tem um preço máximo?",
+    )
+
+    result = await interpreter.interpret(
+        "Só uma geladeira.",
+        snapshot(),
+        clarification_context=context,
+    )
+
+    assert result.intent == PreferenceIntent.APPLY
+    assert len(client.calls) == 2
+    assert "clarification repeated an already answered question" in client.calls[1][0]
 
 
 async def test_two_semantically_invalid_proposals_raise_generic_gemini_error() -> None:

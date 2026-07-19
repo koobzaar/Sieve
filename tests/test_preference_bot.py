@@ -26,19 +26,43 @@ from promo_bot.store import SQLiteStateStore
 
 
 class FakeInterpreter:
-    def __init__(self, intent=PreferenceIntent.QUERY, operations=(), summary="consulta") -> None:
+    def __init__(
+        self,
+        intent=PreferenceIntent.QUERY,
+        operations=(),
+        summary="consulta",
+        question=None,
+    ) -> None:
         self.intent = intent
         self.operations = tuple(operations)
         self.summary = summary
+        self.question = question
         self.calls = []
 
-    async def interpret(self, message, snapshot, *, local_timestamp, language="en"):
-        self.calls.append((message, snapshot.revision, local_timestamp, language))
+    async def interpret(
+        self,
+        message,
+        snapshot,
+        *,
+        local_timestamp,
+        language="en",
+        clarification_context=None,
+    ):
+        self.calls.append(
+            (
+                message,
+                snapshot.revision,
+                local_timestamp,
+                language,
+                clarification_context,
+            )
+        )
         return PreferenceProposal(
             self.intent,
             snapshot.revision,
             self.operations,
             self.summary,
+            self.question,
         )
 
     async def close(self):
@@ -309,6 +333,135 @@ async def test_two_invalid_interpretations_use_generic_failure_and_persist_nothi
         "SELECT outcome FROM telegram_processed_updates WHERE update_id = 1"
     ).fetchone()[0]
     assert outcome == "parser_failure"
+    state.close()
+
+
+async def test_clarification_follow_up_survives_restart_and_applies_complete_request(
+    tmp_path,
+) -> None:
+    responses = [
+        {
+            "intent": "clarify",
+            "operations": [],
+            "summary": "Perguntar preço",
+            "clarification_question": "Você tem um preço máximo?",
+        },
+        {
+            "intent": "apply",
+            "operations": [
+                {
+                    "op": "add",
+                    "kind": "interest",
+                    "data": {"name": "geladeira"},
+                }
+            ],
+            "summary": "Add fridge without a price limit",
+            "clarification_question": None,
+        },
+    ]
+    prompts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompts.append(body["contents"][0]["parts"][0]["text"])
+        payload = responses[len(prompts) - 1]
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {"content": {"parts": [{"text": json.dumps(payload)}]}}
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        interpreter = GeminiPreferenceInterpreter(
+            api_key="secret",
+            model="gemini-test",
+            retries=1,
+            client=client,
+        )
+        state, store, processor = setup(tmp_path, interpreter)
+        await processor.process_update(
+            message(1, "Quero uma geladeira.", language_code="pt-BR")
+        )
+        pending = store.pending_clarification(42)
+        assert pending is not None
+        assert pending.context.question == "Você tem um preço máximo?"
+        assert store.current_snapshot().revision == 0
+
+        reopened = SQLitePreferenceStore(state)
+        processor = PreferenceCommandProcessor(
+            store=reopened,
+            interpreter=interpreter,
+            owner_chat_id=42,
+            owner_user_id=42,
+        )
+        await processor.process_update(
+            callback(2, "pref:language:en", callback_id="cb-language")
+        )
+        assert reopened.ui_language(42) == "en"
+        assert reopened.pending_clarification(42) is not None
+        await processor.process_update(
+            message(3, "Só uma geladeira.", language_code="pt-BR")
+        )
+
+    current = reopened.current_snapshot()
+    assert current.revision == 1
+    assert [entry.data["name"] for entry in current.interests] == ["geladeira"]
+    assert "max_price" not in current.interests[0].data["constraints"]
+    assert reopened.pending_clarification(42) is None
+    assert len(prompts) == 2
+    assert "PENDING CLARIFICATION CONVERSATION" in prompts[1]
+    assert '"text": "Quero uma geladeira."' in prompts[1]
+    assert '"text": "Você tem um preço máximo?"' in prompts[1]
+    assert '"text": "Só uma geladeira."' in prompts[1]
+    assert "SELECTED RESPONSE LANGUAGE: English" in prompts[1]
+    assert "Preferences updated" in reopened.next_outbox()[-1].text
+    assert "Add fridge without a price limit" in reopened.next_outbox()[-1].text
+    state.close()
+
+
+async def test_pending_clarification_can_be_cancelled_without_another_ai_call(
+    tmp_path,
+) -> None:
+    interpreter = FakeInterpreter(
+        PreferenceIntent.CLARIFY,
+        summary="pergunta",
+        question="Você tem um preço máximo?",
+    )
+    state, store, processor = setup(tmp_path, interpreter)
+
+    await processor.process_update(message(1, "Quero uma geladeira."))
+    assert store.pending_clarification(42) is not None
+    await processor.process_update(message(2, "cancelar"))
+
+    assert len(interpreter.calls) == 1
+    assert store.pending_clarification(42) is None
+    assert store.current_snapshot().revision == 0
+    assert "Request cancelled" in store.next_outbox()[-1].text
+    state.close()
+
+
+async def test_clarification_questions_are_bounded_and_then_cleared(tmp_path) -> None:
+    interpreter = FakeInterpreter(
+        PreferenceIntent.CLARIFY,
+        summary="pergunta",
+        question="Pode dar mais detalhes?",
+    )
+    state, store, processor = setup(tmp_path, interpreter)
+
+    await processor.process_update(message(1, "Quero uma geladeira."))
+    await processor.process_update(message(2, "Sem preferência."))
+    await processor.process_update(message(3, "Qualquer uma."))
+    assert store.pending_clarification(42).context.round_count == 3
+
+    await processor.process_update(message(4, "Só uma geladeira."))
+
+    assert len(interpreter.calls) == 4
+    assert store.pending_clarification(42) is None
+    assert store.current_snapshot().revision == 0
+    assert "I still need more detail" in store.next_outbox()[-1].text
     state.close()
 
 

@@ -16,6 +16,7 @@ from promo_bot.preference_store import (
 from promo_bot.preferences import (
     AtomicPreferenceProvider,
     OperationAction,
+    PreferenceClarificationContext,
     PreferenceError,
     PreferenceKind,
     PreferenceOperation,
@@ -98,6 +99,100 @@ def test_ui_language_and_html_outbox_are_durable(tmp_path) -> None:
     message = reopened.next_outbox()[0]
     assert message.parse_mode == "HTML"
     assert message.reply_markup == {"inline_keyboard": []}
+    state.close()
+
+
+def test_pending_clarification_is_durable_bounded_and_revision_safe(tmp_path) -> None:
+    clock = Clock(1_000)
+    state, store, _ = make_store(tmp_path, clock=clock)
+    context = PreferenceClarificationContext(
+        original_message="Quero uma geladeira.",
+        question="Você tem um preço máximo?",
+    )
+    saved = store.save_clarification(
+        context,
+        actor_id=7,
+        chat_id=7,
+        base_revision=0,
+        preview=False,
+        update_id=1,
+        original_message="Quero uma geladeira.",
+        reply=OutboxReply(7, "Qual o preço?"),
+    )
+    assert saved.context == context
+
+    reopened = SQLitePreferenceStore(state, clock=clock)
+    loaded = reopened.pending_clarification(7)
+    assert loaded is not None
+    assert loaded.context.original_message == "Quero uma geladeira."
+    assert loaded.context.question == "Você tem um preço máximo?"
+    assert loaded.preview is False
+
+    continued = loaded.context.continue_with(
+        "Qualquer preço.", "Prefere alguma cor?"
+    )
+    reopened.save_clarification(
+        continued,
+        actor_id=7,
+        chat_id=7,
+        base_revision=0,
+        preview=False,
+        update_id=2,
+        original_message="Qualquer preço.",
+        reply=OutboxReply(7, "Qual cor?"),
+    )
+    assert reopened.pending_clarification(7).context.prior_turns == (
+        ("Você tem um preço máximo?", "Qualquer preço."),
+    )
+
+    reopened.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={"name": "geladeira"},
+            )
+        ],
+        base_revision=0,
+        original_message="Só uma geladeira.",
+        actor_id=7,
+        update_id=3,
+        summary="Geladeira adicionada",
+    )
+    assert reopened.pending_clarification(7) is None
+
+    reopened.save_clarification(
+        PreferenceClarificationContext("Quero um fogão.", "Qual tamanho?"),
+        actor_id=7,
+        chat_id=7,
+        base_revision=1,
+        preview=False,
+        update_id=4,
+        original_message="Quero um fogão.",
+        reply=OutboxReply(7, "Qual tamanho?"),
+    )
+    clock.value += 901
+    assert reopened.pending_clarification(7) is None
+
+    with pytest.raises(PreferenceError, match="round cap"):
+        reopened.save_clarification(
+            PreferenceClarificationContext(
+                "Quero uma TV.",
+                "Pergunta quatro?",
+                (
+                    ("Pergunta um?", "Resposta um."),
+                    ("Pergunta dois?", "Resposta dois."),
+                    ("Pergunta três?", "Resposta três."),
+                ),
+            ),
+            actor_id=7,
+            chat_id=7,
+            base_revision=1,
+            preview=False,
+            update_id=5,
+            original_message="Resposta três.",
+            reply=OutboxReply(7, "Pergunta quatro?"),
+        )
     state.close()
 
 

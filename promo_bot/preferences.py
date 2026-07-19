@@ -164,6 +164,26 @@ class PreferenceProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class PreferenceClarificationContext:
+    original_message: str
+    question: str
+    prior_turns: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def round_count(self) -> int:
+        return len(self.prior_turns) + 1
+
+    def continue_with(
+        self, answer: str, next_question: str
+    ) -> "PreferenceClarificationContext":
+        return PreferenceClarificationContext(
+            original_message=self.original_message,
+            question=next_question,
+            prior_turns=(*self.prior_turns, (self.question, answer)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PreferenceConstraint:
     interest_id: str
     match_terms: tuple[str, ...]
