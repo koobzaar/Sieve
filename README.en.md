@@ -7,7 +7,7 @@
 
 # Sieve
 
-**A bounded, single-process promotion filter for Telegram and Pelando — BM25 pre-ranking, Gemini for the final call.**
+**A bounded, single-process promotion filter for Telegram and Pelando with BM25 pre-ranking and artificial intelligence.**
 
 <p>
   <a href="#how-it-works">How it works</a> •

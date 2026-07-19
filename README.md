@@ -7,7 +7,7 @@
 
 # Sieve
 
-**Filtro de promoções para Telegram e Pelando com preferências ao vivo, BM25 e decisão final do Gemini.**
+**Filtro de promoções para Telegram e Pelando com preferências ao vivo, BM25 e inteligência artificial.**
 
 <p>
   <a href="#como-funciona">Como funciona</a> •
@@ -80,7 +80,7 @@ A ordem é intencional:
 5. tratamento de ofertas excepcionais;
 6. relevância lexical ponderada com BM25 e roteamento por duas faixas;
 7. gates determinísticos para candidatos fortes;
-8. avaliação estruturada do Gemini na faixa incerta e em shadow.
+8. avaliação estruturada por inteligência artificial na faixa incerta e em shadow.
 
 Uma violação de preço identificada com segurança nunca é ignorada por uma oferta “excepcional”. Se
 uma oferta excepcional parece relevante, mas não é possível comprovar um atributo obrigatório, ela
