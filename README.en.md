@@ -69,12 +69,21 @@ flowchart TD
     DD --> PC{Constraint violation?}
     PC -->|reliable price / attribute mismatch| X5[discard]
     PC --> EX{Exceptional?}
-    EX -->|price error, historical low,<br/>&gt;50% stated discount,<br/>Pelando temp &ge; 300| DEL[Deliver]
-
-    EX --> BM{BM25 vs profile}
-    BM -->|score &lt; threshold| X3[discard]
-    BM -->|corpus &lt; 500 docs| LLM
-    BM --> LLM[Gemini structured decision]
+    EX -->|proven price error, historical low,<br/>&gt;50% discount or Pelando temp &ge; 300| DEL[Deliver]
+    EX -->|required attributes unknown| LLM
+    EX -->|no| READY{BM25 ready?}
+    READY -->|cold corpus or alias rebuild| LLM
+    READY -->|yes| BM{Score band}
+    BM -->|score &lt; 2| AUDIT{5% audit sample?}
+    AUDIT -->|no| X3[discard]
+    AUDIT -->|yes| ALLM[Gemini audit]
+    ALLM -->|record label, never deliver| X3
+    BM -->|2 &le; score &lt; 7| LLM
+    BM -->|score &ge; 7| GATE{Deterministic gates?}
+    GATE -->|no| LLM
+    GATE -->|yes + shadow| CAND[Mark candidate]
+    CAND --> LLM[Gemini structured decision]
+    GATE -->|yes + validated live mode| DEL
 
     LLM -->|forward| DEL
     LLM -->|discard| X4[discard]
@@ -92,7 +101,7 @@ flowchart TD
 | **Deduplication**      | Exact content hash and native source ID, persisted in SQLite.                                                                                                                                                                                                                                                                          |
 | **Constraints**        | Reliably matched interest price violations and excluded attributes are discarded before any exceptional bypass. Missing required attributes remain undecided. |
 | **Exceptional bypass** | Normally skips BM25 and the LLM. If a promotion may match an interest but its required attributes cannot be proven, it skips BM25 and goes to Gemini instead. |
-| **BM25**               | In-project weighted Okapi BM25 (`k1=1.2`, `b=0.75`) against a rolling 10,000-document corpus. Importance `0–100` maps to `0.5×–1.5×`; `50` preserves the old score. BM25 fails open during cold start and alias-generation rebuilds. |
+| **BM25**               | Weighted Okapi BM25 (`k1=1.2`, `b=0.75`) with lower `2.0` and experimental upper `7.0` routing thresholds. Importance `0–100` maps to `0.5×–1.5×`. BM25 fails open to Gemini during cold start and alias rebuilds. |
 | **Gemini**             | Structured JSON decision, minimal thinking budget, ≤160 output tokens, no conversation history, 3 retries on transient failure.                                                                                                                                                                                                        |
 | **Delivery**           | Single-claim delivery per promotion, so a restart mid-send can't double-post.                                                                                                                                                                                                                                                          |
 
@@ -139,6 +148,44 @@ w(I) = 0.5 + I / 100,     0 ≤ I ≤ 100
 
 Thus `0 → 0.5×`, `50 → 1.0×`, and `100 → 1.5×`. Aliases expand indexed terms without changing the
 stored source text. Context informs Gemini but does not independently add BM25 relevance.
+
+#### Why the thresholds are 2 and 7
+
+BM25 is neither a percentage nor a probability: its scale changes with `N`, `df(t)`, document
+length, aliases, and weights. For an average-length promotion containing a term once, the saturation
+fraction is exactly `1`:
+
+```text
+f = 1 and |d| = avgdl  →  f·(k₁+1) / (f+k₁) = 1
+term contribution ≈ IDF(t) · w(t)
+```
+
+At the first stable corpus size, `N = 500`, representative values are:
+
+| Corpus frequency | `IDF(t)` | Contribution at weight `1.0` |
+| ---: | ---: | ---: |
+| `df = 1` | `5.81` | `≈ 5.81` |
+| `df = 10` | `3.87` | `≈ 3.87` |
+| `df = 50` | `2.29` | `≈ 2.29` |
+
+The `2.0` cutoff removes weak lexical matches; `7.0` creates a strong-score observation band. It is
+not proof of relevance: one maximally weighted rare term can contribute `5.81 × 1.5 ≈ 8.72` by
+itself. A candidate must therefore also match a literal term from a structured interest, prove all
+required constraints, and not look like an accessory when the interest targets the main product.
+Aliases affect BM25 but cannot satisfy that literal gate alone.
+
+```text
+score < 2.0       → discard; audit 5% with Gemini without ever delivering
+2.0 ≤ score < 7.0 → Gemini decides
+score ≥ 7.0       → apply gates; shadow records a candidate and still lets Gemini decide
+BM25 unavailable → Gemini decides
+```
+
+`7.0` is an experimental starting point, not a universal mathematical optimum. Live mode should
+only be considered after at least 300 eligible shadow candidates with no confirmed false forward.
+With zero failures in `n` observations, the rule of three puts the approximate 95% upper risk bound
+at `3/n`, or about `1%` for `n = 300`. A cold corpus or alias rebuild returns all decisions to
+Gemini.
 
 Price and attribute constraints use three-valued logic: `satisfied`, `violated`, or `unknown`. A
 proven violation is discarded before exceptional handling; a proven match keeps the usual bypass;
@@ -238,7 +285,7 @@ environment variables named _by_ the config, never stored in either file.
 | ----------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `runtime`   | `mode` (`shadow`/`live`), `queue_capacity`, `memory_limit_mb`, `failure_alert_threshold`, `llm_outage_alert_seconds`        |
 | `state`     | `path`, `retention_days`, `retention_cap`, `corpus_limit`, `retry_limit`, `retry_ttl_seconds`                               |
-| `pipeline`  | `bm25_threshold`, `bm25_k1`, `bm25_b`, `cold_start_documents`, `exceptional_temperature`, `profile`, `aliases`, `hard_rules` |
+| `pipeline`  | `bm25_threshold`, `bm25_auto_forward_threshold`, `bm25_auto_forward_mode`, `bm25_below_threshold_audit_rate`, BM25 parameters, profile, aliases and rules |
 | `evaluator` | `factory`, model name, provider URL, timeout, `max_output_tokens`, `retries`                                                |
 | `preferences` | enablement, owner/chat ID env vars, polling/queue limits, confirmation TTL, entry/operation/state caps, optional parser overrides |
 | `sink`      | `factory`, token/chat-ID env var names, API URL, timeout                                                                    |

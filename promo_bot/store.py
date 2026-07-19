@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     stage TEXT NOT NULL,
     reason TEXT NOT NULL,
     score REAL,
-    exceptional INTEGER NOT NULL DEFAULT 0
+    exceptional INTEGER NOT NULL DEFAULT 0,
+    shadow_decision TEXT,
+    auto_forward_candidate INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_time ON decisions(decided_at);
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -147,6 +149,19 @@ class SQLiteStateStore:
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA busy_timeout=10000")
             self._connection.executescript(SCHEMA)
+            decision_columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(decisions)")
+            }
+            if "shadow_decision" not in decision_columns:
+                self._connection.execute(
+                    "ALTER TABLE decisions ADD COLUMN shadow_decision TEXT"
+                )
+            if "auto_forward_candidate" not in decision_columns:
+                self._connection.execute(
+                    "ALTER TABLE decisions ADD COLUMN auto_forward_candidate "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             missing = self._connection.execute(
                 "SELECT d.id FROM corpus_docs d LEFT JOIN corpus_raw_tokens r ON r.doc_id=d.id "
                 "WHERE r.doc_id IS NULL"
@@ -523,8 +538,9 @@ class SQLiteStateStore:
     def add_decision(self, promotion: Promotion, result: PipelineResult) -> None:
         with self._lock:
             self._connection.execute(
-                "INSERT INTO decisions(source,native_id,decided_at,decision,stage,reason,score,exceptional) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO decisions("
+                "source,native_id,decided_at,decision,stage,reason,score,exceptional,"
+                "shadow_decision,auto_forward_candidate) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     promotion.source,
                     promotion.id,
@@ -534,6 +550,8 @@ class SQLiteStateStore:
                     result.reason[:500],
                     result.score,
                     int(result.exceptional),
+                    result.shadow_decision.value if result.shadow_decision else None,
+                    int(result.auto_forward_candidate),
                 ),
             )
 

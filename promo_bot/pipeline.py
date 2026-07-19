@@ -13,6 +13,7 @@ from .normalization import expand_aliases, promotion_hash, promotion_text, token
 from .config import HardFilterRule
 from .preferences import (
     AtomicPreferenceProvider,
+    PreferenceSnapshot,
     build_snapshot,
     evaluate_constraints,
     explicit_exclusion_match,
@@ -21,6 +22,61 @@ from .preferences import (
 from .protocols import LLMEvaluator, PreferenceProvider, PromotionSink, StateStore
 
 logger = logging.getLogger(__name__)
+
+ACCESSORY_HEAD_TERMS = {
+    "acessorio",
+    "adaptador",
+    "cabo",
+    "capa",
+    "carregador",
+    "cartucho",
+    "case",
+    "pulseira",
+    "refil",
+    "replacement",
+    "suporte",
+}
+
+
+def _contains_phrase(tokens: Sequence[str], phrase: Sequence[str]) -> bool:
+    width = len(phrase)
+    return width > 0 and any(
+        list(tokens[index : index + width]) == list(phrase)
+        for index in range(len(tokens) - width + 1)
+    )
+
+
+def _matched_interest_terms(
+    snapshot: PreferenceSnapshot, tokens: Sequence[str]
+) -> list[list[str]]:
+    matches: list[list[str]] = []
+    for interest in getattr(snapshot, "interests", ()):
+        for value in interest.data.get("search_terms", (interest.data["name"],)):
+            phrase = tokenize(str(value))
+            if _contains_phrase(tokens, phrase):
+                matches.append(phrase)
+    return matches
+
+
+def _passes_auto_forward_gates(
+    promotion: Promotion,
+    snapshot: PreferenceSnapshot,
+    document_tokens: Sequence[str],
+    *,
+    constraints_proven: bool,
+) -> bool:
+    """Require a literal structured-interest match and reject accessory-led titles."""
+    if not constraints_proven:
+        return False
+    matched_terms = _matched_interest_terms(snapshot, document_tokens)
+    if not matched_terms:
+        return False
+    interest_is_accessory = any(
+        term in ACCESSORY_HEAD_TERMS for phrase in matched_terms for term in phrase
+    )
+    title_head = tokenize(promotion.title)[:3]
+    accessory_led = any(term in ACCESSORY_HEAD_TERMS for term in title_head)
+    return interest_is_accessory or not accessory_led
 
 
 class PromotionPipeline:
@@ -34,6 +90,9 @@ class PromotionPipeline:
         aliases: Mapping[str, Sequence[str]],
         hard_rules: tuple[HardFilterRule, ...],
         threshold: float = 2.0,
+        auto_forward_threshold: float | None = None,
+        auto_forward_mode: str = "shadow",
+        below_threshold_audit_rate: float = 0.0,
         k1: float = 1.2,
         b: float = 0.75,
         cold_start_documents: int = 500,
@@ -46,6 +105,17 @@ class PromotionPipeline:
         self.evaluator = evaluator
         self.sink = sink
         self.threshold = threshold
+        if auto_forward_threshold is None:
+            auto_forward_threshold = max(7.0, threshold + 1.0)
+        if auto_forward_threshold <= threshold:
+            raise ValueError("auto_forward_threshold must be greater than threshold")
+        if auto_forward_mode not in {"off", "shadow", "live"}:
+            raise ValueError("auto_forward_mode must be off, shadow, or live")
+        if not 0 <= below_threshold_audit_rate <= 1:
+            raise ValueError("below_threshold_audit_rate must be between 0 and 1")
+        self.auto_forward_threshold = auto_forward_threshold
+        self.auto_forward_mode = auto_forward_mode
+        self.below_threshold_audit_rate = below_threshold_audit_rate
         self.k1 = k1
         self.b = b
         self.cold_start_documents = cold_start_documents
@@ -86,9 +156,53 @@ class PromotionPipeline:
                 "stage": result.stage,
                 "reason": result.reason,
                 "score": result.score,
+                "shadow_decision": (
+                    result.shadow_decision.value if result.shadow_decision else None
+                ),
+                "auto_forward_candidate": result.auto_forward_candidate,
             },
         )
         return result
+
+    def _audit_selected(self, content_hash: str) -> bool:
+        if self.below_threshold_audit_rate <= 0:
+            return False
+        if self.below_threshold_audit_rate >= 1:
+            return True
+        bucket = int(content_hash[:16], 16) / float(0xFFFFFFFFFFFFFFFF)
+        return bucket < self.below_threshold_audit_rate
+
+    async def _audit_below_threshold(
+        self,
+        promotion: Promotion,
+        normalized: str,
+        preference_context: str,
+        score: float,
+    ) -> PipelineResult:
+        try:
+            evaluation = await self._evaluate(
+                promotion, normalized, preference_context
+            )
+        except EvaluationError as exc:
+            return self._record(
+                promotion,
+                PipelineResult(
+                    Decision.DISCARD,
+                    "bm25_audit",
+                    f"audit_error:{type(exc).__name__}",
+                    score=score,
+                ),
+            )
+        return self._record(
+            promotion,
+            PipelineResult(
+                Decision.DISCARD,
+                "bm25_audit",
+                f"below_threshold:{evaluation.reason}",
+                score=score,
+                shadow_decision=evaluation.decision,
+            ),
+        )
 
     async def _deliver(self, promotion: Promotion, reason: str) -> bool:
         if not self.store.claim_delivery(promotion):
@@ -125,7 +239,8 @@ class PromotionPipeline:
                 promotion, PipelineResult(Decision.DISCARD, "hard_filter", blocked.reason)
             )
 
-        if self.store.check_and_mark_seen(promotion, promotion_hash(promotion)):
+        content_hash = promotion_hash(promotion)
+        if self.store.check_and_mark_seen(promotion, content_hash):
             return self._record(
                 promotion, PipelineResult(Decision.DISCARD, "deduplication", "duplicate")
             )
@@ -167,6 +282,7 @@ class PromotionPipeline:
             )
 
         score: float | None = None
+        auto_forward_candidate = False
         query_terms = list(snapshot.term_weights)
         if (
             bm25_ready
@@ -185,11 +301,41 @@ class PromotionPipeline:
                 b=self.b,
             )
             if score < self.threshold:
+                if self._audit_selected(content_hash):
+                    return await self._audit_below_threshold(
+                        promotion,
+                        normalized,
+                        snapshot.rendered_profile,
+                        score,
+                    )
                 return self._record(
                     promotion,
                     PipelineResult(Decision.DISCARD, "bm25", "below_threshold", score=score),
                 )
 
+            auto_forward_candidate = (
+                self.auto_forward_mode != "off"
+                and score >= self.auto_forward_threshold
+                and _passes_auto_forward_gates(
+                    promotion,
+                    snapshot,
+                    raw_tokens,
+                    constraints_proven=constraint.all_proven,
+                )
+            )
+            if auto_forward_candidate and self.auto_forward_mode == "live":
+                reason = "above_threshold_with_deterministic_gates"
+                await self._deliver(promotion, reason)
+                return self._record(
+                    promotion,
+                    PipelineResult(
+                        Decision.FORWARD,
+                        "bm25_auto_forward",
+                        reason,
+                        score=score,
+                        auto_forward_candidate=True,
+                    ),
+                )
         try:
             evaluation = await self._evaluate(
                 promotion, normalized, snapshot.rendered_profile
@@ -199,7 +345,14 @@ class PromotionPipeline:
             reason = "llm_retry_queued" if queued else "llm_retry_queue_full"
             decision = Decision.RETRY if queued else Decision.DISCARD
             return self._record(
-                promotion, PipelineResult(decision, "llm", reason, score=score)
+                promotion,
+                PipelineResult(
+                    decision,
+                    "llm",
+                    reason,
+                    score=score,
+                    auto_forward_candidate=auto_forward_candidate,
+                ),
             )
         except EvaluationError as exc:
             return self._record(
@@ -209,10 +362,17 @@ class PromotionPipeline:
                     "llm",
                     f"llm_permanent_error:{type(exc).__name__}",
                     score=score,
+                    auto_forward_candidate=auto_forward_candidate,
                 ),
             )
 
-        result = PipelineResult(evaluation.decision, "llm", evaluation.reason, score=score)
+        result = PipelineResult(
+            evaluation.decision,
+            "llm",
+            evaluation.reason,
+            score=score,
+            auto_forward_candidate=auto_forward_candidate,
+        )
         if evaluation.decision == Decision.FORWARD:
             await self._deliver(promotion, evaluation.reason)
         return self._record(promotion, result)

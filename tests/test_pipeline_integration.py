@@ -97,6 +97,35 @@ async def test_bm25_discards_irrelevant_and_passes_relevant_to_llm(tmp_path) -> 
     store.close()
 
 
+async def test_below_threshold_audit_records_label_without_delivery(tmp_path) -> None:
+    evaluator = FakeEvaluator([Evaluation(Decision.FORWARD, "Seria relevante.")])
+    sink = FakeSink()
+    pipeline, store = build_pipeline(
+        tmp_path,
+        evaluator,
+        sink,
+        threshold=100,
+        auto_forward_threshold=101,
+        below_threshold_audit_rate=1,
+    )
+
+    result = await pipeline.process(
+        Promotion(id="audit", source="telegram", title="Jogo de panelas")
+    )
+
+    assert result.stage == "bm25_audit"
+    assert result.decision == Decision.DISCARD
+    assert result.shadow_decision == Decision.FORWARD
+    assert len(evaluator.calls) == 1
+    assert sink.sent == []
+    stored = store._connection.execute(
+        "SELECT decision,shadow_decision,auto_forward_candidate "
+        "FROM decisions WHERE native_id='audit'"
+    ).fetchone()
+    assert tuple(stored) == ("discard", "forward", 0)
+    store.close()
+
+
 async def test_llm_discard_and_cold_start_fail_open(tmp_path) -> None:
     evaluator = FakeEvaluator([Evaluation(Decision.DISCARD, "Não é relevante.")])
     sink = FakeSink()

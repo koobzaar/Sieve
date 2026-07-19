@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +67,9 @@ class AppConfig:
     aliases: dict[str, list[str]]
     hard_rules: tuple[HardFilterRule, ...]
     bm25_threshold: float
+    bm25_auto_forward_threshold: float
+    bm25_auto_forward_mode: Literal["off", "shadow", "live"]
+    bm25_below_threshold_audit_rate: float
     bm25_k1: float
     bm25_b: float
     cold_start_documents: int
@@ -281,6 +285,36 @@ def load_config(path: str | Path) -> AppConfig:
         )
     if preference_config.rate_per_minute <= 0 or preference_config.rate_per_hour <= 0:
         raise ConfigurationError("preference rate limits must be positive")
+    bm25_threshold = float(pipeline.get("bm25_threshold", 2.0))
+    bm25_auto_forward_threshold = float(
+        pipeline.get("bm25_auto_forward_threshold", 7.0)
+    )
+    bm25_auto_forward_mode = str(
+        pipeline.get("bm25_auto_forward_mode", "shadow")
+    ).casefold()
+    bm25_below_threshold_audit_rate = float(
+        pipeline.get("bm25_below_threshold_audit_rate", 0.05)
+    )
+    if not math.isfinite(bm25_threshold) or bm25_threshold < 0:
+        raise ConfigurationError("pipeline.bm25_threshold must be nonnegative")
+    if (
+        not math.isfinite(bm25_auto_forward_threshold)
+        or bm25_auto_forward_threshold <= bm25_threshold
+    ):
+        raise ConfigurationError(
+            "pipeline.bm25_auto_forward_threshold must be greater than bm25_threshold"
+        )
+    if bm25_auto_forward_mode not in {"off", "shadow", "live"}:
+        raise ConfigurationError(
+            "pipeline.bm25_auto_forward_mode must be off, shadow, or live"
+        )
+    if (
+        not math.isfinite(bm25_below_threshold_audit_rate)
+        or not 0 <= bm25_below_threshold_audit_rate <= 1
+    ):
+        raise ConfigurationError(
+            "pipeline.bm25_below_threshold_audit_rate must be between 0 and 1"
+        )
     return AppConfig(
         mode=mode,
         queue_capacity=int(runtime.get("queue_capacity", 256)),
@@ -294,7 +328,10 @@ def load_config(path: str | Path) -> AppConfig:
         profile=str(pipeline.get("profile", "")),
         aliases={str(k): [str(v) for v in values] for k, values in aliases.items()},
         hard_rules=_hard_rules(pipeline),
-        bm25_threshold=float(pipeline.get("bm25_threshold", 2.0)),
+        bm25_threshold=bm25_threshold,
+        bm25_auto_forward_threshold=bm25_auto_forward_threshold,
+        bm25_auto_forward_mode=bm25_auto_forward_mode,  # type: ignore[arg-type]
+        bm25_below_threshold_audit_rate=bm25_below_threshold_audit_rate,
         bm25_k1=float(pipeline.get("bm25_k1", 1.2)),
         bm25_b=float(pipeline.get("bm25_b", 0.75)),
         cold_start_documents=int(pipeline.get("cold_start_documents", 500)),

@@ -162,6 +162,28 @@ def test_evaluator_model_must_be_explicit(tmp_path) -> None:
         load_config(path)
 
 
+def test_bm25_routing_defaults_and_validation(tmp_path) -> None:
+    data = base_config()
+    path = tmp_path / "config.yaml"
+    write_yaml(path, data)
+    config = load_config(path)
+    assert config.bm25_threshold == 2.0
+    assert config.bm25_auto_forward_threshold == 7.0
+    assert config.bm25_auto_forward_mode == "shadow"
+    assert config.bm25_below_threshold_audit_rate == 0.05
+
+    data["pipeline"]["bm25_auto_forward_threshold"] = 2.0
+    write_yaml(path, data)
+    with pytest.raises(ConfigurationError, match="must be greater"):
+        load_config(path)
+
+    data["pipeline"]["bm25_auto_forward_threshold"] = 7.0
+    data["pipeline"]["bm25_below_threshold_audit_rate"] = 1.1
+    write_yaml(path, data)
+    with pytest.raises(ConfigurationError, match="between 0 and 1"):
+        load_config(path)
+
+
 def test_tracked_base_and_local_example_are_safe_and_valid() -> None:
     base = load_config("config/config.yaml")
     example = load_config("config/config.local.example.yaml")

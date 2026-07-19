@@ -54,9 +54,19 @@ flowchart TD
     C --> E{Oferta excepcional?}
     E -->|atributos satisfeitos| O[Enviar]
     E -->|atributos desconhecidos| G[Gemini]
-    E -->|não| B{BM25 suficiente?}
-    B -->|não| D
-    B -->|sim ou corpus frio| G
+    E -->|não| R{BM25 pronto?}
+    R -->|corpus frio ou rebuild| G
+    R -->|sim| B{Faixa do score}
+    B -->|score menor que 2| A{Amostra de 5%?}
+    A -->|não| D
+    A -->|sim| GA[Gemini para auditoria]
+    GA -->|registrar rótulo, sem entregar| D
+    B -->|2 até menos de 7| G
+    B -->|7 ou mais| K{Gates determinísticos?}
+    K -->|não| G
+    K -->|sim e shadow| S[Marcar candidato]
+    S --> G
+    K -->|sim e live validado| O
     G -->|forward| O
     G -->|discard| D
 ```
@@ -68,8 +78,9 @@ A ordem é intencional:
 3. deduplicação persistente;
 4. restrições determinísticas de preço e atributos;
 5. tratamento de ofertas excepcionais;
-6. relevância lexical ponderada com BM25;
-7. avaliação estruturada do Gemini.
+6. relevância lexical ponderada com BM25 e roteamento por duas faixas;
+7. gates determinísticos para candidatos fortes;
+8. avaliação estruturada do Gemini na faixa incerta e em shadow.
 
 Uma violação de preço identificada com segurança nunca é ignorada por uma oferta “excepcional”. Se
 uma oferta excepcional parece relevante, mas não é possível comprovar um atributo obrigatório, ela
@@ -169,6 +180,47 @@ w(I) = 0,5 + I / 100,     0 ≤ I ≤ 100
 Aliases expandem os termos indexados sem alterar o texto original armazenado. Entradas de contexto
 informam o Gemini, mas não tornam um produto lexicalmente relevante por conta própria.
 
+### Por que os limiares são 2 e 7
+
+BM25 não é porcentagem nem probabilidade: sua escala muda com `N`, `df(t)`, comprimento dos textos,
+aliases e pesos. Quando uma promoção tem comprimento médio e um termo aparece uma vez, a fração de
+saturação vale exatamente `1`:
+
+```text
+f = 1 e |d| = avgdl  →  f·(k₁+1) / (f+k₁) = 1
+contribuição do termo ≈ IDF(t) · w(t)
+```
+
+No primeiro corpus considerado estável, com `N = 500`, alguns exemplos são:
+
+| Frequência no corpus | `IDF(t)` | Contribuição com peso `1,0` |
+| ---: | ---: | ---: |
+| `df = 1` | `5,81` | `≈ 5,81` |
+| `df = 10` | `3,87` | `≈ 3,87` |
+| `df = 50` | `2,29` | `≈ 2,29` |
+
+Assim, `2,0` elimina matches lexicais fracos, enquanto `7,0` separa uma faixa forte para medição.
+Mas um único termo raríssimo com importância máxima pode contribuir `5,81 × 1,5 ≈ 8,72`; portanto,
+`7,0` **não prova relevância sozinho**. O candidato também precisa corresponder literalmente a um
+termo de um interesse estruturado, ter todas as restrições comprovadas e não parecer um acessório
+quando o interesse é o produto principal. Aliases ajudam o BM25, mas não satisfazem sozinhos esse
+gate literal.
+
+Os defaults implementam uma política conservadora:
+
+```text
+score < 2,0       → descartar; 5% entram em auditoria Gemini sem possibilidade de entrega
+2,0 ≤ score < 7,0 → Gemini decide
+score ≥ 7,0       → aplicar gates; em shadow, marcar candidato e ainda deixar Gemini decidir
+BM25 indisponível → Gemini decide
+```
+
+`7,0` é um ponto inicial experimental, não um ótimo matemático universal. O modo `live` só deve ser
+ativado depois de pelo menos 300 candidatos shadow elegíveis sem falso encaminhamento confirmado:
+com zero falhas em `n` observações, a regra dos três limita aproximadamente o risco superior de 95%
+a `3/n`, ou cerca de `1%` quando `n = 300`. Mudanças de aliases e corpus frio desativam o caminho
+BM25 e voltam a decisão ao Gemini.
+
 ### Restrições com três resultados
 
 Preço e atributos são avaliados como `satisfeito`, `violado` ou `desconhecido`:
@@ -263,7 +315,7 @@ ambiente.
 | --- | --- |
 | `runtime` | modo, capacidade de fila, memória e alertas |
 | `state` | caminho SQLite, retenção, corpus e tentativas |
-| `pipeline` | BM25, perfil inicial, aliases, regras e ofertas excepcionais |
+| `pipeline` | limiares e modo BM25, auditoria, perfil inicial, aliases, regras e ofertas excepcionais |
 | `evaluator` | modelo Gemini, timeout e tentativas |
 | `preferences` | proprietário, polling, confirmações, limites e parser |
 | `sink` | bot e conversa privada de destino |

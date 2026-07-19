@@ -86,3 +86,26 @@ def test_decisions_delivery_claims_health_and_incremental_retention(tmp_path) ->
     assert store.record_health("source") == 0
     assert store.health_snapshot()["source"]["consecutive_failures"] == 0
     store.close()
+
+
+def test_existing_decisions_table_is_migrated_for_shadow_fields(tmp_path) -> None:
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE decisions ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, "
+        "native_id TEXT NOT NULL, decided_at REAL NOT NULL, decision TEXT NOT NULL, "
+        "stage TEXT NOT NULL, reason TEXT NOT NULL, score REAL, "
+        "exceptional INTEGER NOT NULL DEFAULT 0)"
+    )
+    connection.commit()
+    connection.close()
+
+    store = SQLiteStateStore(path)
+    columns = {
+        str(row["name"]) for row in store._connection.execute("PRAGMA table_info(decisions)")
+    }
+    assert {"shadow_decision", "auto_forward_candidate"} <= columns
+    store.close()

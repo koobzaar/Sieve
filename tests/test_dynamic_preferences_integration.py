@@ -27,7 +27,14 @@ class ContextEvaluator:
         return None
 
 
-def setup(tmp_path, *, profile="ssd", threshold=0.1):
+def setup(
+    tmp_path,
+    *,
+    profile="ssd",
+    threshold=0.1,
+    auto_forward_threshold=None,
+    auto_forward_mode="shadow",
+):
     state = SQLiteStateStore(tmp_path / "state.db")
 
     def refresh(snapshot, previous):
@@ -49,10 +56,135 @@ def setup(tmp_path, *, profile="ssd", threshold=0.1):
         aliases={},
         hard_rules=(),
         threshold=threshold,
+        auto_forward_threshold=auto_forward_threshold,
+        auto_forward_mode=auto_forward_mode,
         cold_start_documents=0,
         preference_provider=provider,
     )
     return state, preferences, evaluator, sink, pipeline
+
+
+async def test_high_score_shadow_candidate_still_uses_gemini(tmp_path) -> None:
+    state, preferences, evaluator, sink, pipeline = setup(
+        tmp_path,
+        profile="ssd",
+        threshold=0,
+        auto_forward_threshold=0.01,
+        auto_forward_mode="shadow",
+    )
+    preferences.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={"name": "SSD", "search_terms": ["ssd"]},
+            )
+        ],
+        base_revision=0,
+        original_message="quero SSD",
+        actor_id=42,
+        update_id=1,
+        summary="SSD",
+    )
+
+    result = await pipeline.process(
+        Promotion(id="shadow-high", source="telegram", title="SSD NVMe 1TB")
+    )
+
+    assert result.stage == "llm"
+    assert result.auto_forward_candidate
+    assert result.decision == Decision.DISCARD
+    assert len(evaluator.calls) == 1
+    assert sink.sent == []
+    stored = state._connection.execute(
+        "SELECT auto_forward_candidate FROM decisions WHERE native_id='shadow-high'"
+    ).fetchone()
+    assert int(stored[0]) == 1
+    state.close()
+
+
+async def test_live_high_score_requires_exact_interest_and_accessory_guard(tmp_path) -> None:
+    state, preferences, evaluator, sink, pipeline = setup(
+        tmp_path,
+        profile="iphone",
+        threshold=0,
+        auto_forward_threshold=0.01,
+        auto_forward_mode="live",
+    )
+    snapshot = preferences.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={"name": "iPhone", "search_terms": ["iphone"]},
+            )
+        ],
+        base_revision=0,
+        original_message="quero iPhone",
+        actor_id=42,
+        update_id=1,
+        summary="iPhone",
+    )
+
+    accessory = await pipeline.process(
+        Promotion(id="case", source="telegram", title="Capa para iPhone 15")
+    )
+    product = await pipeline.process(
+        Promotion(id="phone", source="telegram", title="iPhone 15 128GB")
+    )
+
+    assert snapshot.interests
+    assert accessory.stage == "llm"
+    assert not accessory.auto_forward_candidate
+    assert product.stage == "bm25_auto_forward"
+    assert product.decision == Decision.FORWARD
+    assert product.auto_forward_candidate
+    assert len(evaluator.calls) == 1
+    assert [item[0].id for item in sink.sent] == ["phone"]
+    state.close()
+
+
+async def test_live_high_score_requires_proven_attributes(tmp_path) -> None:
+    state, preferences, evaluator, sink, pipeline = setup(
+        tmp_path,
+        profile="notebook",
+        threshold=0,
+        auto_forward_threshold=0.01,
+        auto_forward_mode="live",
+    )
+    preferences.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={
+                    "name": "Notebook",
+                    "search_terms": ["notebook"],
+                    "constraints": {"attributes": {"memory": ["16gb"]}},
+                },
+            )
+        ],
+        base_revision=0,
+        original_message="notebook com 16 GB",
+        actor_id=42,
+        update_id=1,
+        summary="Notebook 16 GB",
+    )
+
+    unknown = await pipeline.process(
+        Promotion(id="unknown-memory", source="telegram", title="Notebook gamer")
+    )
+    proven = await pipeline.process(
+        Promotion(id="proven-memory", source="telegram", title="Notebook gamer 16GB")
+    )
+
+    assert unknown.stage == "llm"
+    assert not unknown.auto_forward_candidate
+    assert proven.stage == "bm25_auto_forward"
+    assert proven.auto_forward_candidate
+    assert len(evaluator.calls) == 1
+    assert [item[0].id for item in sink.sent] == ["proven-memory"]
+    state.close()
 
 
 async def test_command_revision_is_visible_to_the_next_promotion(tmp_path) -> None:

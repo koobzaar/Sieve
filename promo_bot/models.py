@@ -59,6 +59,8 @@ class PipelineResult:
     reason: str
     score: float | None = None
     exceptional: bool = False
+    shadow_decision: Decision | None = None
+    auto_forward_candidate: bool = False
 
 
 @dataclass(frozen=True, slots=True)
