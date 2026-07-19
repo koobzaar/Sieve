@@ -210,14 +210,17 @@ class Service:
             "component_failure",
             extra={"event": "component_failure", "component": name, "failures": failures, "error": str(error)},
         )
-        immediate = isinstance(error, (PelandoSchemaError, StoreError))
+        schema_failure = isinstance(error, PelandoSchemaError)
+        immediate = isinstance(error, StoreError)
         persistent_llm = (
             name == "llm" and elapsed >= self.config.llm_outage_alert_seconds
         )
         repeated_component = (
             name != "llm" and failures >= self.config.failure_alert_threshold
         )
-        should_alert = immediate or persistent_llm or repeated_component
+        should_alert = not schema_failure and (
+            immediate or persistent_llm or repeated_component
+        )
         if should_alert and name not in self._failure_alerted:
             self._failure_alerted.add(name)
             with suppress(Exception):

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -16,6 +18,10 @@ from ..normalization import parse_price
 from ..protocols import PromotionEmitter
 
 HealthReporter = Callable[[str, Exception | None], Awaitable[None]]
+
+logger = logging.getLogger(__name__)
+
+_SKIP_EXAMPLE_LIMIT = 3
 
 
 class PelandoSchemaError(ValueError):
@@ -80,9 +86,12 @@ class _RenderedCardParser(HTMLParser):
 
         href = attributes.get("href", "") or ""
         deal_id = attributes.get("data-deal-id")
-        if tag.casefold() == "a" and deal_id and "/d/" in href:
+        if tag.casefold() == "a" and "/d/" in href:
             self._finish_current()
-            self._current = {"id": deal_id, "url": href}
+            self._current = {
+                "id": (deal_id or "").strip(),
+                "url": href.strip(),
+            }
             self._title_chunks = []
             self._price_chunks = []
             self._temperature_chunks = []
@@ -144,6 +153,37 @@ def _collection_parts(root: Any) -> list[Any] | None:
     return parts if isinstance(parts, list) else None
 
 
+def _finish_item_parse(
+    promotions: list[Promotion],
+    skipped: list[tuple[int, str]],
+    *,
+    source_name: str,
+    schema: str,
+    total_count: int,
+) -> list[Promotion]:
+    if skipped:
+        logger.warning(
+            "pelando_items_skipped",
+            extra={
+                "event": "pelando_items_skipped",
+                "source": source_name,
+                "schema": schema,
+                "skipped_count": len(skipped),
+                "total_count": total_count,
+                "reason_counts": dict(sorted(Counter(reason for _, reason in skipped).items())),
+                "examples": [
+                    {"index": index, "reason": reason}
+                    for index, reason in skipped[:_SKIP_EXAMPLE_LIMIT]
+                ],
+            },
+        )
+    if not promotions:
+        raise PelandoSchemaError(
+            f"feed-schema {schema} contains no usable promotions"
+        )
+    return promotions
+
+
 def _parse_rendered_collection(
     root: Any, html: str, *, source_name: str
 ) -> list[Promotion] | None:
@@ -157,30 +197,46 @@ def _parse_rendered_collection(
     parser.feed(html)
     parser.close()
     cards_by_url: dict[str, dict[str, str]] = {}
+    ambiguous_urls: set[str] = set()
     for card in parser.cards:
         url = card["url"].rstrip("/")
-        if url in cards_by_url:
-            raise PelandoSchemaError(f"rendered feed contains duplicate URL: {url}")
-        cards_by_url[url] = card
+        if url in cards_by_url or url in ambiguous_urls:
+            cards_by_url.pop(url, None)
+            ambiguous_urls.add(url)
+        else:
+            cards_by_url[url] = card
 
     promotions: list[Promotion] = []
+    skipped: list[tuple[int, str]] = []
     for index, part in enumerate(parts):
         if not isinstance(part, dict):
-            raise PelandoSchemaError(f"CollectionPage item {index} is not an object")
+            skipped.append((index, "item_not_object"))
+            continue
         title = str(part.get("name") or "").strip()
         url = str(part.get("url") or part.get("@id") or "").strip().rstrip("/")
+        if not title:
+            skipped.append((index, "missing_title"))
+            continue
+        if not url:
+            skipped.append((index, "missing_url"))
+            continue
+        if url in ambiguous_urls:
+            skipped.append((index, "duplicate_card_url"))
+            continue
         card = cards_by_url.get(url)
-        if not title or not url or card is None:
-            raise PelandoSchemaError(
-                f"CollectionPage item {index} is missing title, URL, or rendered card"
-            )
-        if not card.get("id") or not card.get("temperature"):
-            raise PelandoSchemaError(
-                f"CollectionPage item {index} is missing ID or temperature"
-            )
+        if card is None:
+            skipped.append((index, "missing_rendered_card"))
+            continue
+        if not card.get("id"):
+            skipped.append((index, "missing_id"))
+            continue
+        if not card.get("temperature"):
+            skipped.append((index, "missing_temperature"))
+            continue
         rendered_title = card.get("title", "")
         if rendered_title and rendered_title != title:
-            raise PelandoSchemaError(f"CollectionPage item {index} title does not match its card")
+            skipped.append((index, "title_mismatch"))
+            continue
         promotions.append(
             Promotion(
                 id=card["id"],
@@ -193,7 +249,13 @@ def _parse_rendered_collection(
                 metadata={"position": index + 1, "currency": "BRL"},
             )
         )
-    return promotions
+    return _finish_item_parse(
+        promotions,
+        skipped,
+        source_name=source_name,
+        schema="CollectionPage",
+        total_count=len(parts),
+    )
 
 
 def _temperature(product: dict[str, Any], entry: dict[str, Any]) -> int | None:
@@ -251,26 +313,43 @@ def parse_feed_schema(html: str, *, source_name: str = "pelando") -> list[Promot
         raise PelandoSchemaError("feed-schema ItemList is empty")
 
     promotions: list[Promotion] = []
+    skipped: list[tuple[int, str]] = []
     for index, raw_entry in enumerate(entries):
         if not isinstance(raw_entry, dict):
-            raise PelandoSchemaError(f"item {index} is not an object")
+            skipped.append((index, "item_not_object"))
+            continue
         product = raw_entry.get("item", raw_entry)
         if not isinstance(product, dict):
-            raise PelandoSchemaError(f"item {index} has no Product object")
+            skipped.append((index, "missing_product"))
+            continue
         offers = product.get("offers")
         if isinstance(offers, list):
             offers = offers[0] if offers else None
         if not isinstance(offers, dict):
-            raise PelandoSchemaError(f"item {index} has no Offer")
+            skipped.append((index, "missing_offer"))
+            continue
         title = str(product.get("name") or "").strip()
         url = str(product.get("url") or offers.get("url") or "").strip()
         price = parse_price(offers.get("price"))
         temperature = _temperature(product, raw_entry)
         native_id = product.get("productID") or product.get("sku") or product.get("@id")
-        if not title or not url or price is None or temperature is None:
-            raise PelandoSchemaError(
-                f"item {index} is missing title, URL, price, or temperature"
-            )
+        if not title:
+            skipped.append((index, "missing_title"))
+            continue
+        if not url:
+            skipped.append((index, "missing_url"))
+            continue
+        if price is None:
+            skipped.append((index, "missing_price"))
+            continue
+        if temperature is None:
+            skipped.append((index, "missing_temperature"))
+            continue
+        try:
+            timestamp = _timestamp(product)
+        except PelandoSchemaError:
+            skipped.append((index, "invalid_timestamp"))
+            continue
         identifier = str(native_id or hashlib.sha256(url.encode()).hexdigest()[:24])
         description = str(product.get("description") or "")
         promotions.append(
@@ -282,11 +361,17 @@ def parse_feed_schema(html: str, *, source_name: str = "pelando") -> list[Promot
                 price=price,
                 url=url,
                 temperature=temperature,
-                timestamp=_timestamp(product),
+                timestamp=timestamp,
                 metadata={"position": raw_entry.get("position"), "currency": offers.get("priceCurrency")},
             )
         )
-    return promotions
+    return _finish_item_parse(
+        promotions,
+        skipped,
+        source_name=source_name,
+        schema="ItemList",
+        total_count=len(entries),
+    )
 
 
 class PelandoSource:

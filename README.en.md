@@ -117,8 +117,9 @@ flowchart TD
 - **No media downloads.** Telegram ingestion reads text and media captions only.
 - **Locked-down container.** Non-root user, read-only root filesystem, all capabilities dropped,
   `no-new-privileges`, 64 PIDs, 16 MB tmpfs, 10 MB × 3 log rotation.
-- **Observable.** JSON logs to stdout; alerts for source failures, schema drift, database errors,
-  LLM outages and memory pressure.
+- **Observable.** JSON logs to stdout; Telegram alerts for transport and other source failures,
+  database errors, LLM outages and memory pressure. Pelando schema drift stays visible in structured
+  logs and the persisted health snapshot without sending Telegram alerts.
 
 ### The math
 
