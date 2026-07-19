@@ -27,61 +27,6 @@ from .preferences import (
 logger = logging.getLogger(__name__)
 
 
-_STRING_LIST_SCHEMA: dict[str, Any] = {
-    "type": "array",
-    "items": {"type": "string", "minLength": 1},
-}
-
-
-_PREFERENCE_DATA_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "description": (
-        "Canonical preference fields only. For an interest add, name is required and "
-        "must be a nonempty product or category name. Put price limits inside the "
-        "constraints object belonging to that interest."
-    ),
-    "properties": {
-        "name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500,
-            "description": "Required nonempty canonical name for an interest add.",
-        },
-        "importance": {"type": "integer", "minimum": 0, "maximum": 100},
-        "search_terms": _STRING_LIST_SCHEMA,
-        "constraints": {
-            "type": "object",
-            "properties": {
-                "min_price": {"type": "number", "minimum": 0},
-                "max_price": {"type": "number", "minimum": 0},
-                "attributes": {
-                    "type": "object",
-                    "description": "Attribute names mapped to nonempty string lists.",
-                },
-                "excluded_attributes": _STRING_LIST_SCHEMA,
-            },
-        },
-        "category": {"type": "string", "minLength": 1, "maxLength": 500},
-        "text": {"type": "string", "minLength": 1},
-        "terms": _STRING_LIST_SCHEMA,
-        "canonical": {"type": "string", "minLength": 1, "maxLength": 500},
-        "synonyms": _STRING_LIST_SCHEMA,
-        "rule_id": {"type": "string", "minLength": 1, "maxLength": 100},
-        "priority": {"type": "integer"},
-        "action": {"type": "string", "enum": ["allow", "deny"]},
-        "any": _STRING_LIST_SCHEMA,
-        "all": {
-            "type": "array",
-            "items": {
-                "type": "array",
-                "minItems": 1,
-                "items": {"type": "string", "minLength": 1},
-            },
-        },
-    },
-}
-
-
 INTERPRETER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -91,7 +36,6 @@ INTERPRETER_SCHEMA: dict[str, Any] = {
         },
         "operations": {
             "type": "array",
-            "maxItems": 25,
             "items": {
                 "type": "object",
                 "properties": {
@@ -106,66 +50,25 @@ INTERPRETER_SCHEMA: dict[str, Any] = {
                             "alias",
                             "hard_rule",
                         ],
+                        "nullable": True,
                     },
-                    "id": {"type": "string"},
-                    "data": _PREFERENCE_DATA_SCHEMA,
+                    "id": {
+                        "type": "string",
+                        "nullable": True,
+                        "description": "Existing entry ID for update/remove; null for add.",
+                    },
+                    "data": {
+                        "type": "object",
+                        "description": (
+                            "Canonical data object for add/update; use an empty object for remove. "
+                            "The application validates its fields."
+                        ),
+                    },
                 },
-                "required": ["op"],
-                "anyOf": [
-                    {
-                        "type": "object",
-                        "description": "Add one interest with its required canonical name.",
-                        "properties": {
-                            "op": {"type": "string", "enum": ["add"]},
-                            "kind": {"type": "string", "enum": ["interest"]},
-                            "data": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {"type": "string", "minLength": 1}
-                                },
-                                "required": ["name"],
-                            },
-                        },
-                        "required": ["op", "kind", "data"],
-                    },
-                    {
-                        "type": "object",
-                        "description": "Add one non-interest preference.",
-                        "properties": {
-                            "op": {"type": "string", "enum": ["add"]},
-                            "kind": {
-                                "type": "string",
-                                "enum": [
-                                    "baseline_note",
-                                    "exclusion",
-                                    "context",
-                                    "alias",
-                                    "hard_rule",
-                                ],
-                            },
-                        },
-                        "required": ["op", "kind", "data"],
-                    },
-                    {
-                        "type": "object",
-                        "description": "Update one existing preference by ID.",
-                        "properties": {
-                            "op": {"type": "string", "enum": ["update"]}
-                        },
-                        "required": ["op", "id", "data"],
-                    },
-                    {
-                        "type": "object",
-                        "description": "Remove one existing preference by ID.",
-                        "properties": {
-                            "op": {"type": "string", "enum": ["remove"]}
-                        },
-                        "required": ["op", "id"],
-                    },
-                ],
+                "required": ["op", "kind", "id", "data"],
                 "description": (
-                    "Use one operation per distinct product. Interest add operations require "
-                    "kind=interest and a nonempty data.name."
+                    "Use one operation per distinct product. Conditional operation rules are "
+                    "validated by the application after generation."
                 ),
             },
         },
@@ -256,7 +159,12 @@ class GeminiPreferenceInterpreter:
             "You interpret private natural-language commands that manage promotion preferences. "
             "Do not authorize, confirm, or persist anything; only convert the message into a proposal. "
             "Use only existing IDs for update/remove. For add, do not invent an ID; provide kind and data. "
-            "Use canonical data fields from the response schema. Every interest add must include a "
+            "Every operation must contain op, kind, id, and data. Use null kind when it is not needed, "
+            "null id for add, and an empty data object for remove. Use only these canonical data shapes: "
+            "baseline_note/context use {text}; interest uses {name, importance, search_terms, "
+            "constraints: {min_price, max_price, attributes, excluded_attributes}, category}; "
+            "exclusion uses {terms}; alias uses {canonical, synonyms}; hard_rule uses "
+            "{rule_id, priority, action, any, all}. Every interest add must include a "
             "trimmed, nonempty data.name. Represent each distinct product or category with a separate "
             "operation, and attach constraints such as min_price or max_price only to the interest they "
             "describe. Preserve every unambiguous requested change. "
@@ -394,6 +302,7 @@ class GeminiPreferenceInterpreter:
             max_output_tokens=self.max_output_tokens,
             temperature=0,
             thinking_level="minimal",
+            event_name="preference_interpreter_request",
         )
         try:
             proposal = self.parse(payload, snapshot)
@@ -414,6 +323,7 @@ class GeminiPreferenceInterpreter:
                 max_output_tokens=self.max_output_tokens,
                 temperature=0,
                 thinking_level="minimal",
+                event_name="preference_interpreter_repair_request",
             )
             try:
                 proposal = self.parse(replacement, snapshot)

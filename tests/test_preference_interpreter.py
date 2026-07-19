@@ -171,13 +171,15 @@ def test_rejects_ambiguity_malformed_semantics_and_oversized_operations() -> Non
 def test_schema_and_prompt_require_canonical_separate_interests() -> None:
     operation_schema = INTERPRETER_SCHEMA["properties"]["operations"]["items"]
     data_schema = operation_schema["properties"]["data"]
-    assert data_schema["properties"]["name"]["minLength"] == 1
-    assert operation_schema["anyOf"][0]["properties"]["data"]["required"] == [
-        "name"
-    ]
-    assert "required nonempty canonical name" in (
-        data_schema["properties"]["name"]["description"].casefold()
-    )
+    assert operation_schema["required"] == ["op", "kind", "id", "data"]
+    assert "anyOf" not in operation_schema
+    assert data_schema == {
+        "type": "object",
+        "description": (
+            "Canonical data object for add/update; use an empty object for remove. "
+            "The application validates its fields."
+        ),
+    }
     assert "one operation per distinct product" in operation_schema[
         "description"
     ].casefold()
@@ -192,6 +194,31 @@ def test_schema_and_prompt_require_canonical_separate_interests() -> None:
     assert "each distinct product or category with a separate operation" in prompt
     assert "SELECTED RESPONSE LANGUAGE: Brazilian Portuguese" in prompt
     assert "selected UI language is authoritative" in prompt
+    assert "interest uses {name, importance, search_terms" in prompt
+
+
+def test_every_required_provider_field_is_defined_on_the_same_schema_node() -> None:
+    def check(schema, path="$") -> None:
+        if isinstance(schema, dict):
+            required = schema.get("required", [])
+            if required:
+                properties = schema.get("properties", {})
+                missing = sorted(set(required) - set(properties))
+                assert not missing, f"{path} requires undefined local fields: {missing}"
+            for key, value in schema.items():
+                check(value, f"{path}.{key}")
+        elif isinstance(schema, list):
+            for index, value in enumerate(schema):
+                check(value, f"{path}[{index}]")
+
+    check(INTERPRETER_SCHEMA)
+
+
+def test_provider_schema_avoids_conditional_and_length_constraints() -> None:
+    serialized = json.dumps(INTERPRETER_SCHEMA, sort_keys=True)
+    assert '"anyOf"' not in serialized
+    assert '"minLength"' not in serialized
+    assert '"maxLength"' not in serialized
 
 
 async def test_semantic_repair_returns_a_complete_valid_replacement(caplog) -> None:
@@ -381,7 +408,7 @@ async def test_structured_client_retries_malformed_json_in_the_same_request() ->
         calls += 1
         body = json.loads(request.content)
         assert body["generationConfig"]["responseMimeType"] == "application/json"
-        assert "responseSchema" in body["generationConfig"]
+        assert body["generationConfig"]["responseSchema"] == INTERPRETER_SCHEMA
         assert "Brazilian Portuguese" in body["contents"][0]["parts"][0]["text"]
         text = "not-json" if calls == 1 else json.dumps(
             {

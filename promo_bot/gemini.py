@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
+import re
 from collections.abc import Mapping
 from typing import Any
 
 import httpx
 
 
+logger = logging.getLogger(__name__)
+
+
 class GeminiError(RuntimeError):
-    pass
+    def __init__(self, message: str, **details: Any) -> None:
+        super().__init__(message)
+        self.details = {key: value for key, value in details.items() if value is not None}
 
 
 class RetryableGeminiError(GeminiError):
@@ -79,7 +86,127 @@ class GeminiStructuredClient:
             raise RetryableGeminiError("structured Gemini response must be an object")
         return parsed
 
-    async def request_json(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _prompt_fragments(body: Mapping[str, Any]) -> set[str]:
+        fragments: set[str] = set()
+
+        def add_fragment(value: str, *, minimum_length: int = 4) -> None:
+            value = value.strip()
+            if len(value) < minimum_length:
+                return
+            fragments.add(value[:2_000])
+            if len(value) > 2_000:
+                fragments.add(value[-2_000:])
+
+        def collect_json_strings(value: Any) -> None:
+            if isinstance(value, str):
+                add_fragment(value, minimum_length=1)
+            elif isinstance(value, Mapping):
+                for item in value.values():
+                    collect_json_strings(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect_json_strings(item)
+
+        contents = body.get("contents", [])
+        if not isinstance(contents, list):
+            return fragments
+        for content in contents:
+            if not isinstance(content, Mapping):
+                continue
+            parts = content.get("parts", [])
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, Mapping) or not isinstance(part.get("text"), str):
+                    continue
+                prompt = part["text"]
+                add_fragment(prompt)
+                for line in prompt.splitlines():
+                    line = line.strip()
+                    add_fragment(line)
+                    if ":" in line:
+                        add_fragment(line.split(":", 1)[1], minimum_length=1)
+                    if line.startswith(("{", "[")):
+                        try:
+                            collect_json_strings(json.loads(line))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            pass
+        return fragments
+
+    def _sanitize_provider_message(
+        self, value: Any, body: Mapping[str, Any]
+    ) -> str:
+        message = " ".join(str(value or "").split())[:4_000]
+        secrets = self._prompt_fragments(body)
+        if self.api_key:
+            secrets.add(self.api_key)
+        for secret in sorted(secrets, key=len, reverse=True):
+            message = re.sub(re.escape(secret), "[redacted]", message, flags=re.IGNORECASE)
+        message = re.sub(
+            r"(?i)(api[_-]?key|token|secret|authorization)\s*[:=]\s*[^\s,;]+",
+            r"\1=[redacted]",
+            message,
+        )
+        message = re.sub(r"(?i)([?&](?:key|api_key)=)[^&\s]+", r"\1[redacted]", message)
+        if not message:
+            return "provider returned an error without a message"
+        return message[:500]
+
+    def _http_error(
+        self,
+        response: httpx.Response,
+        body: Mapping[str, Any],
+        *,
+        request_event: str,
+        attempt: int,
+    ) -> GeminiError:
+        provider_status = "UNKNOWN"
+        provider_message: Any = "provider returned a non-JSON error response"
+        try:
+            payload = response.json()
+            if isinstance(payload, Mapping):
+                error = payload.get("error", payload)
+                if isinstance(error, Mapping):
+                    raw_status = str(error.get("status", "UNKNOWN")).upper()
+                    if re.fullmatch(r"[A-Z0-9_]{1,80}", raw_status):
+                        provider_status = raw_status
+                    provider_message = error.get("message", provider_message)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        raw_request_id = next(
+            (
+                response.headers[name].strip()[:200]
+                for name in ("x-request-id", "x-goog-request-id", "request-id")
+                if response.headers.get(name, "").strip()
+            ),
+            None,
+        )
+        request_id = (
+            re.sub(r"[^A-Za-z0-9._:/-]", "_", raw_request_id)
+            if raw_request_id
+            else None
+        )
+        details = {
+            "status_code": response.status_code,
+            "provider_status": provider_status,
+            "provider_message": self._sanitize_provider_message(provider_message, body),
+            "model": self.model,
+            "request_event": request_event,
+            "request_id": request_id,
+        }
+        logger.error(
+            "gemini_http_error",
+            extra={"event": "gemini_http_error", "attempt": attempt, **details},
+        )
+        return GeminiError(f"Gemini HTTP {response.status_code}", **details)
+
+    async def request_json(
+        self,
+        body: Mapping[str, Any],
+        *,
+        event_name: str = "gemini_structured_request",
+    ) -> dict[str, Any]:
         last_error = "Gemini request failed"
         for attempt in range(self.retries):
             try:
@@ -91,7 +218,12 @@ class GeminiStructuredClient:
                 if response.status_code in {408, 409, 425, 429} or response.status_code >= 500:
                     last_error = f"transient Gemini HTTP {response.status_code}"
                 elif response.is_error:
-                    raise GeminiError(f"Gemini HTTP {response.status_code}")
+                    raise self._http_error(
+                        response,
+                        body,
+                        request_event=event_name,
+                        attempt=attempt + 1,
+                    )
                 else:
                     return self.parse_response(response.json())
             except GeminiError as exc:
@@ -113,6 +245,7 @@ class GeminiStructuredClient:
         max_output_tokens: int,
         temperature: float = 0.1,
         thinking_level: str | None = "minimal",
+        event_name: str = "gemini_structured_request",
     ) -> dict[str, Any]:
         return await self.request_json(
             self.request_body(
@@ -121,7 +254,8 @@ class GeminiStructuredClient:
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
                 thinking_level=thinking_level,
-            )
+            ),
+            event_name=event_name,
         )
 
     async def close(self) -> None:

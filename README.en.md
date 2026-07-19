@@ -394,15 +394,20 @@ python -m venv .venv
 
 On Windows PowerShell, use `.venv\Scripts\pip` and `.venv\Scripts\python`.
 
-Tests never touch live services. They run against saved HTML/JSON-LD fixtures, synthetic events,
-mocked HTTP transports, deterministic clocks and temporary SQLite files. The suite covers BM25,
+The default suite never touches live services; the `contract` test is skipped unless explicitly
+enabled. Tests run against saved HTML/JSON-LD fixtures, synthetic events, mocked HTTP transports,
+deterministic clocks and temporary SQLite files. The suite covers BM25,
 normalization, filters and exceptional detection, revisioned preference CRUD, Gemini parsing,
 Telegram authorization and outbox recovery, restart-safe alias generations, pipeline integration,
 replay, and `soak`-marked promotion, 500-entry, 10,000-document rebuild and command-flood runs.
 
 ```bash
 .venv/bin/python -m pytest -m "not soak"   # skip the long one
+SIEVE_RUN_GEMINI_CONTRACT=1 GEMINI_API_KEY=... .venv/bin/python -m pytest -m contract
 ```
+
+Set `SIEVE_GEMINI_MODEL` to override the contract test's default
+`gemini-3.1-flash-lite` model.
 
 ---
 

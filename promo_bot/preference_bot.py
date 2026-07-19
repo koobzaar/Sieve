@@ -762,9 +762,18 @@ class PreferenceCommandProcessor:
                     next_pt="Reescreva com um produto, uma ação e o limite desejado.",
                 ),
             )
-        except GeminiError:
+        except GeminiError as exc:
             if not consumed:
                 self.store.record_rate_event(actor_id)
+            logger.error(
+                "preference_interpreter_failure",
+                extra={
+                    "event": "preference_interpreter_failure",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    **exc.details,
+                },
+            )
             self._record_reply(
                 update_id,
                 actor_id,
