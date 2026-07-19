@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 
 import pytest
 
-from promo_bot.gemini import GeminiStructuredClient
-from promo_bot.preference_interpreter import INTERPRETER_SCHEMA
+from promo_bot.preference_interpreter import GeminiPreferenceInterpreter
+from promo_bot.preferences import PreferenceIntent, PreferenceKind, build_snapshot, seed_entries
 
 
 pytestmark = pytest.mark.contract
@@ -17,27 +18,24 @@ pytestmark = pytest.mark.contract
     reason="set SIEVE_RUN_GEMINI_CONTRACT=1 and GEMINI_API_KEY to call Gemini",
 )
 async def test_exact_interpreter_schema_is_accepted_by_configured_model() -> None:
-    client = GeminiStructuredClient(
+    interpreter = GeminiPreferenceInterpreter(
         api_key=os.environ["GEMINI_API_KEY"],
         model=os.environ.get("SIEVE_GEMINI_MODEL", "gemini-3.1-flash-lite"),
         retries=1,
     )
     try:
-        payload = await client.generate_json(
-            (
-                "Synthetic schema contract check. Return an apply proposal that adds SSD as "
-                "one interest. Every operation must contain op, kind, id, and data; use null "
-                "id for add. Use an empty summary and null clarification_question."
-            ),
-            INTERPRETER_SCHEMA,
-            max_output_tokens=512,
-            temperature=0,
-            event_name="preference_interpreter_contract",
+        proposal = await interpreter.interpret(
+            "adicione SSD nas buscas, até 500 reais",
+            build_snapshot(0, seed_entries("", {}, ())),
+            local_timestamp="2026-07-19T12:00:00-03:00",
+            language="pt-BR",
         )
     finally:
-        await client.close()
+        await interpreter.close()
 
-    assert payload["intent"] == "apply"
-    assert payload["operations"][0]["op"] == "add"
-    assert isinstance(payload["operations"][0]["data"], dict)
-    assert payload["operations"][0]["data"]["name"].casefold() == "ssd"
+    assert proposal.intent == PreferenceIntent.APPLY
+    assert len(proposal.operations) == 1
+    operation = proposal.operations[0]
+    assert operation.kind == PreferenceKind.INTEREST
+    assert operation.data["name"].casefold() == "ssd"
+    assert Decimal(str(operation.data["constraints"]["max_price"])) == Decimal("500")
