@@ -21,6 +21,7 @@ from .preference_store import (
     SQLitePreferenceStore,
 )
 from .preferences import (
+    PreferenceClarificationContext,
     PreferenceError,
     PreferenceIntent,
     PreferenceProposal,
@@ -292,6 +293,7 @@ class PreferenceCommandProcessor:
         callback_query_id: str | None = None,
         reply_markup: Mapping[str, Any] | None = None,
         parse_mode: str | None = "HTML",
+        clear_clarification: bool = False,
     ) -> None:
         self.store.record_update(
             update_id,
@@ -304,6 +306,7 @@ class PreferenceCommandProcessor:
                 reply_markup=reply_markup,
                 parse_mode=parse_mode,
             ),
+            clear_clarification=clear_clarification,
         )
 
     async def _confirm(
@@ -527,8 +530,14 @@ class PreferenceCommandProcessor:
         actor_id: int,
         original: str,
         preview: bool,
+        allow_clarification_context: bool = True,
     ) -> None:
         ui = self._ui(actor_id)
+        snapshot = self.store.current_snapshot()
+        stored_pending = self.store.pending_clarification(actor_id)
+        pending = stored_pending if allow_clarification_context else None
+        if pending is not None:
+            preview = pending.preview
         allowed, window = self.store.rate_limit_available(
             actor_id,
             per_minute=self.rate_per_minute,
@@ -553,13 +562,15 @@ class PreferenceCommandProcessor:
         if preview:
             self.store.record_rate_event(actor_id)
         consumed = preview
-        snapshot = self.store.current_snapshot()
         try:
             proposal = await self.interpreter.interpret(
                 instruction,
                 snapshot,
                 local_timestamp=datetime.now(self.zone).isoformat(),
                 language=ui.language,
+                clarification_context=(
+                    pending.context if pending is not None else None
+                ),
             )
             if not preview and proposal.intent != PreferenceIntent.QUERY:
                 self.store.record_rate_event(actor_id)
@@ -581,6 +592,7 @@ class PreferenceCommandProcessor:
                             len(operations),
                             len(candidate.entries),
                         ),
+                        clear_clarification=stored_pending is not None,
                     )
                     return
                 confirm, reason = requires_confirmation(
@@ -612,6 +624,59 @@ class PreferenceCommandProcessor:
                             or ui.pick("Change applied", "Alteração aplicada"),
                         )
                     ),
+                )
+                return
+            if proposal.intent == PreferenceIntent.CLARIFY:
+                question = (
+                    proposal.clarification_question
+                    or ui.pick(
+                        "Please clarify the preference you want to change.",
+                        "Esclareça a preferência que deseja alterar.",
+                    )
+                )
+                if pending is None:
+                    context = PreferenceClarificationContext(
+                        original_message=instruction,
+                        question=question,
+                    )
+                else:
+                    context = pending.context.continue_with(instruction, question)
+                if context.round_count > self.store.max_clarification_rounds:
+                    self._record_reply(
+                        update_id,
+                        actor_id,
+                        original,
+                        "clarification_limit",
+                        ui.notice(
+                            "I still need more detail",
+                            "Ainda preciso de mais detalhes",
+                            "I could not complete this request after several questions. "
+                            "Nothing was changed.",
+                            "Não consegui concluir esta solicitação após várias perguntas. "
+                            "Nada foi alterado.",
+                            next_en="Send one complete instruction with the product and any required limits.",
+                            next_pt="Envie uma instrução completa com o produto e os limites necessários.",
+                        ),
+                        clear_clarification=True,
+                    )
+                    return
+                text = ui.notice(
+                    "I need one detail",
+                    "Preciso de um detalhe",
+                    escape(question),
+                    escape(question),
+                    next_en="Reply naturally, or send “cancel” to abandon this request.",
+                    next_pt="Responda naturalmente ou envie “cancelar” para abandonar esta solicitação.",
+                )
+                self.store.save_clarification(
+                    context,
+                    actor_id=actor_id,
+                    chat_id=self.owner_chat_id,
+                    base_revision=snapshot.revision,
+                    preview=preview,
+                    update_id=update_id,
+                    original_message=original,
+                    reply=self._reply(text),
                 )
                 return
             if preview:
@@ -647,6 +712,7 @@ class PreferenceCommandProcessor:
                         escape(text),
                         escape(text),
                     ),
+                    clear_clarification=stored_pending is not None,
                 )
                 return
             if proposal.intent in {PreferenceIntent.UNDO, PreferenceIntent.REVERT}:
@@ -655,23 +721,7 @@ class PreferenceCommandProcessor:
                 else:
                     self._revert(update_id=update_id, actor_id=actor_id, original=original)
                 return
-            if proposal.intent == PreferenceIntent.CLARIFY:
-                text = ui.notice(
-                    "I need one detail",
-                    "Preciso de um detalhe",
-                    escape(
-                        proposal.clarification_question
-                        or "Please clarify the preference you want to change."
-                    ),
-                    escape(
-                        proposal.clarification_question
-                        or "Esclareça a preferência que deseja alterar."
-                    ),
-                    next_en="Reply with the missing detail in a normal sentence.",
-                    next_pt="Responda com o detalhe que falta em uma frase comum.",
-                )
-                outcome = "clarify"
-            elif proposal.intent == PreferenceIntent.QUERY:
+            if proposal.intent == PreferenceIntent.QUERY:
                 # Gemini classifies natural-language queries, but application code
                 # renders authoritative state instead of echoing a model summary.
                 text, markup = self._preferences_screen(actor_id)
@@ -693,6 +743,7 @@ class PreferenceCommandProcessor:
                 reply_markup=(
                     markup if proposal.intent == PreferenceIntent.QUERY else None
                 ),
+                clear_clarification=stored_pending is not None,
             )
         except (PreferenceError, StaleRevisionError) as exc:
             if not consumed:
@@ -769,6 +820,29 @@ class PreferenceCommandProcessor:
                 ),
                 callback_query_id=callback_query_id,
                 reply_markup=ui.menu_markup(),
+            )
+            return
+
+        pending_clarification = self.store.pending_clarification(actor_id)
+        if pending_clarification is not None and normalize_text(text) in {
+            "cancel",
+            "cancelar",
+            "deixa pra la",
+            "never mind",
+        }:
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                "clarification_cancelled",
+                ui.notice(
+                    "Request cancelled",
+                    "Solicitação cancelada",
+                    "The pending preference request was discarded. Nothing was changed.",
+                    "A solicitação de preferência pendente foi descartada. Nada foi alterado.",
+                ),
+                callback_query_id=callback_query_id,
+                clear_clarification=True,
             )
             return
 
@@ -1016,6 +1090,7 @@ class PreferenceCommandProcessor:
                 actor_id=actor_id,
                 original=text,
                 preview=True,
+                allow_clarification_context=False,
             )
             return
         if command:

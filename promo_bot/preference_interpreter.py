@@ -10,8 +10,10 @@ import httpx
 
 from .config import env_secret
 from .gemini import GeminiError, GeminiStructuredClient
+from .normalization import normalize_text
 from .preferences import (
     OperationAction,
+    PreferenceClarificationContext,
     PreferenceError,
     PreferenceIntent,
     PreferenceOperation,
@@ -211,6 +213,7 @@ class GeminiPreferenceInterpreter:
         snapshot: PreferenceSnapshot,
         local_timestamp: str,
         language: str = "en",
+        clarification_context: PreferenceClarificationContext | None = None,
     ) -> str:
         state = {
             "revision": snapshot.revision,
@@ -220,6 +223,35 @@ class GeminiPreferenceInterpreter:
         response_language = (
             "Brazilian Portuguese" if str(language).casefold().startswith("pt") else "English"
         )
+        if clarification_context is None:
+            message_context = f"ORIGINAL MESSAGE: {message}"
+        else:
+            turns: list[dict[str, str]] = [
+                {"role": "user", "text": clarification_context.original_message}
+            ]
+            for question, answer in clarification_context.prior_turns:
+                turns.extend(
+                    (
+                        {"role": "model", "text": question},
+                        {"role": "user", "text": answer},
+                    )
+                )
+            turns.extend(
+                (
+                    {"role": "model", "text": clarification_context.question},
+                    {"role": "user", "text": message},
+                )
+            )
+            message_context = (
+                "PENDING CLARIFICATION CONVERSATION:\n"
+                + json.dumps(turns, ensure_ascii=False)
+                + "\n\nThe latest user message answers the pending clarification. "
+                "Interpret the entire conversation as one request and return a complete proposal, "
+                "not a patch. Do not ask a question that the user already answered. Replies in any "
+                "language such as 'just a fridge', 'só uma geladeira', 'any price', "
+                "'qualquer preço', 'no preference', or 'it does not matter' mean the corresponding "
+                "optional constraint should be omitted."
+            )
         return (
             "You interpret private natural-language commands that manage promotion preferences. "
             "Do not authorize, confirm, or persist anything; only convert the message into a proposal. "
@@ -231,12 +263,35 @@ class GeminiPreferenceInterpreter:
             "If there is material ambiguity, use intent clarify and ask one specific question. "
             "Use query for questions about current state, apply for changes, undo for the latest revision, "
             "revert for a prior date/state, and noop when no action was requested. Return at most 25 "
-            f"operations. Write summary and clarification_question in {response_language}.\n\n"
+            "operations. The selected UI language is authoritative for every user-visible model "
+            "field, regardless of the language used in the message or clarification history. "
+            f"Write summary and clarification_question only in {response_language}.\n\n"
+            f"SELECTED RESPONSE LANGUAGE: {response_language}\n"
             f"LOCAL TIMESTAMP: {local_timestamp}\n"
-            f"ORIGINAL MESSAGE: {message}\n\n"
+            f"{message_context}\n\n"
             "COMPLETE ACTIVE STATE:\n"
             + json.dumps(state, ensure_ascii=False, sort_keys=True)
         )
+
+    @staticmethod
+    def _validate_clarification_response(
+        proposal: PreferenceProposal,
+        clarification_context: PreferenceClarificationContext | None,
+    ) -> None:
+        if (
+            clarification_context is None
+            or proposal.intent != PreferenceIntent.CLARIFY
+            or not proposal.clarification_question
+        ):
+            return
+        normalized = normalize_text(proposal.clarification_question)
+        previous = {
+            normalize_text(question)
+            for question, _ in clarification_context.prior_turns
+        }
+        previous.add(normalize_text(clarification_context.question))
+        if normalized in previous:
+            raise PreferenceError("clarification repeated an already answered question")
 
     @staticmethod
     def _repair_prompt(
@@ -253,7 +308,9 @@ class GeminiPreferenceInterpreter:
             "that failed. Preserve every unambiguous change requested in the original message, "
             "including changes that were valid in the previous proposal. Use a separate operation "
             "for each distinct product. If you cannot produce one complete valid proposal, return "
-            "intent clarify with no operations and ask one specific clarification question.\n\n"
+            "intent clarify with no operations and ask one specific clarification question. "
+            "Keep every user-visible field in the SELECTED RESPONSE LANGUAGE stated in the "
+            "original request context.\n\n"
             f"VALIDATION ERROR: {reason}\n\n"
             "PREVIOUS STRUCTURED RESPONSE:\n"
             + json.dumps(previous_payload, ensure_ascii=False, sort_keys=True)
@@ -321,9 +378,16 @@ class GeminiPreferenceInterpreter:
         *,
         local_timestamp: str | None = None,
         language: str = "en",
+        clarification_context: PreferenceClarificationContext | None = None,
     ) -> PreferenceProposal:
         timestamp = local_timestamp or datetime.now().astimezone().isoformat()
-        prompt = self._prompt(message, snapshot, timestamp, language)
+        prompt = self._prompt(
+            message,
+            snapshot,
+            timestamp,
+            language,
+            clarification_context,
+        )
         payload = await self.client.generate_json(
             prompt,
             INTERPRETER_SCHEMA,
@@ -332,7 +396,9 @@ class GeminiPreferenceInterpreter:
             thinking_level="minimal",
         )
         try:
-            return self.parse(payload, snapshot)
+            proposal = self.parse(payload, snapshot)
+            self._validate_clarification_response(proposal, clarification_context)
+            return proposal
         except PreferenceError as validation_error:
             logger.warning(
                 "preference_interpreter_semantic_repair",
@@ -350,7 +416,11 @@ class GeminiPreferenceInterpreter:
                 thinking_level="minimal",
             )
             try:
-                return self.parse(replacement, snapshot)
+                proposal = self.parse(replacement, snapshot)
+                self._validate_clarification_response(
+                    proposal, clarification_context
+                )
+                return proposal
             except PreferenceError as repair_error:
                 raise GeminiError(
                     "Gemini returned an invalid preference proposal after semantic repair"

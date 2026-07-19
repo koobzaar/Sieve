@@ -17,6 +17,7 @@ from .preferences import (
     AtomicPreferenceProvider,
     OperationAction,
     PreferenceEntry,
+    PreferenceClarificationContext,
     PreferenceError,
     PreferenceIntent,
     PreferenceKind,
@@ -76,6 +77,17 @@ CREATE TABLE IF NOT EXISTS preference_confirmations (
 );
 CREATE INDEX IF NOT EXISTS idx_preference_confirmations_expiry
     ON preference_confirmations(expires_at);
+CREATE TABLE IF NOT EXISTS preference_clarifications (
+    actor_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    base_revision INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    preview INTEGER NOT NULL,
+    context_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_preference_clarifications_expiry
+    ON preference_clarifications(expires_at);
 CREATE TABLE IF NOT EXISTS telegram_processed_updates (
     update_id INTEGER PRIMARY KEY,
     processed_at REAL NOT NULL,
@@ -160,6 +172,16 @@ class PendingConfirmation:
     summary: str
 
 
+@dataclass(frozen=True, slots=True)
+class PendingClarification:
+    actor_id: int
+    chat_id: int
+    base_revision: int
+    expires_at: float
+    preview: bool
+    context: PreferenceClarificationContext
+
+
 def _json(value: Any) -> str:
     return json.dumps(thaw(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -190,6 +212,34 @@ def _proposal_from_dict(value: Mapping[str, Any]) -> PreferenceProposal:
     )
 
 
+def _clarification_to_dict(
+    context: PreferenceClarificationContext,
+) -> dict[str, Any]:
+    return {
+        "original_message": context.original_message,
+        "question": context.question,
+        "prior_turns": [list(turn) for turn in context.prior_turns],
+    }
+
+
+def _clarification_from_dict(
+    value: Mapping[str, Any],
+) -> PreferenceClarificationContext:
+    raw_turns = value.get("prior_turns", [])
+    if not isinstance(raw_turns, list):
+        raise PreferenceError("stored clarification turns must be a list")
+    turns: list[tuple[str, str]] = []
+    for item in raw_turns:
+        if not isinstance(item, list | tuple) or len(item) != 2:
+            raise PreferenceError("stored clarification turn is invalid")
+        turns.append((str(item[0]), str(item[1])))
+    return PreferenceClarificationContext(
+        original_message=str(value.get("original_message", "")),
+        question=str(value.get("question", "")),
+        prior_turns=tuple(turns),
+    )
+
+
 class SQLitePreferenceStore:
     """Revisioned preference state stored beside the service's other SQLite tables."""
 
@@ -203,6 +253,8 @@ class SQLitePreferenceStore:
         max_operations: int = 25,
         max_state_bytes: int = 128 * 1024,
         confirmation_ttl_seconds: int = 600,
+        clarification_ttl_seconds: int = 900,
+        max_clarification_rounds: int = 3,
         outbox_capacity: int = 20,
         command_log_cap: int = 2_000,
         on_snapshot: Callable[[PreferenceSnapshot, PreferenceSnapshot | None], None]
@@ -213,6 +265,8 @@ class SQLitePreferenceStore:
         self.max_operations = max_operations
         self.max_state_bytes = max_state_bytes
         self.confirmation_ttl_seconds = confirmation_ttl_seconds
+        self.clarification_ttl_seconds = max(1, clarification_ttl_seconds)
+        self.max_clarification_rounds = max(1, max_clarification_rounds)
         self.outbox_capacity = outbox_capacity
         self.command_log_cap = command_log_cap
         self.provider = provider
@@ -333,6 +387,138 @@ class SQLitePreferenceStore:
             if revision is None:
                 raise PreferenceStoreError("preference store has not been initialized")
             return build_snapshot(revision, self._entries_locked().values())
+
+    def _validated_clarification_context(
+        self, context: PreferenceClarificationContext
+    ) -> PreferenceClarificationContext:
+        def bounded(value: str, label: str, maximum: int) -> str:
+            text = str(value).strip()
+            if not text:
+                raise PreferenceError(f"{label} must be nonempty")
+            if len(text.encode("utf-8")) > maximum:
+                raise PreferenceError(f"{label} is too long")
+            return text
+
+        if context.round_count > self.max_clarification_rounds:
+            raise PreferenceError(
+                f"clarification round cap exceeded ({self.max_clarification_rounds})"
+            )
+        return PreferenceClarificationContext(
+            original_message=bounded(
+                context.original_message, "clarification original message", 16_384
+            ),
+            question=bounded(context.question, "clarification question", 4_096),
+            prior_turns=tuple(
+                (
+                    bounded(question, "prior clarification question", 4_096),
+                    bounded(answer, "prior clarification answer", 16_384),
+                )
+                for question, answer in context.prior_turns
+            ),
+        )
+
+    def pending_clarification(self, actor_id: int) -> PendingClarification | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM preference_clarifications WHERE actor_id=?",
+                (actor_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            current_revision = self._revision_locked()
+            if (
+                float(row["expires_at"]) <= self.clock()
+                or int(row["base_revision"]) != current_revision
+            ):
+                self._connection.execute(
+                    "DELETE FROM preference_clarifications WHERE actor_id=?",
+                    (actor_id,),
+                )
+                return None
+        context_value = json.loads(str(row["context_json"]))
+        if not isinstance(context_value, Mapping):
+            raise PreferenceError("stored clarification context must be an object")
+        return PendingClarification(
+            actor_id=int(row["actor_id"]),
+            chat_id=int(row["chat_id"]),
+            base_revision=int(row["base_revision"]),
+            expires_at=float(row["expires_at"]),
+            preview=bool(row["preview"]),
+            context=_clarification_from_dict(context_value),
+        )
+
+    def save_clarification(
+        self,
+        context: PreferenceClarificationContext,
+        *,
+        actor_id: int,
+        chat_id: int,
+        base_revision: int,
+        preview: bool,
+        update_id: int | None,
+        original_message: str,
+        reply: OutboxReply,
+    ) -> PendingClarification:
+        normalized = self._validated_clarification_context(context)
+        now = self.clock()
+        pending = PendingClarification(
+            actor_id=actor_id,
+            chat_id=chat_id,
+            base_revision=base_revision,
+            expires_at=now + self.clarification_ttl_seconds,
+            preview=preview,
+            context=normalized,
+        )
+        with self._lock:
+            connection = self._begin()
+            try:
+                current_revision = self._revision_locked()
+                if current_revision != base_revision:
+                    raise StaleRevisionError(
+                        f"base revision {base_revision} is stale; "
+                        f"current revision is {current_revision}"
+                    )
+                self._enqueue_reply_locked(reply)
+                connection.execute(
+                    "INSERT INTO preference_clarifications("
+                    "actor_id,chat_id,base_revision,created_at,expires_at,preview,context_json"
+                    ") VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(actor_id) DO UPDATE SET "
+                    "chat_id=excluded.chat_id,base_revision=excluded.base_revision,"
+                    "created_at=excluded.created_at,expires_at=excluded.expires_at,"
+                    "preview=excluded.preview,context_json=excluded.context_json",
+                    (
+                        actor_id,
+                        chat_id,
+                        base_revision,
+                        now,
+                        pending.expires_at,
+                        int(preview),
+                        _json(_clarification_to_dict(normalized)),
+                    ),
+                )
+                self._mark_update_locked(update_id, "clarify")
+                self._log_locked(
+                    update_id=update_id,
+                    actor_id=actor_id,
+                    command=original_message,
+                    outcome="clarify",
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return pending
+
+    def clear_clarification(self, actor_id: int) -> bool:
+        with self._lock:
+            return self._delete_clarification_locked(actor_id)
+
+    def _delete_clarification_locked(self, actor_id: int) -> bool:
+        cursor = self._connection.execute(
+            "DELETE FROM preference_clarifications WHERE actor_id=?", (actor_id,)
+        )
+        return cursor.rowcount == 1
 
     def _validate_snapshot(self, snapshot: PreferenceSnapshot) -> None:
         if len(snapshot.entries) > self.max_entries:
@@ -539,6 +725,8 @@ class SQLitePreferenceStore:
                 rollback_target,
             ),
         )
+        if actor_id is not None:
+            self._delete_clarification_locked(actor_id)
         self._mark_update_locked(update_id, outcome)
         self._log_locked(
             update_id=update_id,
@@ -754,6 +942,7 @@ class SQLitePreferenceStore:
                         summary[:1_000],
                     ),
                 )
+                self._delete_clarification_locked(actor_id)
                 self._mark_update_locked(update_id, "confirmation_pending")
                 self._log_locked(
                     update_id=update_id,
@@ -879,11 +1068,14 @@ class SQLitePreferenceStore:
         actor_id: int | None = None,
         command: str = "",
         reply: OutboxReply | None = None,
+        clear_clarification: bool = False,
     ) -> None:
         with self._lock:
             connection = self._begin()
             try:
                 self._enqueue_reply_locked(reply)
+                if clear_clarification and actor_id is not None:
+                    self._delete_clarification_locked(actor_id)
                 self._mark_update_locked(update_id, outcome)
                 self._log_locked(
                     update_id=update_id,
