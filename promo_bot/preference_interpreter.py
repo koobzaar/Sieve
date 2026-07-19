@@ -27,6 +27,13 @@ from .preferences import (
 logger = logging.getLogger(__name__)
 
 
+MAX_OPERATION_DATA_JSON_BYTES = 32 * 1_024
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 INTERPRETER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -57,15 +64,15 @@ INTERPRETER_SCHEMA: dict[str, Any] = {
                         "nullable": True,
                         "description": "Existing entry ID for update/remove; null for add.",
                     },
-                    "data": {
-                        "type": "object",
+                    "data_json": {
+                        "type": "string",
                         "description": (
-                            "Canonical data object for add/update; use an empty object for remove. "
-                            "The application validates its fields."
+                            "JSON-encoded canonical data object for add/update; use exactly '{}' "
+                            "for remove. The application decodes and validates its fields."
                         ),
                     },
                 },
-                "required": ["op", "kind", "id", "data"],
+                "required": ["op", "kind", "id", "data_json"],
                 "description": (
                     "Use one operation per distinct product. Conditional operation rules are "
                     "validated by the application after generation."
@@ -158,20 +165,33 @@ class GeminiPreferenceInterpreter:
         return (
             "You interpret private natural-language commands that manage promotion preferences. "
             "Do not authorize, confirm, or persist anything; only convert the message into a proposal. "
-            "Use only existing IDs for update/remove. For add, do not invent an ID; provide kind and data. "
-            "Every operation must contain op, kind, id, and data. Use null kind when it is not needed, "
-            "null id for add, and an empty data object for remove. Use only these canonical data shapes: "
-            "baseline_note/context use {text}; interest uses {name, importance, search_terms, "
-            "constraints: {min_price, max_price, attributes, excluded_attributes}, category}; "
-            "exclusion uses {terms}; alias uses {canonical, synonyms}; hard_rule uses "
-            "{rule_id, priority, action, any, all}. Every interest add must include a "
-            "trimmed, nonempty data.name. Represent each distinct product or category with a separate "
-            "operation, and attach constraints such as min_price or max_price only to the interest they "
-            "describe. Preserve every unambiguous requested change. "
+            "Use only existing IDs for update/remove. For add, do not invent an ID; provide kind and "
+            "data_json. Every operation must contain op, kind, id, and data_json. Never emit a data "
+            "field. data_json must be a JSON string whose decoded value is one canonical object; for "
+            "example, encode an SSD payload as "
+            "'{\"name\":\"SSD\",\"constraints\":{\"max_price\":500}}'. "
+            "Use null kind only when it is not needed, null id for add, and exactly '{}' as data_json "
+            "for remove. Use only these decoded JSON object shapes: baseline_note is "
+            "{\"text\":\"string\"}; context is {\"text\":\"string\"}; interest is "
+            "{\"name\":\"string\",\"importance\":50,\"search_terms\":[\"string\"],"
+            "\"constraints\":{\"min_price\":0,\"max_price\":500,\"attributes\":{"
+            "\"attribute\":[\"allowed value\"]},\"excluded_attributes\":[\"string\"]},"
+            "\"category\":\"string\"}; exclusion is {\"terms\":[\"string\"]}; alias is "
+            "{\"canonical\":\"string\",\"synonyms\":[\"string\"]}; hard_rule is "
+            "{\"rule_id\":\"stable_id\",\"priority\":100,\"action\":\"allow\","
+            "\"any\":[\"phrase\"],\"all\":[[\"alternative phrase\"],[\"required phrase\"]]}. "
+            "For hard_rule, action must be exactly allow or deny. any is a flat list where one phrase "
+            "must match. all is a nested list where one phrase from every inner list must match. If both "
+            "any and all are nonempty, both conditions must match. Every interest add must include a "
+            "trimmed, nonempty name in its decoded data_json object; other fields may be omitted when "
+            "not requested, and updates may contain only changed fields. Represent each distinct product "
+            "or category with a separate operation, and attach constraints such as min_price or max_price "
+            "only to the interest they describe. Preserve every unambiguous requested mutation. "
             "If there is material ambiguity, use intent clarify and ask one specific question. "
             "Use query for questions about current state, apply for changes, undo for the latest revision, "
-            "revert for a prior date/state, and noop when no action was requested. Return at most 25 "
-            "operations. The selected UI language is authoritative for every user-visible model "
+            "revert for a prior date/state, and noop when no action was requested. operations must be "
+            "empty for query, undo, revert, clarify, and noop. Return at most 25 operations. The selected "
+            "UI language is authoritative for every user-visible model "
             "field, regardless of the language used in the message or clarification history. "
             f"Write summary and clarification_question only in {response_language}.\n\n"
             f"SELECTED RESPONSE LANGUAGE: {response_language}\n"
@@ -247,6 +267,41 @@ class GeminiPreferenceInterpreter:
             merged = merge_entry_data(existing.data, operation.data)
             validate_entry_data(existing.kind, merged)
 
+    @staticmethod
+    def _decode_operation_data(value: Any) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            raise PreferenceError("Gemini operation must be an object")
+        has_data = "data" in value
+        has_data_json = "data_json" in value
+        if has_data and has_data_json:
+            raise PreferenceError("operation cannot contain both data and data_json")
+        if not has_data_json:
+            return value
+
+        raw_data_json = value["data_json"]
+        if not isinstance(raw_data_json, str):
+            raise PreferenceError("operation data_json must be a string")
+        try:
+            encoded_size = len(raw_data_json.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise PreferenceError("operation data_json must contain valid JSON") from exc
+        if encoded_size > MAX_OPERATION_DATA_JSON_BYTES:
+            raise PreferenceError("operation data_json exceeds 32 KiB")
+        try:
+            decoded = json.loads(
+                raw_data_json,
+                parse_constant=_reject_nonstandard_json_constant,
+            )
+        except (ValueError, json.JSONDecodeError, RecursionError) as exc:
+            raise PreferenceError("operation data_json must contain valid JSON") from exc
+        if not isinstance(decoded, Mapping):
+            raise PreferenceError("operation data_json must encode an object")
+
+        normalized = dict(value)
+        normalized.pop("data_json")
+        normalized["data"] = dict(decoded)
+        return normalized
+
     def parse(
         self, payload: Mapping[str, Any], snapshot: PreferenceSnapshot
     ) -> PreferenceProposal:
@@ -259,7 +314,10 @@ class GeminiPreferenceInterpreter:
             raise PreferenceError("Gemini operations must be a list")
         if len(raw_operations) > self.max_operations:
             raise PreferenceError(f"Gemini exceeded the {self.max_operations}-operation cap")
-        operations = tuple(PreferenceOperation.from_dict(item) for item in raw_operations)
+        operations = tuple(
+            PreferenceOperation.from_dict(self._decode_operation_data(item))
+            for item in raw_operations
+        )
         for operation in operations:
             self._validate_operation(operation, snapshot)
         summary = " ".join(str(payload.get("summary", "")).split())[:1_000]

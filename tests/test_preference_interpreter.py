@@ -8,6 +8,7 @@ import pytest
 from promo_bot.gemini import GeminiError
 from promo_bot.preference_interpreter import (
     INTERPRETER_SCHEMA,
+    MAX_OPERATION_DATA_JSON_BYTES,
     GeminiPreferenceInterpreter,
 )
 from promo_bot.preferences import (
@@ -43,6 +44,15 @@ def apply_payload(*operations):
         "operations": list(operations),
         "summary": "Adicionar interesses",
         "clarification_question": None,
+    }
+
+
+def provider_operation(op, kind, data, *, entry_id=None):
+    return {
+        "op": op,
+        "kind": kind,
+        "id": entry_id,
+        "data_json": json.dumps(data, ensure_ascii=False),
     }
 
 
@@ -110,6 +120,89 @@ def test_parses_multiple_apply_operations_and_rejects_invented_ids() -> None:
         )
 
 
+def test_decodes_provider_data_json_into_internal_mapping() -> None:
+    interpreter = GeminiPreferenceInterpreter.__new__(GeminiPreferenceInterpreter)
+    interpreter.max_operations = 25
+
+    result = interpreter.parse(
+        apply_payload(
+            provider_operation(
+                "add",
+                "interest",
+                {"name": "SSD", "constraints": {"max_price": 500}},
+            )
+        ),
+        snapshot(),
+    )
+
+    assert result.operations[0].data["name"] == "SSD"
+    assert result.operations[0].data["constraints"]["max_price"] == 500
+    assert "data_json" not in result.operations[0].to_dict()
+
+
+@pytest.mark.parametrize(
+    ("operation", "error"),
+    [
+        (
+            {"op": "add", "kind": "interest", "id": None, "data_json": "{"},
+            "must contain valid JSON",
+        ),
+        (
+            {"op": "add", "kind": "interest", "id": None, "data_json": "[]"},
+            "must encode an object",
+        ),
+        (
+            {"op": "add", "kind": "interest", "id": None, "data_json": {}},
+            "must be a string",
+        ),
+        (
+            {
+                "op": "add",
+                "kind": "interest",
+                "id": None,
+                "data": {"name": "SSD"},
+                "data_json": '{"name":"SSD"}',
+            },
+            "cannot contain both data and data_json",
+        ),
+    ],
+)
+def test_rejects_invalid_provider_data_json(operation, error) -> None:
+    interpreter = GeminiPreferenceInterpreter.__new__(GeminiPreferenceInterpreter)
+    interpreter.max_operations = 25
+
+    with pytest.raises(PreferenceError, match=error):
+        interpreter.parse(apply_payload(operation), snapshot())
+
+
+def test_rejects_provider_data_json_over_32_kib() -> None:
+    interpreter = GeminiPreferenceInterpreter.__new__(GeminiPreferenceInterpreter)
+    interpreter.max_operations = 25
+    oversized = json.dumps({"text": "x" * MAX_OPERATION_DATA_JSON_BYTES})
+
+    with pytest.raises(PreferenceError, match="exceeds 32 KiB"):
+        interpreter.parse(
+            apply_payload(provider_operation("add", "context", {}, entry_id=None) | {
+                "data_json": oversized
+            }),
+            snapshot(),
+        )
+
+
+def test_legacy_mapping_payload_remains_supported() -> None:
+    interpreter = GeminiPreferenceInterpreter.__new__(GeminiPreferenceInterpreter)
+    interpreter.max_operations = 25
+
+    result = interpreter.parse(
+        apply_payload(
+            {"op": "add", "kind": "interest", "data": {"name": "legacy SSD"}}
+        ),
+        snapshot(),
+    )
+
+    assert result.operations[0].data["name"] == "legacy SSD"
+
+
 def test_direct_parse_remains_strict_for_missing_interest_names() -> None:
     interpreter = GeminiPreferenceInterpreter.__new__(GeminiPreferenceInterpreter)
     interpreter.max_operations = 25
@@ -170,14 +263,14 @@ def test_rejects_ambiguity_malformed_semantics_and_oversized_operations() -> Non
 
 def test_schema_and_prompt_require_canonical_separate_interests() -> None:
     operation_schema = INTERPRETER_SCHEMA["properties"]["operations"]["items"]
-    data_schema = operation_schema["properties"]["data"]
-    assert operation_schema["required"] == ["op", "kind", "id", "data"]
+    data_schema = operation_schema["properties"]["data_json"]
+    assert operation_schema["required"] == ["op", "kind", "id", "data_json"]
     assert "anyOf" not in operation_schema
     assert data_schema == {
-        "type": "object",
+        "type": "string",
         "description": (
-            "Canonical data object for add/update; use an empty object for remove. "
-            "The application validates its fields."
+            "JSON-encoded canonical data object for add/update; use exactly '{}' "
+            "for remove. The application decodes and validates its fields."
         ),
     }
     assert "one operation per distinct product" in operation_schema[
@@ -190,11 +283,16 @@ def test_schema_and_prompt_require_canonical_separate_interests() -> None:
         "2026-07-18T12:00:00-03:00",
         "pt-BR",
     )
-    assert "Every interest add must include a trimmed, nonempty data.name" in prompt
+    assert "Every interest add must include a trimmed, nonempty name" in prompt
     assert "each distinct product or category with a separate operation" in prompt
     assert "SELECTED RESPONSE LANGUAGE: Brazilian Portuguese" in prompt
     assert "selected UI language is authoritative" in prompt
-    assert "interest uses {name, importance, search_terms" in prompt
+    assert "Never emit a data field" in prompt
+    assert "exactly '{}' as data_json for remove" in prompt
+    assert "operations must be empty for query, undo, revert, clarify, and noop" in prompt
+    assert '\"action\":\"allow\"' in prompt
+    assert "action must be exactly allow or deny" in prompt
+    assert '\"all\":[[\"alternative phrase\"]' in prompt
 
 
 def test_every_required_provider_field_is_defined_on_the_same_schema_node() -> None:
@@ -300,6 +398,33 @@ async def test_semantic_repair_returns_a_complete_valid_replacement(caplog) -> N
     assert repair_records[0].attempt == 1
     assert message not in repair_records[0].getMessage()
     assert "sofás" not in repair_records[0].getMessage()
+
+
+async def test_data_json_decoding_failure_gets_one_semantic_repair() -> None:
+    malformed = apply_payload(
+        {
+            "op": "add",
+            "kind": "interest",
+            "id": None,
+            "data_json": '{"name":',
+        }
+    )
+    replacement = apply_payload(
+        provider_operation(
+            "add",
+            "interest",
+            {"name": "SSD", "constraints": {"max_price": 500}},
+        )
+    )
+    client = SequenceStructuredClient(malformed, replacement)
+    interpreter = GeminiPreferenceInterpreter(structured_client=client)
+
+    result = await interpreter.interpret("adicione SSD até 500 reais", snapshot())
+
+    assert result.operations[0].data["name"] == "SSD"
+    assert result.operations[0].data["constraints"]["max_price"] == 500
+    assert len(client.calls) == 2
+    assert "operation data_json must contain valid JSON" in client.calls[1][0]
 
 
 async def test_valid_first_proposal_does_not_make_a_repair_call() -> None:
