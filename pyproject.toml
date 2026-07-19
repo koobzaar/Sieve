@@ -31,5 +31,6 @@ addopts = "-q"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
+  "contract: opt-in live provider contract tests",
   "soak: long-running 100,000-promotion bounded-memory test",
 ]

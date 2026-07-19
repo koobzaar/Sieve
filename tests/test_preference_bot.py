@@ -275,6 +275,7 @@ async def test_malformed_multi_interest_response_is_repaired_and_applied_atomica
 
 async def test_two_invalid_interpretations_use_generic_failure_and_persist_nothing(
     tmp_path,
+    caplog,
 ) -> None:
     invalid = {
         "intent": "apply",
@@ -314,13 +315,14 @@ async def test_two_invalid_interpretations_use_generic_failure_and_persist_nothi
             client=client,
         )
         state, store, processor = setup(tmp_path, interpreter)
-        await processor.process_update(
-            message(
-                1,
-                "Adicione figurinhas da Copa do Mundo e sofás até R$ 3.000.",
-                language_code="pt-BR",
+        with caplog.at_level("ERROR"):
+            await processor.process_update(
+                message(
+                    1,
+                    "Adicione figurinhas da Copa do Mundo e sofás até R$ 3.000.",
+                    language_code="pt-BR",
+                )
             )
-        )
 
     current = store.current_snapshot()
     assert calls == 2
@@ -333,6 +335,15 @@ async def test_two_invalid_interpretations_use_generic_failure_and_persist_nothi
         "SELECT outcome FROM telegram_processed_updates WHERE update_id = 1"
     ).fetchone()[0]
     assert outcome == "parser_failure"
+    failure_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", "") == "preference_interpreter_failure"
+    ]
+    assert len(failure_records) == 1
+    assert failure_records[0].error_type == "GeminiError"
+    assert "figurinhas" not in failure_records[0].getMessage().casefold()
+    assert "sofás" not in failure_records[0].getMessage().casefold()
     state.close()
 
 

@@ -335,11 +335,14 @@ sieve [--config ARQUIVO] replay FIXTURE [--no-fail]
 python -m pip install -e ".[test]"
 python -m pytest
 $env:RUN_SOAK="1"; python -m pytest -m soak
+$env:SIEVE_RUN_GEMINI_CONTRACT="1"; $env:GEMINI_API_KEY="..."; python -m pytest -m contract
 ```
 
-Os testes usam HTTP falso, relógios determinísticos e bancos temporários; não chamam serviços reais.
-Eles cobrem autorização, idiomas, formatação HTML, offsets, outbox, revisões, parsing estruturado,
-restrições, BM25, reconstruções de aliases, integração e carga.
+Por padrão, os testes usam HTTP falso, relógios determinísticos e bancos temporários e não chamam
+serviços reais. O teste `contract` é opcional e valida o schema exato contra Gemini; defina também
+`SIEVE_GEMINI_MODEL` para substituir o modelo padrão `gemini-3.1-flash-lite`. A suíte cobre
+autorização, idiomas, formatação HTML, offsets, outbox, revisões, parsing estruturado, restrições,
+BM25, reconstruções de aliases, integração e carga.
 
 ## Segurança operacional
 

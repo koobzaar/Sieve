@@ -125,7 +125,8 @@ class GeminiEvaluator:
     ) -> Evaluation:
         try:
             payload = await self.structured_client.request_json(
-                self._request(promotion, normalized, preference_context)
+                self._request(promotion, normalized, preference_context),
+                event_name="promotion_evaluation_request",
             )
             return self._parse(payload)
         except RetryableGeminiError as exc:
