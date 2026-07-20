@@ -7,7 +7,7 @@
 
 # Sieve
 
-**Filtro de promoções para Telegram e Pelando com preferências ao vivo, BM25 e inteligência artificial.**
+**Rastreador modular de promoções com preferências em linguagem natural, BM25 e inteligência artificial opcional.**
 
 <p>
   <a href="#como-funciona">Como funciona</a> •
@@ -29,10 +29,10 @@
 
 </div>
 
-O Sieve acompanha grupos do Telegram e a página `/recentes` do Pelando, descarta ruído e envia
-somente as promoções relevantes para uma conversa privada. Ele foi projetado para funcionar
-continuamente em hardware pequeno: processo único, filas limitadas, SQLite em modo WAL e limite de
-memória do contêiner.
+O Sieve acompanha as fontes de promoções habilitadas, descarta o que não corresponde às suas
+preferências ao vivo e envia somente as promoções relevantes para uma conversa privada. Ele foi
+projetado para funcionar continuamente em hardware pequeno: processo único, filas limitadas,
+SQLite em modo WAL e limite de memória do contêiner.
 
 Para acompanhar algo, basta mandar uma mensagem ao bot. Você pode informar o nome do produto, preço
 máximo, modelo ou atributo obrigatório, aliases e categorias que não deseja ver, sem editar a
@@ -342,12 +342,12 @@ ambiente.
 
 ### Fontes de promoções suportadas
 
-As fontes embutidas ficam desativadas na configuração compartilhada para que cada instalação escolha
-explicitamente de onde vêm suas promoções. O exemplo local ativa Telegram e mantém Pelando desligado.
+O Telegram fica ativado na configuração compartilhada; adaptadores de sites são opcionais. O
+exemplo local mantém Telegram ligado e Pelando desligado.
 
 | Fonte | Cobertura | Padrão | Configuração necessária |
 | --- | --- | --- | --- |
-| Grupos/canais do Telegram | Qualquer grupo ou canal acessível à conta de usuário | Desativada | Credenciais do Telethon, sessão persistida e `chat_ids` |
+| Grupos/canais do Telegram | Qualquer grupo ou canal acessível à conta de usuário | Ativada | Credenciais do Telethon, sessão persistida e `chat_ids` |
 | [Pelando `/recentes`](https://www.pelando.com.br/recentes) | Site de promoções voltado ao Brasil | Desativada | Sem conta; intervalo, timeout e user agent são opcionais |
 
 Ative ou desative cada fonte separadamente em `config/config.local.yaml`:
