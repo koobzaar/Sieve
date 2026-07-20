@@ -167,6 +167,7 @@ def test_bm25_routing_defaults_and_validation(tmp_path) -> None:
     path = tmp_path / "config.yaml"
     write_yaml(path, data)
     config = load_config(path)
+    assert config.gemini_evaluation_enabled is True
     assert config.bm25_threshold == 2.0
     assert config.bm25_auto_forward_threshold == 7.0
     assert config.bm25_auto_forward_mode == "shadow"
@@ -184,12 +185,28 @@ def test_bm25_routing_defaults_and_validation(tmp_path) -> None:
         load_config(path)
 
 
+def test_gemini_evaluation_toggle_requires_a_boolean(tmp_path) -> None:
+    data = base_config()
+    data["pipeline"]["gemini_evaluation_enabled"] = False
+    path = tmp_path / "config.yaml"
+    write_yaml(path, data)
+
+    assert load_config(path).gemini_evaluation_enabled is False
+
+    data["pipeline"]["gemini_evaluation_enabled"] = "false"
+    write_yaml(path, data)
+    with pytest.raises(ConfigurationError, match="must be a boolean"):
+        load_config(path)
+
+
 def test_tracked_base_and_local_example_are_safe_and_valid() -> None:
     base = load_config("config/config.yaml")
     example = load_config("config/config.local.example.yaml")
 
     assert not base.sources[0].enabled
+    assert not base.sources[1].enabled
     assert base.sources[0].settings["chat_ids"] == []
     assert "config.local.yaml" in base.profile
     assert example.sources[0].settings["chat_ids"] == [-1001234567890]
+    assert not example.sources[1].enabled
     assert example.profile.startswith("Describe the products")

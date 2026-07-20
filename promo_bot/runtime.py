@@ -97,6 +97,7 @@ class Service:
             profile=config.profile,
             aliases=config.aliases,
             hard_rules=config.hard_rules,
+            gemini_evaluation_enabled=config.gemini_evaluation_enabled,
             threshold=config.bm25_threshold,
             auto_forward_threshold=config.bm25_auto_forward_threshold,
             auto_forward_mode=config.bm25_auto_forward_mode,

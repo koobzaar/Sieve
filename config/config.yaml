@@ -14,6 +14,7 @@ state:
   retry_ttl_seconds: 3600
 
 pipeline:
+  gemini_evaluation_enabled: true
   bm25_threshold: 2.0
   bm25_auto_forward_threshold: 7.0
   bm25_auto_forward_mode: shadow
@@ -82,7 +83,7 @@ sources:
 
   - name: pelando
     factory: promo_bot.sources.pelando:create_pelando_source
-    enabled: true
+    enabled: false
     mode: shadow
     settings:
       url: https://www.pelando.com.br/recentes

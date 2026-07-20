@@ -89,6 +89,7 @@ class PromotionPipeline:
         profile: str,
         aliases: Mapping[str, Sequence[str]],
         hard_rules: tuple[HardFilterRule, ...],
+        gemini_evaluation_enabled: bool = True,
         threshold: float = 2.0,
         auto_forward_threshold: float | None = None,
         auto_forward_mode: str = "shadow",
@@ -104,6 +105,7 @@ class PromotionPipeline:
         self.store = store
         self.evaluator = evaluator
         self.sink = sink
+        self.gemini_evaluation_enabled = gemini_evaluation_enabled
         self.threshold = threshold
         if auto_forward_threshold is None:
             auto_forward_threshold = max(7.0, threshold + 1.0)
@@ -165,6 +167,8 @@ class PromotionPipeline:
         return result
 
     def _audit_selected(self, content_hash: str) -> bool:
+        if not self.gemini_evaluation_enabled:
+            return False
         if self.below_threshold_audit_rate <= 0:
             return False
         if self.below_threshold_audit_rate >= 1:
@@ -283,6 +287,7 @@ class PromotionPipeline:
 
         score: float | None = None
         auto_forward_candidate = False
+        auto_forward_gates_passed = False
         query_terms = list(snapshot.term_weights)
         if (
             bm25_ready
@@ -313,15 +318,17 @@ class PromotionPipeline:
                     PipelineResult(Decision.DISCARD, "bm25", "below_threshold", score=score),
                 )
 
-            auto_forward_candidate = (
-                self.auto_forward_mode != "off"
-                and score >= self.auto_forward_threshold
+            auto_forward_gates_passed = (
+                score >= self.auto_forward_threshold
                 and _passes_auto_forward_gates(
                     promotion,
                     snapshot,
                     raw_tokens,
                     constraints_proven=constraint.all_proven,
                 )
+            )
+            auto_forward_candidate = (
+                self.auto_forward_mode != "off" and auto_forward_gates_passed
             )
             if auto_forward_candidate and self.auto_forward_mode == "live":
                 reason = "above_threshold_with_deterministic_gates"
@@ -336,6 +343,29 @@ class PromotionPipeline:
                         auto_forward_candidate=True,
                     ),
                 )
+        if not self.gemini_evaluation_enabled:
+            if exceptional_uncertain:
+                reason = "gemini_evaluation_disabled:uncertain_exceptional"
+            elif score is None:
+                reason = "gemini_evaluation_disabled:bm25_unavailable"
+            elif score < self.auto_forward_threshold:
+                reason = "gemini_evaluation_disabled:below_auto_forward_threshold"
+            elif not auto_forward_gates_passed:
+                reason = "gemini_evaluation_disabled:deterministic_gates_failed"
+            elif self.auto_forward_mode == "off":
+                reason = "gemini_evaluation_disabled:auto_forward_off"
+            else:
+                reason = "gemini_evaluation_disabled:auto_forward_shadow"
+            return self._record(
+                promotion,
+                PipelineResult(
+                    Decision.DISCARD,
+                    "deterministic",
+                    reason,
+                    score=score,
+                    auto_forward_candidate=auto_forward_candidate,
+                ),
+            )
         try:
             evaluation = await self._evaluate(
                 promotion, normalized, snapshot.rendered_profile
@@ -378,6 +408,17 @@ class PromotionPipeline:
         return self._record(promotion, result)
 
     async def process_retry(self, promotion: Promotion) -> Evaluation:
+        if not self.gemini_evaluation_enabled:
+            evaluation = Evaluation(Decision.DISCARD, "gemini_evaluation_disabled")
+            self._record(
+                promotion,
+                PipelineResult(
+                    evaluation.decision,
+                    "llm_retry",
+                    evaluation.reason,
+                ),
+            )
+            return evaluation
         snapshot = self.preference_provider.get_snapshot()
         normalized = promotion_text(promotion)
         evaluation = await self._evaluate(

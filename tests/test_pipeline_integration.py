@@ -158,6 +158,51 @@ async def test_llm_outage_enters_bounded_persistent_retry_queue(tmp_path) -> Non
     store.close()
 
 
+async def test_disabled_gemini_skips_cold_start_evaluation_and_retry(tmp_path) -> None:
+    evaluator, sink = FakeEvaluator(), FakeSink()
+    pipeline, store = build_pipeline(
+        tmp_path,
+        evaluator,
+        sink,
+        gemini_evaluation_enabled=False,
+        cold_start_documents=500,
+        below_threshold_audit_rate=1,
+    )
+    promotion = Promotion(id="disabled", source="x", title="SSD")
+
+    result = await pipeline.process(promotion)
+    retry = await pipeline.process_retry(promotion)
+
+    assert result.stage == "deterministic"
+    assert result.reason == "gemini_evaluation_disabled:bm25_unavailable"
+    assert retry == Evaluation(Decision.DISCARD, "gemini_evaluation_disabled")
+    assert evaluator.calls == []
+    assert sink.sent == []
+    store.close()
+
+
+async def test_disabled_gemini_also_disables_below_threshold_audits(tmp_path) -> None:
+    evaluator, sink = FakeEvaluator(), FakeSink()
+    pipeline, store = build_pipeline(
+        tmp_path,
+        evaluator,
+        sink,
+        gemini_evaluation_enabled=False,
+        threshold=100,
+        auto_forward_threshold=101,
+        below_threshold_audit_rate=1,
+    )
+
+    result = await pipeline.process(
+        Promotion(id="no-audit", source="telegram", title="Jogo de panelas")
+    )
+
+    assert result.stage == "bm25"
+    assert result.reason == "below_threshold"
+    assert evaluator.calls == []
+    store.close()
+
+
 async def test_delivery_claim_prevents_duplicate_after_retry_or_restart(tmp_path) -> None:
     evaluator = FakeEvaluator(
         [
