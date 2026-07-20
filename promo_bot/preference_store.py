@@ -140,6 +140,30 @@ class ConfirmationExpiredError(ConfirmationError):
     pass
 
 
+_STOCK_BASELINE_PLACEHOLDERS = frozenset(
+    text
+    for sentence in (
+        "Replace this example with your promotion interests in config.local.yaml.",
+        "Describe the products, brands, and deal characteristics you want.",
+    )
+    for text in (sentence, sentence + "\n")
+)
+
+
+def _is_untouched_stock_baseline(entry: PreferenceEntry | None) -> bool:
+    text = entry.data.get("text") if entry is not None else None
+    return bool(
+        entry is not None
+        and entry.id == "baseline-profile"
+        and entry.kind == PreferenceKind.BASELINE_NOTE
+        and entry.created_revision == 0
+        and entry.updated_revision == 0
+        and set(entry.data) == {"text"}
+        and isinstance(text, str)
+        and text in _STOCK_BASELINE_PLACEHOLDERS
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class OutboxReply:
     chat_id: int
@@ -363,14 +387,43 @@ class SQLitePreferenceStore:
                     )
                     created = True
                 else:
-                    snapshot = build_snapshot(revision, self._entries_locked().values())
+                    entries_by_id = self._entries_locked()
+                    snapshot = build_snapshot(revision, entries_by_id.values())
+                    if _is_untouched_stock_baseline(
+                        entries_by_id.get("baseline-profile")
+                    ):
+                        previous = snapshot
+                        del entries_by_id["baseline-profile"]
+                        snapshot = build_snapshot(
+                            revision + 1, entries_by_id.values()
+                        )
+                        self._validate_snapshot(snapshot)
+                        self._commit_snapshot_locked(
+                            snapshot,
+                            parent_revision=revision,
+                            original_message=(
+                                "System migration: remove stock placeholder baseline"
+                            ),
+                            actor_id=None,
+                            update_id=None,
+                            operations=(
+                                {
+                                    "op": "remove_stock_placeholder",
+                                    "entry_id": "baseline-profile",
+                                },
+                            ),
+                            summary="Removed untouched stock placeholder baseline",
+                            rollback_target=None,
+                            reply=None,
+                            outcome="system_migration",
+                        )
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
         if self.provider is not None:
             self.provider.swap(snapshot)
-        if created and self.on_snapshot is not None:
+        if (created or previous is not None) and self.on_snapshot is not None:
             self.on_snapshot(snapshot, previous)
         return snapshot
 

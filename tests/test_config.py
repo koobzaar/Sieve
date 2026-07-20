@@ -44,84 +44,14 @@ def write_yaml(path: Path, data: dict) -> None:
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
-def test_local_config_inherits_and_merges_named_sources_and_rules(tmp_path) -> None:
-    base = tmp_path / "base.yaml"
-    local = tmp_path / "local.yaml"
-    write_yaml(base, base_config())
-    write_yaml(
-        local,
-        {
-            "extends": "base.yaml",
-            "pipeline": {
-                "profile": "notebook",
-                "hard_rules": [
-                    {
-                        "id": "preferred",
-                        "priority": 10,
-                        "action": "allow",
-                        "all": [["notebook"], ["ssd", "nvme"]],
-                    }
-                ],
-            },
-            "sources": [
-                {
-                    "name": "telegram",
-                    "enabled": True,
-                    "settings": {"chat_ids": [-100123]},
-                }
-            ],
-        },
-    )
+def test_extends_is_no_longer_supported(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    data = base_config()
+    data["extends"] = "base.yaml"
+    write_yaml(path, data)
 
-    config = load_config(local)
-
-    assert config.profile == "notebook"
-    assert [rule.id for rule in config.hard_rules] == ["preferred", "base_deny"]
-    assert config.sources[0].factory == "example:source"
-    assert config.sources[0].enabled
-    assert config.sources[0].settings["chat_ids"] == [-100123]
-
-
-def test_named_rules_override_by_id_and_ordinary_lists_replace(tmp_path) -> None:
-    base_data = base_config()
-    base_data["pipeline"]["hard_rules"][0]["any"] = ["lottery", "casino"]
-    base = tmp_path / "base.yaml"
-    local = tmp_path / "local.yaml"
-    write_yaml(base, base_data)
-    write_yaml(
-        local,
-        {
-            "extends": "base.yaml",
-            "pipeline": {
-                "hard_rules": [
-                    {
-                        "id": "base_deny",
-                        "priority": 100,
-                        "action": "deny",
-                        "any": ["bet"],
-                    }
-                ]
-            },
-        },
-    )
-
-    config = load_config(local)
-
-    assert config.hard_rules[0].any_phrases == ("bet",)
-
-
-def test_config_inheritance_reports_missing_parent_and_cycles(tmp_path) -> None:
-    missing = tmp_path / "missing.yaml"
-    write_yaml(missing, {"extends": "absent.yaml"})
-    with pytest.raises(ConfigurationError, match="cannot load"):
-        load_config(missing)
-
-    first = tmp_path / "first.yaml"
-    second = tmp_path / "second.yaml"
-    write_yaml(first, {"extends": "second.yaml"})
-    write_yaml(second, {"extends": "first.yaml"})
-    with pytest.raises(ConfigurationError, match="inheritance cycle"):
-        load_config(first)
+    with pytest.raises(ConfigurationError, match="extends is no longer supported"):
+        load_config(path)
 
 
 @pytest.mark.parametrize(
@@ -199,14 +129,17 @@ def test_gemini_evaluation_toggle_requires_a_boolean(tmp_path) -> None:
         load_config(path)
 
 
-def test_tracked_base_and_local_example_are_safe_and_valid() -> None:
-    base = load_config("config/config.yaml")
-    example = load_config("config/config.local.example.yaml")
+def test_tracked_example_is_complete_safe_and_valid() -> None:
+    path = Path("config/config.example.yaml")
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    example = load_config(path)
 
-    assert base.sources[0].enabled
-    assert not base.sources[1].enabled
-    assert base.sources[0].settings["chat_ids"] == []
-    assert "config.local.yaml" in base.profile
-    assert example.sources[0].settings["chat_ids"] == [-1001234567890]
-    assert not example.sources[1].enabled
-    assert example.profile.startswith("Describe the products")
+    assert "extends" not in raw
+    assert example.profile == ""
+    assert not example.gemini_evaluation_enabled
+    assert not example.preferences.enabled
+    assert all(not source.enabled for source in example.sources)
+    telegram = next(source for source in example.sources if source.name == "telegram-principal")
+    assert telegram.settings["chat_ids"] == []
+    assert "owner_id" not in raw["preferences"]
+    assert "chat_id" not in raw["preferences"]

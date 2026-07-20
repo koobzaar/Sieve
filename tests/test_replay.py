@@ -19,7 +19,7 @@ def test_labeled_replay_reports_acceptance_metrics(tmp_path) -> None:
         encoding="utf-8",
     )
     config = replace(
-        load_config("config/config.yaml"),
+        load_config("config/config.example.yaml"),
         profile="ssd nvme",
         hard_rules=(),
         bm25_threshold=0.1,

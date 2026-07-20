@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -100,6 +101,144 @@ def test_ui_language_and_html_outbox_are_durable(tmp_path) -> None:
     assert message.parse_mode == "HTML"
     assert message.reply_markup == {"inline_keyboard": []}
     state.close()
+
+
+def test_blank_profile_does_not_create_a_baseline_entry(tmp_path) -> None:
+    state = SQLiteStateStore(tmp_path / "blank.db")
+    store = SQLitePreferenceStore(state)
+
+    snapshot = store.initialize(profile=" \n\t", aliases={}, hard_rules=())
+
+    assert snapshot.revision == 0
+    assert snapshot.entries == ()
+    assert snapshot.rendered_profile == ""
+    state.close()
+
+
+def test_stale_stock_baseline_is_removed_once_without_touching_structured_state(
+    tmp_path,
+) -> None:
+    state = SQLiteStateStore(tmp_path / "stale.db")
+    store = SQLitePreferenceStore(state)
+    initial = store.initialize(
+        profile="Describe the products, brands, and deal characteristics you want.\n",
+        aliases={"storage": ["ssd"]},
+        hard_rules=(
+            HardFilterRule(
+                id="deny_bet",
+                priority=100,
+                action="deny",
+                any_phrases=("bet",),
+            ),
+        ),
+    )
+    changed = store.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={"name": "notebook"},
+            ),
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.EXCLUSION,
+                data={"terms": ["refurbished"]},
+            ),
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.CONTEXT,
+                data={"text": "already owns a monitor"},
+            ),
+        ],
+        base_revision=initial.revision,
+        original_message="structured preferences",
+        actor_id=7,
+        update_id=1,
+        summary="structured preferences",
+    )
+    expected = {
+        entry.id: entry.to_dict()
+        for entry in changed.entries
+        if entry.id != "baseline-profile"
+    }
+
+    reopened = SQLitePreferenceStore(state)
+    migrated = reopened.initialize(profile="", aliases={}, hard_rules=())
+
+    assert migrated.revision == 2
+    assert "baseline-profile" not in {entry.id for entry in migrated.entries}
+    assert {entry.id: entry.to_dict() for entry in migrated.entries} == expected
+    assert reopened.initialize(profile="", aliases={}, hard_rules=()).revision == 2
+    audit = reopened._connection.execute(
+        "SELECT parent_revision,original_message,actor_id,operations_json,summary "
+        "FROM preference_revisions WHERE revision=2"
+    ).fetchone()
+    assert tuple(audit[:3]) == (
+        1,
+        "System migration: remove stock placeholder baseline",
+        None,
+    )
+    assert json.loads(audit["operations_json"]) == [
+        {
+            "entry_id": "baseline-profile",
+            "op": "remove_stock_placeholder",
+        }
+    ]
+    assert audit["summary"] == "Removed untouched stock placeholder baseline"
+    state.close()
+
+
+def test_user_authored_and_revision_touched_baselines_are_preserved(tmp_path) -> None:
+    custom_state = SQLiteStateStore(tmp_path / "custom.db")
+    custom_store = SQLitePreferenceStore(custom_state)
+    custom_store.initialize(
+        profile="My actual promotion interests.",
+        aliases={},
+        hard_rules=(),
+    )
+    custom = SQLitePreferenceStore(custom_state).initialize(
+        profile="", aliases={}, hard_rules=()
+    )
+    assert custom.revision == 0
+    assert custom.entries[0].data["text"] == "My actual promotion interests."
+    custom_state.close()
+
+    touched_state = SQLiteStateStore(tmp_path / "touched.db")
+    touched_store = SQLitePreferenceStore(touched_state)
+    touched_store.initialize(
+        profile="Replace this example with your promotion interests in config.local.yaml.",
+        aliases={},
+        hard_rules=(),
+    )
+    touched_store.apply(
+        [
+            PreferenceOperation(
+                OperationAction.UPDATE,
+                entry_id="baseline-profile",
+                data={
+                    "text": (
+                        "Replace this example with your promotion interests "
+                        "in config.local.yaml."
+                    )
+                },
+            )
+        ],
+        base_revision=0,
+        original_message="keep this baseline",
+        actor_id=7,
+        update_id=1,
+        summary="keep this baseline",
+    )
+
+    touched = SQLitePreferenceStore(touched_state).initialize(
+        profile="", aliases={}, hard_rules=()
+    )
+    baseline = next(
+        entry for entry in touched.entries if entry.id == "baseline-profile"
+    )
+    assert touched.revision == 1
+    assert baseline.updated_revision == 1
+    touched_state.close()
 
 
 def test_pending_clarification_is_durable_bounded_and_revision_safe(tmp_path) -> None:

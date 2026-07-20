@@ -582,13 +582,15 @@ def seed_entries(
     aliases: Mapping[str, Sequence[str]],
     hard_rules: Sequence[HardFilterRule],
 ) -> tuple[PreferenceEntry, ...]:
-    entries: list[PreferenceEntry] = [
-        PreferenceEntry(
-            id="baseline-profile",
-            kind=PreferenceKind.BASELINE_NOTE,
-            data={"text": profile},
+    entries: list[PreferenceEntry] = []
+    if profile.strip():
+        entries.append(
+            PreferenceEntry(
+                id="baseline-profile",
+                kind=PreferenceKind.BASELINE_NOTE,
+                data={"text": profile},
+            )
         )
-    ]
     for canonical, synonyms in sorted(aliases.items()):
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
         entries.append(

@@ -25,7 +25,7 @@
   <img src="https://img.shields.io/github/stars/koobzaar/Sieve?style=flat" alt="Stars" />
 </p>
 
-<img src="assets/sieve_telegram.gif" alt="Demonstração do bot Sieve no Telegram" width="100%" />
+<img src="assets/sieve_telegram_br.gif" alt="Demonstração do bot Sieve no Telegram" width="100%" />
 
 </div>
 
@@ -270,7 +270,7 @@ não autorizadas não consomem. O estado persiste após reinicializações.
 - Docker com Docker Compose, ou Python 3.12+;
 - credenciais de aplicativo do Telegram em [my.telegram.org](https://my.telegram.org);
 - um bot criado pelo BotFather e uma conversa privada já aberta com ele;
-- uma chave da API Gemini para mensagens de preferência em linguagem natural e, por padrão,
+- uma chave da API Gemini se você ativar mensagens de preferência em linguagem natural ou
   avaliação de promoções.
 
 O Sieve usa duas identidades diferentes:
@@ -281,19 +281,22 @@ O Sieve usa duas identidades diferentes:
 ### 1. Configuração
 
 ```powershell
-Copy-Item config/config.local.example.yaml config/config.local.yaml
+Copy-Item config/config.example.yaml config/config.yaml
 Copy-Item .env.example .env
 ```
 
-Preencha `.env` e `config/config.local.yaml`. Nunca faça commit de tokens, chaves ou do arquivo de
-sessão do Telegram.
+Preencha `.env` apenas com as credenciais das integrações que pretende ativar. Depois edite
+`config/config.yaml`: configure perfil, aliases, regras, `chat_ids` e preferências; ative
+explicitamente somente as fontes, a avaliação Gemini e o bot de preferências que pretende usar.
+O exemplo começa com todas as integrações externas desativadas. Nunca faça commit de tokens,
+chaves, `config/config.yaml` ou do arquivo de sessão do Telegram.
 
 ### 2. Login único da conta que lê grupos
 
 No PowerShell, informe o telefone explicitamente ou configure a variável esperada:
 
 ```powershell
-docker compose run --rm -it sieve --config /app/config/config.local.yaml `
+docker compose run --rm -it sieve --config /app/config/config.yaml `
   auth-telegram --source telegram-principal --phone +55SEUNUMERO
 ```
 
@@ -303,17 +306,21 @@ Esse comando é somente para a sessão Telethon. O bot de entrega usa `TELEGRAM_
 
 ```powershell
 docker compose config
+docker compose run --rm sieve --config /app/config/config.yaml validate-config
 docker compose up -d --build
 docker compose logs -f sieve
 ```
 
-Depois, abra a conversa privada com o bot e envie `/start`.
+Se ativou o bot de preferências, abra a conversa privada com ele e envie `/start`.
 
 ## Preferências e persistência
 
-No primeiro início de um banco novo, o perfil YAML vira uma nota-base sem perda, e aliases e regras
-viram entradas individuais na revisão zero. A partir daí, SQLite é autoritativo; o YAML não é
-reimportado automaticamente. Excluir o banco de preferências é o único caminho de reseed automático.
+No primeiro início de um banco novo, um perfil YAML não vazio vira uma nota-base sem perda, e
+aliases e regras viram entradas individuais na revisão zero. A partir daí, SQLite é autoritativo;
+o YAML não é reimportado automaticamente. Excluir o banco de preferências é o único caminho de
+reseed automático. Em uma atualização, um placeholder antigo intacto é removido em uma única
+revisão auditada do sistema; notas criadas pelo usuário e todas as preferências estruturadas são
+preservadas.
 
 Cada alteração cria uma revisão com mensagem original, ator, operações, resumo e snapshot completo.
 Restaurações também criam novas revisões—o histórico aplicado nunca é apagado. No commit de uma
@@ -326,9 +333,24 @@ atomicamente e o anterior é removido depois.
 
 ## Configuração principal
 
-Os padrões compartilhados ficam em [`config/config.yaml`](config/config.yaml). Dados pessoais ficam
-em `config/config.local.yaml`, que estende o arquivo principal. Segredos são lidos de variáveis de
-ambiente.
+Copie o modelo completo [`config/config.example.yaml`](config/config.example.yaml) para o arquivo
+ignorado `config/config.yaml` e edite esse único arquivo ativo. Todos os comandos do Sieve usam
+`config/config.yaml` por padrão. Herança de configuração não é suportada. Segredos são lidos de
+variáveis de ambiente.
+
+### Atualização da configuração em camadas
+
+Preserve a configuração existente antes de usar o novo exemplo:
+
+```powershell
+Move-Item config/config.local.yaml config/config.yaml
+# Ou copie para manter o arquivo antigo:
+# Copy-Item config/config.local.yaml config/config.yaml
+```
+
+Não copie o exemplo por cima do arquivo migrado. Overrides antigos podem conter `extends` e omitir
+valores que vinham do arquivo-base; remova `extends` e compare o arquivo migrado com
+`config/config.example.yaml` para incluir todas as configurações exigidas nesta versão.
 
 | Bloco | Responsabilidade |
 | --- | --- |
@@ -342,15 +364,14 @@ ambiente.
 
 ### Fontes de promoções suportadas
 
-O Telegram fica ativado na configuração compartilhada; adaptadores de sites são opcionais. O
-exemplo local mantém Telegram ligado e Pelando desligado.
+Todas as fontes começam desativadas no modelo copiado. Ative apenas os adaptadores configurados.
 
 | Fonte | Cobertura | Padrão | Configuração necessária |
 | --- | --- | --- | --- |
-| Grupos/canais do Telegram | Qualquer grupo ou canal acessível à conta de usuário | Ativada | Credenciais do Telethon, sessão persistida e `chat_ids` |
+| Grupos/canais do Telegram | Qualquer grupo ou canal acessível à conta de usuário | Desativada | Credenciais do Telethon, sessão persistida e `chat_ids` |
 | [Pelando `/recentes`](https://www.pelando.com.br/recentes) | Site de promoções voltado ao Brasil | Desativada | Sem conta; intervalo, timeout e user agent são opcionais |
 
-Ative ou desative cada fonte separadamente em `config/config.local.yaml`:
+Ative ou desative cada fonte separadamente em `config/config.yaml`:
 
 ```yaml
 sources:
@@ -367,10 +388,6 @@ Pelo menos uma fonte precisa estar ativa antes de executar `run`. Para adicionar
 implemente o protocolo `PromotionSource` e uma factory que receba as configurações, o `name`, o
 cliente HTTP compartilhado e o health reporter; depois use o caminho `module:factory` em `sources`.
 Não é necessário alterar o pipeline.
-
-> [!WARNING]
-> Antes desta mudança, o Pelando era ativado pela configuração compartilhada. Depois de atualizar,
-> declare a fonte `pelando` com `enabled: true` para continuar recebendo promoções dela.
 
 ### Filtragem determinística de promoções
 

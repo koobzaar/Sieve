@@ -18,4 +18,4 @@ USER sieve
 
 VOLUME ["/state"]
 ENTRYPOINT ["sieve"]
-CMD ["--config", "/app/config/config.local.yaml", "run"]
+CMD ["--config", "/app/config/config.yaml", "run"]
