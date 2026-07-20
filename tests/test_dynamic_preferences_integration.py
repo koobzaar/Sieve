@@ -222,6 +222,70 @@ async def test_live_high_score_requires_exact_interest_and_accessory_guard(tmp_p
     state.close()
 
 
+async def test_live_matching_handles_reordering_aliases_and_model_boundaries(
+    tmp_path,
+) -> None:
+    state, preferences, evaluator, sink, pipeline = setup(
+        tmp_path,
+        profile="gpu rx9070xt furadeira bosch",
+        threshold=0,
+        auto_forward_threshold=0.01,
+        auto_forward_mode="live",
+    )
+    preferences.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.ALIAS,
+                data={
+                    "canonical": "placa de vídeo",
+                    "synonyms": ["gpu", "radeon"],
+                },
+            ),
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={
+                    "name": "Produtos específicos",
+                    "search_terms": [
+                        "GPU RX9070XT",
+                        "furadeira de impacto Bosch",
+                    ],
+                },
+            ),
+        ],
+        base_revision=0,
+        original_message="produtos específicos",
+        actor_id=42,
+        update_id=1,
+        summary="produtos específicos",
+    )
+    while not state.rebuild_alias_batch(250)["complete"]:
+        pass
+
+    gpu = await pipeline.process(
+        Promotion(id="gpu-full", source="telegram", title="Radeon XT 9070 RX")
+    )
+    drill = await pipeline.process(
+        Promotion(
+            id="drill-reordered",
+            source="telegram",
+            title="Bosch Professional furadeira impacto",
+        )
+    )
+    partial = await pipeline.process(
+        Promotion(id="gpu-partial", source="telegram", title="Radeon RX 9070")
+    )
+
+    assert gpu.stage == drill.stage == "bm25_auto_forward"
+    assert gpu.auto_forward_candidate and drill.auto_forward_candidate
+    assert partial.stage == "llm"
+    assert not partial.auto_forward_candidate
+    assert len(evaluator.calls) == 1
+    assert [item[0].id for item in sink.sent] == ["gpu-full", "drill-reordered"]
+    state.close()
+
+
 async def test_live_high_score_requires_proven_attributes(tmp_path) -> None:
     state, preferences, evaluator, sink, pipeline = setup(
         tmp_path,

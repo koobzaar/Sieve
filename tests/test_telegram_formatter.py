@@ -63,3 +63,30 @@ def test_confirmation_never_relies_on_a_generic_yes() -> None:
     assert "Confirm change" in labels
     assert "Cancel" in labels
     assert all("yes" not in label.casefold() for label in labels)
+
+
+def test_interest_screen_explains_alternative_match_terms() -> None:
+    snapshot = build_snapshot(
+        1,
+        [
+            PreferenceEntry(
+                "interest-gpu",
+                PreferenceKind.INTEREST,
+                {
+                    "name": "GPU",
+                    "importance": 50,
+                    "search_terms": ["GPU RX9070XT", "Radeon RX 9070 XT"],
+                    "constraints": {},
+                },
+                1,
+                1,
+            )
+        ],
+    )
+
+    english, _, _ = TelegramFormatter("en").preferences(snapshot, 1)
+    portuguese, _, _ = TelegramFormatter("pt-BR").preferences(snapshot, 1)
+
+    assert "Alternative match terms (each matches independently)" in english
+    assert "Termos alternativos (cada um corresponde separadamente)" in portuguese
+    assert "GPU RX9070XT, Radeon RX 9070 XT" in english

@@ -411,6 +411,7 @@ estiverem ativadas.
 ```text
 sieve [--config ARQUIVO] [--log-level NÍVEL] run
 sieve [--config ARQUIVO] auth-telegram [--source NOME] [--phone NÚMERO]
+sieve [--config ARQUIVO] smoke-telegram-preferences [--source NOME] [--session-path CAMINHO] [--phone NÚMERO] [--timeout SEGUNDOS]
 sieve [--config ARQUIVO] replay FIXTURE [--no-fail]
 ```
 
@@ -421,13 +422,35 @@ python -m pip install -e ".[test]"
 python -m pytest
 $env:RUN_SOAK="1"; python -m pytest -m soak
 $env:SIEVE_RUN_GEMINI_CONTRACT="1"; $env:GEMINI_API_KEY="..."; python -m pytest -m contract
+$env:SIEVE_RUN_SYSTEM="1"; python -m pytest -m system
 ```
 
 Por padrão, os testes usam HTTP falso, relógios determinísticos e bancos temporários e não chamam
-serviços reais. O teste `contract` é opcional e valida o schema exato contra Gemini; defina também
-`SIEVE_GEMINI_MODEL` para substituir o modelo padrão `gemini-3.1-flash-lite`. A suíte cobre
-autorização, idiomas, formatação HTML, offsets, outbox, revisões, parsing estruturado, restrições,
+serviços reais. Os gates `contract` e `system` são opcionais. O primeiro valida o schema exato
+contra Gemini; defina também `SIEVE_GEMINI_MODEL` para substituir o modelo padrão
+`gemini-3.1-flash-lite`. O segundo exige o daemon do Docker, constrói a imagem de produção e usa
+somente a pilha sintética `compose.system.yaml`, credenciais fictícias e um volume SQLite isolado.
+A suíte cobre autorização, idiomas, formatação HTML, offsets, outbox, revisões, parsing estruturado, restrições,
 BM25, reconstruções de aliases, integração e carga.
+
+## Checklist pré-live
+
+- [ ] Execute a suíte completa, incluindo contrato, recuperação e carga.
+- [ ] Execute o gate Docker determinístico:
+      `$env:SIEVE_RUN_SYSTEM="1"; python -m pytest -m system`.
+- [ ] Mantenha todas as fontes em `shadow` por sete dias e revise as métricas de replay.
+- [ ] Com o bot implantado em execução, execute o gate Telegram sem mutação:
+      `docker compose run --rm sieve --config /app/config/config.yaml smoke-telegram-preferences --source telegram-principal`.
+- [ ] Promova uma fonte por vez para `live` e confirme ausência de duplicatas e recuperação limpa
+      após reinícios.
+
+O gate ao vivo descobre o usuário do bot pelo token configurado, confirma que a conta Telethon é a
+proprietária das preferências, envia `/preferences`, usa uma solicitação `/preview` com nonce e
+confirma que o estado autoritativo não mudou. Ele usa por padrão a sessão dedicada
+`/state/telegram-smoke-user`; nunca reutilize o caminho da sessão de uma fonte. No primeiro uso,
+`--phone`, código de login e 2FA podem ser necessários. A saída contém somente um relatório JSON
+conciso e qualquer timeout, webhook, identidade divergente, prévia ambígua ou mudança de estado
+encerra o comando com falha. `--timeout` usa 90 segundos por padrão e aceita de 10 a 300 segundos.
 
 ## Segurança operacional
 

@@ -13,6 +13,21 @@ from .config import ConfigurationError, env_secret, load_config
 from .logging import configure_logging
 from .replay import calibrate, load_labeled_jsonl
 from .runtime import run_service
+from .telegram_smoke import (
+    TelegramSmokeError,
+    run_telegram_preferences_smoke,
+    select_telegram_source,
+)
+
+
+def _smoke_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("timeout must be a number") from exc
+    if not 10 <= timeout <= 300:
+        raise argparse.ArgumentTypeError("timeout must be between 10 and 300 seconds")
+    return timeout
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -24,6 +39,23 @@ def _parser() -> argparse.ArgumentParser:
     auth = commands.add_parser("auth-telegram", help="create/update the persisted user session")
     auth.add_argument("--source", help="configured Telegram source name")
     auth.add_argument("--phone", help="phone number including country code")
+    smoke = commands.add_parser(
+        "smoke-telegram-preferences",
+        help="run a non-mutating live preference-bot smoke test",
+    )
+    smoke.add_argument("--source", help="configured Telegram source name")
+    smoke.add_argument(
+        "--session-path",
+        default="/state/telegram-smoke-user",
+        help="dedicated Telethon user-session path",
+    )
+    smoke.add_argument("--phone", help="phone number for first-time authorization")
+    smoke.add_argument(
+        "--timeout",
+        type=_smoke_timeout,
+        default=90.0,
+        help="whole smoke-test timeout in seconds (10-300; default: 90)",
+    )
     replay = commands.add_parser("replay", help="calibrate pre-LLM filtering against JSONL")
     replay.add_argument("fixture")
     replay.add_argument("--no-fail", action="store_true", help="report metrics without acceptance exit")
@@ -36,18 +68,7 @@ async def _auth_telegram(config_path: str, source_name: str | None, phone: str |
     from telethon import TelegramClient
 
     config = load_config(config_path)
-    candidates = [
-        source
-        for source in config.sources
-        if "telegram" in source.factory.casefold()
-        and (source_name is None or source.name == source_name)
-    ]
-    if len(candidates) != 1:
-        names = ", ".join(item.name for item in candidates) or "none"
-        raise ConfigurationError(
-            f"select exactly one Telegram source with --source (matches: {names})"
-        )
-    source = candidates[0]
+    source = select_telegram_source(config, source_name)
     settings = source.settings
     api_id = int(env_secret(str(settings.get("api_id_env", "TELEGRAM_API_ID"))))
     api_hash = env_secret(str(settings.get("api_hash_env", "TELEGRAM_API_HASH")))
@@ -101,6 +122,21 @@ def main(argv: list[str] | None = None) -> None:
             asyncio.run(run_service(load_config(args.config)))
         elif args.command == "auth-telegram":
             asyncio.run(_auth_telegram(args.config, args.source, args.phone))
+        elif args.command == "smoke-telegram-preferences":
+            try:
+                report = asyncio.run(
+                    run_telegram_preferences_smoke(
+                        load_config(args.config),
+                        source_name=args.source,
+                        session_path=args.session_path,
+                        phone=args.phone,
+                        timeout_seconds=args.timeout,
+                    )
+                )
+            except (ConfigurationError, TelegramSmokeError) as exc:
+                print(json.dumps({"success": False, "error": str(exc)}))
+                raise SystemExit(1) from exc
+            print(json.dumps(report))
         elif args.command == "replay":
             config = load_config(args.config)
             metrics = calibrate(load_labeled_jsonl(args.fixture), config)

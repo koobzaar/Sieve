@@ -394,8 +394,16 @@ using `live`. `GEMINI_API_KEY` is still required while natural-language preferen
 On the first startup for a database, Sieve imports a nonblank YAML profile losslessly as a baseline
 note and imports each alias and hard rule as its own revision-zero entry. It never imports YAML
 again for that database; deleting the preference database is the automatic reseed path. During an
-upgrade, an untouched revision-zero placeholder shipped by the old templates is removed in one
-audited system revision; user-authored baselines and every structured preference are preserved.
+upgrade, an untouched revision-zero placeholder shipped by the old templates is removed only when
+structured interests already exist, in one audited system revision. Adding the first interest
+removes that placeholder atomically in the same audited revision. User-authored, revision-touched,
+and no-interest baselines are preserved.
+
+Each interest keeps a `search_terms` list whose values are alternative match expressions, not words
+that must all appear together across the list. Keep each alternative short and discriminative (for
+example, a model, product, or product-plus-brand identity). Matching ignores case, accents,
+connector words, word order, and letter/number spacing while still requiring every significant
+token in the selected alternative.
 
 The configured private owner can send natural-language instructions to the delivery bot. The app
 checks both private chat and sender IDs before Gemini sees a message. On the first message it uses
@@ -435,13 +443,14 @@ hour; previews consume the limit, while queries and confirmations do not.
 
 The `sieve` entrypoint takes a global `--config` and `--log-level`, then a subcommand.
 
-| Command                                          | Purpose                                                                        |
-| ------------------------------------------------ | ------------------------------------------------------------------------------ |
-| `run`                                            | Start the service.                                                             |
-| `auth-telegram [--source NAME] [--phone NUMBER]` | Create or refresh the persisted Telethon user session.                         |
-| `replay FIXTURE [--no-fail]`                     | Score pre-LLM filtering against a labeled JSONL file.                          |
-| `health`                                         | Print JSON health status; exit 1 if unhealthy. Used by the Docker healthcheck. |
-| `validate-config`                                | Parse the YAML without touching secrets.                                       |
+| Command                                                                                  | Purpose                                                                        |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `run`                                                                                    | Start the service.                                                             |
+| `auth-telegram [--source NAME] [--phone NUMBER]`                                         | Create or refresh the persisted Telethon source session.                       |
+| `smoke-telegram-preferences [--source NAME] [--session-path PATH] [--phone NUMBER] [--timeout SECONDS]` | Run the non-mutating live preference-bot gate with a dedicated user session. |
+| `replay FIXTURE [--no-fail]`                                                             | Score pre-LLM filtering against a labeled JSONL file.                          |
+| `health`                                                                                 | Print JSON health status; exit 1 if unhealthy. Used by the Docker healthcheck. |
+| `validate-config`                                                                        | Parse the YAML without touching secrets.                                       |
 
 ---
 
@@ -478,9 +487,9 @@ python -m venv .venv
 
 On Windows PowerShell, use `.venv\Scripts\pip` and `.venv\Scripts\python`.
 
-The default suite never touches live services; the `contract` test is skipped unless explicitly
-enabled. Tests run against saved HTML/JSON-LD fixtures, synthetic events, mocked HTTP transports,
-deterministic clocks and temporary SQLite files. The suite covers BM25,
+The default suite never touches live services; the `contract` and Docker `system` gates are
+skipped unless explicitly enabled. Tests run against saved HTML/JSON-LD fixtures, synthetic events,
+mocked HTTP transports, deterministic clocks and temporary SQLite files. The suite covers BM25,
 normalization, filters and exceptional detection, revisioned preference CRUD, Gemini parsing,
 Telegram authorization and outbox recovery, restart-safe alias generations, pipeline integration,
 replay, and `soak`-marked promotion, 500-entry, 10,000-document rebuild and command-flood runs.
@@ -488,10 +497,13 @@ replay, and `soak`-marked promotion, 500-entry, 10,000-document rebuild and comm
 ```bash
 .venv/bin/python -m pytest -m "not soak"   # skip the long one
 SIEVE_RUN_GEMINI_CONTRACT=1 GEMINI_API_KEY=... .venv/bin/python -m pytest -m contract
+SIEVE_RUN_SYSTEM=1 .venv/bin/python -m pytest -m system
 ```
 
 Set `SIEVE_GEMINI_MODEL` to override the contract test's default
-`gemini-3.1-flash-lite` model.
+`gemini-3.1-flash-lite` model. The Docker gate requires a running Docker daemon. It builds the
+production image, starts only the synthetic `compose.system.yaml` stack with dummy credentials,
+and removes its isolated SQLite volume unconditionally.
 
 ---
 
@@ -501,13 +513,25 @@ Shadow mode exists because a filter that silently eats a good deal is worse than
 Advance one step at a time:
 
 - [ ] Run the full suite — fixture, contract, integration, recovery and soak tests
+- [ ] Run the deterministic Docker black-box gate:
+      `SIEVE_RUN_SYSTEM=1 python -m pytest -m system`
 - [ ] Run **all** sources in shadow for seven days
 - [ ] Review replay metrics; tune initial YAML before the first seed, then use live preference commands
+- [ ] With the deployed preference bot running, run the non-mutating live gate:
+      `docker compose run --rm sieve --config /app/config/config.yaml smoke-telegram-preferences --source telegram-principal`
 - [ ] Promote **one** Telegram source to `live` for 48 hours
 - [ ] Enable remaining Telegram sources, then Pelando
 
 Do not advance unless all of the following hold: no duplicate live deliveries, no sustained memory
 growth, clean recovery across restarts, and the 90% rejection / 95% retention targets met.
+
+The live gate resolves the bot username from its configured token, verifies that the dedicated
+Telethon user is the configured preference owner, sends `/preferences`, performs a nonce-bearing
+`/preview`, and proves the authoritative response is unchanged. Its default session is
+`/state/telegram-smoke-user`; never point `--session-path` at a configured source session.
+First-time authorization may require `--phone`, a login code and 2FA. The command prints only a
+concise JSON report and exits non-zero on timeouts, identity/webhook conflicts, ambiguous previews,
+or changed state. `--timeout` defaults to 90 seconds and accepts a bounded 10–300 seconds.
 
 ---
 
@@ -523,6 +547,7 @@ promo_bot/
 ├── preference_store.py # SQLite entries, revisions, confirmations, rate state, outbox
 ├── preference_interpreter.py # Gemini natural-language operation parser
 ├── preference_bot.py # authorized Telegram Bot API long polling and commands
+├── telegram_smoke.py # dedicated-session, non-mutating live Telegram gate
 ├── gemini.py         # shared structured-output REST client
 ├── protocols.py      # Source / Stage / Evaluator / Sink / Store interfaces
 ├── config.py         # YAML loading, factory resolution, env secrets

@@ -141,13 +141,26 @@ class ConfirmationExpiredError(ConfirmationError):
 
 
 _STOCK_BASELINE_PLACEHOLDERS = frozenset(
-    text
-    for sentence in (
+    {
         "Replace this example with your promotion interests in config.local.yaml.",
         "Describe the products, brands, and deal characteristics you want.",
-    )
-    for text in (sentence, sentence + "\n")
+        "No promotion interests have been configured yet.",
+        "No promotion interests have been configured yet...",
+        "No promotion interests have been configured yet…",
+        (
+            "No promotion interests have been configured yet. "
+            "Use the private Telegram preference bot to add them."
+        ),
+        (
+            "No promotion interests have been configured yet. "
+            "Add them through the private Telegram bot."
+        ),
+    }
 )
+
+
+def _normalized_baseline_text(value: str) -> str:
+    return " ".join(value.split())
 
 
 def _is_untouched_stock_baseline(entry: PreferenceEntry | None) -> bool:
@@ -160,8 +173,22 @@ def _is_untouched_stock_baseline(entry: PreferenceEntry | None) -> bool:
         and entry.updated_revision == 0
         and set(entry.data) == {"text"}
         and isinstance(text, str)
-        and text in _STOCK_BASELINE_PLACEHOLDERS
+        and _normalized_baseline_text(text) in _STOCK_BASELINE_PLACEHOLDERS
     )
+
+
+def _remove_superseded_stock_baseline(
+    entries: dict[str, PreferenceEntry],
+) -> bool:
+    has_interest = any(
+        entry.kind == PreferenceKind.INTEREST for entry in entries.values()
+    )
+    if not has_interest or not _is_untouched_stock_baseline(
+        entries.get("baseline-profile")
+    ):
+        return False
+    del entries["baseline-profile"]
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,11 +416,8 @@ class SQLitePreferenceStore:
                 else:
                     entries_by_id = self._entries_locked()
                     snapshot = build_snapshot(revision, entries_by_id.values())
-                    if _is_untouched_stock_baseline(
-                        entries_by_id.get("baseline-profile")
-                    ):
+                    if _remove_superseded_stock_baseline(entries_by_id):
                         previous = snapshot
-                        del entries_by_id["baseline-profile"]
                         snapshot = build_snapshot(
                             revision + 1, entries_by_id.values()
                         )
@@ -604,6 +628,7 @@ class SQLitePreferenceStore:
                 )
             entries = self._entries_locked()
         candidate = self._apply_to_entries(entries, normalized, base_revision + 1)
+        _remove_superseded_stock_baseline(candidate)
         snapshot = build_snapshot(base_revision + 1, candidate.values())
         self._validate_snapshot(snapshot)
         return snapshot, normalized
@@ -748,7 +773,7 @@ class SQLitePreferenceStore:
         original_message: str,
         actor_id: int | None,
         update_id: int | None,
-        operations: Sequence[PreferenceOperation] | Sequence[Mapping[str, Any]],
+        operations: Sequence[PreferenceOperation | Mapping[str, Any]],
         summary: str,
         rollback_target: int | None,
         reply: OutboxReply | None,
@@ -828,6 +853,16 @@ class SQLitePreferenceStore:
                 entries = self._entries_locked()
                 previous = build_snapshot(revision, entries.values())
                 changed = self._apply_to_entries(entries, normalized, revision + 1)
+                audited_operations: list[
+                    PreferenceOperation | Mapping[str, Any]
+                ] = list(normalized)
+                if _remove_superseded_stock_baseline(changed):
+                    audited_operations.append(
+                        {
+                            "op": "remove_stock_placeholder",
+                            "entry_id": "baseline-profile",
+                        }
+                    )
                 snapshot = build_snapshot(revision + 1, changed.values())
                 self._validate_snapshot(snapshot)
                 self._commit_snapshot_locked(
@@ -836,7 +871,7 @@ class SQLitePreferenceStore:
                     original_message=original_message,
                     actor_id=actor_id,
                     update_id=update_id,
-                    operations=normalized,
+                    operations=audited_operations,
                     summary=summary,
                     rollback_target=None,
                     reply=reply,

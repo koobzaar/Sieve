@@ -285,6 +285,10 @@ def test_schema_and_prompt_require_canonical_separate_interests() -> None:
     )
     assert "Every interest add must include a trimmed, nonempty name" in prompt
     assert "each distinct product or category with a separate operation" in prompt
+    assert "search_terms is a list of alternative product identities" in prompt
+    assert "short, discriminative expressions" in prompt
+    assert "Do not copy complete promotion titles" in prompt
+    assert "every significant token in one expression" in prompt
     assert "SELECTED RESPONSE LANGUAGE: Brazilian Portuguese" in prompt
     assert "selected UI language is authoritative" in prompt
     assert "Never emit a data field" in prompt

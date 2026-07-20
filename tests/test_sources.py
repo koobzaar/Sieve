@@ -33,6 +33,7 @@ def _card(
     title: str,
     deal_id: str | None,
     temperature: int | None,
+    price: str | None = "R$ 10,00",
 ) -> str:
     id_attribute = f' data-deal-id="{deal_id}"' if deal_id is not None else ""
     temperature_html = (
@@ -40,11 +41,12 @@ def _card(
         if temperature is not None
         else ""
     )
-    return (
-        f'<a href="{url}"{id_attribute}>{title}</a>'
-        '<span class="deal-card-stamp">R$ 10,00</span>'
-        + temperature_html
+    price_html = (
+        f'<span class="deal-card-stamp">{price}</span>'
+        if price is not None
+        else ""
     )
+    return f'<a href="{url}"{id_attribute}>{title}</a>' + price_html + temperature_html
 
 
 def _collection_html(parts: list[object], cards: str) -> str:
@@ -102,6 +104,25 @@ def test_current_pelando_collection_page_is_paired_with_rendered_cards() -> None
     assert promotions[0].temperature == 321
 
 
+def test_saved_current_three_anchor_fixture_merges_compatible_partial_cards() -> None:
+    promotions = parse_feed_schema(
+        (FIXTURES / "pelando_current_three_anchors.html").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert [promotion.id for promotion in promotions] == ["deal-ssd", "deal-gpu"]
+    assert [str(promotion.price) for promotion in promotions] == [
+        "399.90",
+        "4999.00",
+    ]
+    assert [promotion.temperature for promotion in promotions] == [245, 310]
+    assert [promotion.url for promotion in promotions] == [
+        "https://www.pelando.com.br/d/ssd-current",
+        "https://www.pelando.com.br/d/gpu-current",
+    ]
+
+
 def test_mixed_collection_page_skips_malformed_trailing_item(caplog) -> None:
     html = _collection_html(
         [
@@ -152,7 +173,7 @@ def test_mixed_collection_page_skips_malformed_trailing_item(caplog) -> None:
             _card(BAD_URL, title="Different title", deal_id="bad-id", temperature=50),
         ),
         (
-            "duplicate_card_url",
+            "conflicting_duplicate_card",
             {"name": "Bad deal", "url": BAD_URL},
             _card(BAD_URL, title="Bad deal", deal_id="bad-1", temperature=50)
             + _card(BAD_URL, title="Bad deal", deal_id="bad-2", temperature=50),
@@ -184,6 +205,57 @@ def test_collection_page_skip_reasons_are_precise(
     )
     assert warning.reason_counts == {reason: 1}
     assert warning.examples == [{"index": 1, "reason": reason}]
+
+
+@pytest.mark.parametrize(
+    "bad_cards",
+    [
+        _card(BAD_URL, title="Bad deal", deal_id="bad-id", temperature=50)
+        + _card(BAD_URL, title="Different deal", deal_id="bad-id", temperature=50),
+        _card(
+            BAD_URL,
+            title="Bad deal",
+            deal_id="bad-id",
+            temperature=50,
+            price="R$ 10,00",
+        )
+        + _card(
+            BAD_URL,
+            title="Bad deal",
+            deal_id="bad-id",
+            temperature=50,
+            price="R$ 11,00",
+        ),
+        _card(BAD_URL, title="Bad deal", deal_id="bad-id", temperature=50)
+        + _card(BAD_URL, title="Bad deal", deal_id="bad-id", temperature=51),
+    ],
+)
+def test_collection_page_rejects_every_conflicting_duplicate_field(
+    bad_cards: str, caplog
+) -> None:
+    html = _collection_html(
+        [
+            {"name": "Valid deal", "url": VALID_URL},
+            {"name": "Bad deal", "url": BAD_URL},
+        ],
+        _card(
+            VALID_URL,
+            title="Valid deal",
+            deal_id="valid-id",
+            temperature=100,
+        )
+        + bad_cards,
+    )
+
+    promotions = parse_feed_schema(html)
+
+    assert [promotion.id for promotion in promotions] == ["valid-id"]
+    warning = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "pelando_items_skipped"
+    )
+    assert warning.reason_counts == {"conflicting_duplicate_card": 1}
 
 
 def test_mixed_legacy_item_list_keeps_valid_promotions(caplog) -> None:

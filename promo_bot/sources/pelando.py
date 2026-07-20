@@ -10,11 +10,12 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 
 from ..models import Promotion, utc_now
-from ..normalization import parse_price
+from ..normalization import canonicalize_url, parse_price
 from ..protocols import PromotionEmitter
 
 HealthReporter = Callable[[str, Exception | None], Awaitable[None]]
@@ -22,6 +23,7 @@ HealthReporter = Callable[[str, Exception | None], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
 _SKIP_EXAMPLE_LIMIT = 3
+_PELANDO_ORIGIN = "https://www.pelando.com.br"
 
 
 class PelandoSchemaError(ValueError):
@@ -184,6 +186,38 @@ def _finish_item_parse(
     return promotions
 
 
+def _normalized_deal_url(value: str) -> str:
+    return canonicalize_url(urljoin(_PELANDO_ORIGIN, value.strip()))
+
+
+def _consolidate_rendered_cards(
+    cards: list[dict[str, str]],
+) -> tuple[dict[str, dict[str, str]], set[str]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for card in cards:
+        url = _normalized_deal_url(card.get("url", ""))
+        if url:
+            grouped.setdefault(url, []).append(card)
+
+    consolidated: dict[str, dict[str, str]] = {}
+    conflicting: set[str] = set()
+    for url, siblings in grouped.items():
+        merged = {"url": url}
+        for field in ("id", "title", "price", "temperature"):
+            values = {
+                str(card.get(field, "")).strip()
+                for card in siblings
+                if str(card.get(field, "")).strip()
+            }
+            if len(values) > 1:
+                conflicting.add(url)
+                break
+            merged[field] = next(iter(values), "")
+        if url not in conflicting:
+            consolidated[url] = merged
+    return consolidated, conflicting
+
+
 def _parse_rendered_collection(
     root: Any, html: str, *, source_name: str
 ) -> list[Promotion] | None:
@@ -196,15 +230,7 @@ def _parse_rendered_collection(
     parser = _RenderedCardParser()
     parser.feed(html)
     parser.close()
-    cards_by_url: dict[str, dict[str, str]] = {}
-    ambiguous_urls: set[str] = set()
-    for card in parser.cards:
-        url = card["url"].rstrip("/")
-        if url in cards_by_url or url in ambiguous_urls:
-            cards_by_url.pop(url, None)
-            ambiguous_urls.add(url)
-        else:
-            cards_by_url[url] = card
+    cards_by_url, conflicting_urls = _consolidate_rendered_cards(parser.cards)
 
     promotions: list[Promotion] = []
     skipped: list[tuple[int, str]] = []
@@ -213,15 +239,16 @@ def _parse_rendered_collection(
             skipped.append((index, "item_not_object"))
             continue
         title = str(part.get("name") or "").strip()
-        url = str(part.get("url") or part.get("@id") or "").strip().rstrip("/")
+        raw_url = str(part.get("url") or part.get("@id") or "").strip()
+        url = _normalized_deal_url(raw_url) if raw_url else ""
         if not title:
             skipped.append((index, "missing_title"))
             continue
         if not url:
             skipped.append((index, "missing_url"))
             continue
-        if url in ambiguous_urls:
-            skipped.append((index, "duplicate_card_url"))
+        if url in conflicting_urls:
+            skipped.append((index, "conflicting_duplicate_card"))
             continue
         card = cards_by_url.get(url)
         if card is None:

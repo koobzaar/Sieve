@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from .models import PipelineResult, Promotion, RetryJob
-from .normalization import expand_aliases
+from .normalization import MATCH_NORMALIZATION_VERSION, canonical_match_tokens
 
 
 class StoreError(RuntimeError):
@@ -194,7 +194,16 @@ class SQLiteStateStore:
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
-        return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        fingerprint_material = json.dumps(
+            {
+                "aliases": payload,
+                "normalization_version": MATCH_NORMALIZATION_VERSION,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return encoded, hashlib.sha256(fingerprint_material.encode("utf-8")).hexdigest()
 
     def ensure_alias_generation(
         self, aliases: dict[str, list[str]] | dict[str, tuple[str, ...]]
@@ -378,7 +387,7 @@ class SQLiteStateStore:
                 ).fetchone()
                 if building is not None:
                     aliases = json.loads(str(building["aliases_json"]))
-                    rebuilt = expand_aliases(raw, aliases)
+                    rebuilt = canonical_match_tokens(raw, aliases)
                     self._index_generation_document_locked(
                         connection, int(building["id"]), doc_id, rebuilt
                     )
@@ -416,7 +425,7 @@ class SQLiteStateStore:
         else:
             ready = str(active["fingerprint"]) == requested_fingerprint
             active_aliases = json.loads(str(active["aliases_json"]))
-        indexed = expand_aliases(raw_tokens, active_aliases)
+        indexed = canonical_match_tokens(raw_tokens, active_aliases)
         count = self.add_corpus_document(indexed, now=now, raw_tokens=raw_tokens)
         return count, ready and self.alias_generation_ready(aliases)
 
@@ -474,7 +483,7 @@ class SQLiteStateStore:
                 ).fetchall()
                 for row in rows:
                     raw = json.loads(str(row["tokens_json"]))
-                    tokens = expand_aliases(raw, aliases)
+                    tokens = canonical_match_tokens(raw, aliases)
                     self._index_generation_document_locked(
                         connection, generation_id, int(row["id"]), tokens
                     )

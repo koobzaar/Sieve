@@ -115,13 +115,13 @@ def test_blank_profile_does_not_create_a_baseline_entry(tmp_path) -> None:
     state.close()
 
 
-def test_stale_stock_baseline_is_removed_once_without_touching_structured_state(
+def test_first_interest_removes_wrapped_stock_baseline_in_the_same_audited_revision(
     tmp_path,
 ) -> None:
     state = SQLiteStateStore(tmp_path / "stale.db")
     store = SQLitePreferenceStore(state)
     initial = store.initialize(
-        profile="Describe the products, brands, and deal characteristics you want.\n",
+        profile="No promotion interests have\n  been configured yet.\n",
         aliases={"storage": ["ssd"]},
         hard_rules=(
             HardFilterRule(
@@ -156,19 +156,67 @@ def test_stale_stock_baseline_is_removed_once_without_touching_structured_state(
         update_id=1,
         summary="structured preferences",
     )
-    expected = {
-        entry.id: entry.to_dict()
-        for entry in changed.entries
-        if entry.id != "baseline-profile"
+    assert changed.revision == 1
+    assert "baseline-profile" not in {entry.id for entry in changed.entries}
+    assert "No promotion interests" not in changed.rendered_profile
+    assert "promotion" not in dict(changed.weighted_bm25_terms)
+    audit = store._connection.execute(
+        "SELECT operations_json FROM preference_revisions WHERE revision=1"
+    ).fetchone()
+    assert json.loads(audit["operations_json"])[-1] == {
+        "entry_id": "baseline-profile",
+        "op": "remove_stock_placeholder",
     }
+
+    reopened = SQLitePreferenceStore(state)
+    unchanged = reopened.initialize(profile="", aliases={}, hard_rules=())
+
+    assert unchanged.revision == 1
+    assert unchanged.entries == changed.entries
+    state.close()
+
+
+def test_restart_migrates_a_legacy_contradictory_state_once(tmp_path) -> None:
+    state = SQLiteStateStore(tmp_path / "legacy-stale.db")
+    store = SQLitePreferenceStore(state)
+    store.initialize(
+        profile="legacy deployment placeholder",
+        aliases={},
+        hard_rules=(),
+    )
+    store.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={"name": "notebook"},
+            )
+        ],
+        base_revision=0,
+        original_message="legacy structured preference",
+        actor_id=7,
+        update_id=1,
+        summary="legacy structured preference",
+    )
+    state._connection.execute(
+        "UPDATE preference_entries SET data_json=? WHERE id='baseline-profile'",
+        (
+            json.dumps(
+                {
+                    "text": (
+                        "No promotion interests have been configured yet. "
+                        "Use the private Telegram preference bot to add them."
+                    )
+                }
+            ),
+        ),
+    )
 
     reopened = SQLitePreferenceStore(state)
     migrated = reopened.initialize(profile="", aliases={}, hard_rules=())
 
     assert migrated.revision == 2
     assert "baseline-profile" not in {entry.id for entry in migrated.entries}
-    assert {entry.id: entry.to_dict() for entry in migrated.entries} == expected
-    assert reopened.initialize(profile="", aliases={}, hard_rules=()).revision == 2
     audit = reopened._connection.execute(
         "SELECT parent_revision,original_message,actor_id,operations_json,summary "
         "FROM preference_revisions WHERE revision=2"
@@ -185,6 +233,25 @@ def test_stale_stock_baseline_is_removed_once_without_touching_structured_state(
         }
     ]
     assert audit["summary"] == "Removed untouched stock placeholder baseline"
+    assert reopened.initialize(profile="", aliases={}, hard_rules=()).revision == 2
+    state.close()
+
+
+def test_stock_baseline_without_interests_is_preserved(tmp_path) -> None:
+    state = SQLiteStateStore(tmp_path / "no-interests.db")
+    store = SQLitePreferenceStore(state)
+    initial = store.initialize(
+        profile="Describe the products, brands, and deal characteristics you want.\n",
+        aliases={},
+        hard_rules=(),
+    )
+
+    reopened = SQLitePreferenceStore(state).initialize(
+        profile="", aliases={}, hard_rules=()
+    )
+
+    assert initial.revision == reopened.revision == 0
+    assert [entry.id for entry in reopened.entries] == ["baseline-profile"]
     state.close()
 
 
@@ -202,6 +269,33 @@ def test_user_authored_and_revision_touched_baselines_are_preserved(tmp_path) ->
     assert custom.revision == 0
     assert custom.entries[0].data["text"] == "My actual promotion interests."
     custom_state.close()
+
+    prefixed_state = SQLiteStateStore(tmp_path / "prefixed-custom.db")
+    prefixed_store = SQLitePreferenceStore(prefixed_state)
+    prefixed_store.initialize(
+        profile=(
+            "No promotion interests have been configured yet. "
+            "This is an intentionally custom note."
+        ),
+        aliases={},
+        hard_rules=(),
+    )
+    prefixed = prefixed_store.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={"name": "monitor"},
+            )
+        ],
+        base_revision=0,
+        original_message="monitor",
+        actor_id=7,
+        update_id=1,
+        summary="monitor",
+    )
+    assert "baseline-profile" in {entry.id for entry in prefixed.entries}
+    prefixed_state.close()
 
     touched_state = SQLiteStateStore(tmp_path / "touched.db")
     touched_store = SQLitePreferenceStore(touched_state)
@@ -479,6 +573,66 @@ def test_exclusions_price_and_attribute_constraints_are_deterministic(tmp_path) 
     state.close()
 
 
+def test_constraint_interest_matching_uses_complete_normalized_alternatives(
+    tmp_path,
+) -> None:
+    state, store, _ = make_store(tmp_path)
+    snapshot = store.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.ALIAS,
+                data={
+                    "canonical": "placa de vídeo",
+                    "synonyms": ["gpu", "radeon"],
+                },
+            ),
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={
+                    "name": "Radeon RX 9070 XT",
+                    "search_terms": ["GPU RX9070XT"],
+                    "constraints": {"max_price": 4000},
+                },
+            ),
+        ],
+        base_revision=0,
+        original_message="RX 9070 XT até 4000",
+        actor_id=1,
+        update_id=1,
+        summary="RX 9070 XT",
+    )
+
+    matched = evaluate_constraints(
+        Promotion(
+            id="rx-full",
+            source="x",
+            title="Radeon XT 9070 RX",
+            price=Decimal("4500"),
+        ),
+        "radeon xt 9070 rx brl 4500",
+        snapshot.constraints,
+        snapshot.aliases,
+    )
+    partial = evaluate_constraints(
+        Promotion(
+            id="rx-partial",
+            source="x",
+            title="Radeon RX 9070",
+            price=Decimal("4500"),
+        ),
+        "radeon rx 9070 brl 4500",
+        snapshot.constraints,
+        snapshot.aliases,
+    )
+
+    assert matched.violation and "price_above_maximum" in matched.violation
+    assert not partial.may_match_interest
+    assert partial.violation is None
+    state.close()
+
+
 def test_rate_limits_undo_and_timezone_revert_targets(tmp_path) -> None:
     zone = ZoneInfo("America/Sao_Paulo")
     clock = Clock(datetime(2026, 7, 17, 23, 0, tzinfo=zone).timestamp())
@@ -559,6 +713,34 @@ def test_existing_corpus_is_not_assumed_to_match_first_alias_fingerprint(tmp_pat
     assert state.rebuild_alias_batch()["complete"]
     assert state.alias_generation_ready({"storage": ["ssd"]})
     assert state.corpus_stats(["storage"])[2] == {"storage": 1}
+    state.close()
+
+
+def test_normalization_fingerprint_reindexes_raw_documents_atomically(tmp_path) -> None:
+    state = SQLiteStateStore(tmp_path / "normalization-version.db")
+    assert state.ensure_alias_generation({})
+    state.add_corpus_document(["rx9070xt"], raw_tokens=["rx9070xt"])
+    state._connection.execute(
+        "UPDATE corpus_generations SET fingerprint='previous-normalization' "
+        "WHERE status='active'"
+    )
+
+    assert not state.ensure_alias_generation({})
+    count, ready = state.add_corpus_document_dynamic(["16gb"], {})
+    assert count == 2
+    assert not ready
+    assert not state.alias_generation_ready({})
+    assert state.corpus_stats(["rx", "rx9070xt"])[2] == {"rx9070xt": 1}
+
+    result = state.rebuild_alias_batch()
+
+    assert result["complete"]
+    assert state.alias_generation_ready({})
+    count, _, frequencies = state.corpus_stats(
+        ["rx", "9070", "xt", "16", "gb", "rx9070xt"]
+    )
+    assert count == 2
+    assert frequencies == {"16": 1, "9070": 1, "gb": 1, "rx": 1, "xt": 1}
     state.close()
 
 

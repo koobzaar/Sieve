@@ -633,6 +633,26 @@ async def test_direct_bot_api_uses_required_long_polling_shape() -> None:
     }
 
 
+async def test_direct_bot_api_get_me_returns_bot_identity() -> None:
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "result": {"id": 99, "is_bot": True, "username": "sieve_test_bot"},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        api = TelegramBotAPI(token="token", api_url="https://telegram.test", client=client)
+        identity = await api.get_me()
+    assert identity["username"] == "sieve_test_bot"
+    assert bodies == [("/bottoken/getMe", {})]
+
+
 async def test_direct_bot_api_sets_owner_scoped_command_menu() -> None:
     bodies = []
 

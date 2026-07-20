@@ -1,0 +1,68 @@
+services:
+  emulator:
+    image: python:3.12-alpine
+    command: ["python", "/system/emulator.py"]
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    volumes:
+      - ./tests/system:/system:ro
+    ports:
+      - "127.0.0.1::8080"
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=1)",
+        ]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+
+  sieve:
+    build:
+      context: .
+    restart: "no"
+    environment:
+      GEMINI_API_KEY: system-dummy-gemini-key
+      TELEGRAM_BOT_TOKEN: system-dummy-token
+      TELEGRAM_PRIVATE_CHAT_ID: "424242"
+    command: ["--config", "/app/config/config.yaml", "run"]
+    depends_on:
+      emulator:
+        condition: service_healthy
+    volumes:
+      - system-state:/state
+      - ./tests/system/config.yaml:/app/config/config.yaml:ro
+      - ./tests/system:/system:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    mem_limit: 256m
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "sieve", "--config", "/app/config/config.yaml", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+volumes:
+  system-state:

@@ -13,7 +13,13 @@ from typing import Any
 
 from .config import HardFilterRule
 from .models import Promotion
-from .normalization import expand_aliases, normalize_text, parse_stated_price, tokenize
+from .normalization import (
+    canonical_match_tokens,
+    matches_alternative,
+    normalize_text,
+    parse_stated_price,
+    significant_tokens,
+)
 
 
 class PreferenceError(ValueError):
@@ -461,8 +467,7 @@ def _constraint_from_interest(entry: PreferenceEntry) -> PreferenceConstraint:
 def _add_weighted_terms(
     weights: dict[str, float], text: str, weight: float, aliases: Mapping[str, Sequence[str]]
 ) -> None:
-    raw = tokenize(text)
-    for term in expand_aliases(raw, aliases):
+    for term in canonical_match_tokens(text, aliases):
         weights[term] = max(weights.get(term, 0.0), weight)
 
 
@@ -672,14 +677,21 @@ def explicit_exclusion_match(
     exclusions: Sequence[str],
     aliases: Mapping[str, Sequence[str]] | None = None,
 ) -> str | None:
-    tokens = expand_aliases(tokenize(normalized), aliases or {})
+    document_tokens = significant_tokens(normalized)
     for exclusion in exclusions:
-        for phrase in _phrase_patterns(exclusion, aliases or {}):
-            width = len(phrase)
-            if width and any(
-                tokens[index : index + width] == phrase
-                for index in range(len(tokens) - width + 1)
-            ):
+        phrase = significant_tokens(exclusion)
+        width = len(phrase)
+        if width and any(
+            document_tokens[index : index + width] == phrase
+            for index in range(len(document_tokens) - width + 1)
+        ):
+            return exclusion
+        exclusion_text = normalize_text(exclusion)
+        for canonical, synonyms in (aliases or {}).items():
+            if exclusion_text in {
+                normalize_text(canonical),
+                *(normalize_text(item) for item in synonyms),
+            } and matches_alternative(normalized, exclusion, aliases):
                 return exclusion
     return None
 
@@ -696,30 +708,7 @@ def _matches_any_text(
     values: Sequence[str],
     aliases: Mapping[str, Sequence[str]] | None = None,
 ) -> bool:
-    tokens = expand_aliases(tokenize(normalized), aliases or {})
-    for value in values:
-        for phrase in _phrase_patterns(value, aliases or {}):
-            width = len(phrase)
-            if width and any(
-                tokens[index : index + width] == phrase
-                for index in range(len(tokens) - width + 1)
-            ):
-                return True
-    return False
-
-
-def _phrase_patterns(
-    value: str, aliases: Mapping[str, Sequence[str]]
-) -> tuple[list[str], ...]:
-    base = tokenize(value)
-    patterns: list[list[str]] = [base]
-    normalized = normalize_text(value)
-    for canonical, synonyms in aliases.items():
-        if normalized in {normalize_text(canonical), *(normalize_text(item) for item in synonyms)}:
-            token = "_".join(tokenize(canonical))
-            if token:
-                patterns.append([token])
-    return tuple(patterns)
+    return any(matches_alternative(normalized, value, aliases) for value in values)
 
 
 def evaluate_constraints(

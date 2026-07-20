@@ -9,7 +9,14 @@ from .evaluator import EvaluationError, RetryableEvaluationError
 from .exceptional import detect_exceptional
 from .filters import fixed_filter, hard_rules_filter
 from .models import Decision, Evaluation, PipelineResult, Promotion
-from .normalization import expand_aliases, promotion_hash, promotion_text, tokenize
+from .normalization import (
+    canonical_match_tokens,
+    matches_alternative,
+    promotion_hash,
+    promotion_text,
+    significant_tokens,
+    tokenize,
+)
 from .config import HardFilterRule
 from .preferences import (
     AtomicPreferenceProvider,
@@ -38,23 +45,14 @@ ACCESSORY_HEAD_TERMS = {
 }
 
 
-def _contains_phrase(tokens: Sequence[str], phrase: Sequence[str]) -> bool:
-    width = len(phrase)
-    return width > 0 and any(
-        list(tokens[index : index + width]) == list(phrase)
-        for index in range(len(tokens) - width + 1)
-    )
-
-
 def _matched_interest_terms(
     snapshot: PreferenceSnapshot, tokens: Sequence[str]
 ) -> list[list[str]]:
     matches: list[list[str]] = []
     for interest in getattr(snapshot, "interests", ()):
         for value in interest.data.get("search_terms", (interest.data["name"],)):
-            phrase = tokenize(str(value))
-            if _contains_phrase(tokens, phrase):
-                matches.append(phrase)
+            if matches_alternative(tokens, str(value), snapshot.aliases):
+                matches.append(significant_tokens(str(value)))
     return matches
 
 
@@ -263,9 +261,9 @@ class PromotionPipeline:
             corpus_size, bm25_ready = self.store.add_corpus_document_dynamic(  # type: ignore[attr-defined]
                 raw_tokens, dict(snapshot.aliases)
             )
-            document_tokens = expand_aliases(raw_tokens, snapshot.aliases)
+            document_tokens = canonical_match_tokens(raw_tokens, snapshot.aliases)
         else:
-            document_tokens = expand_aliases(raw_tokens, snapshot.aliases)
+            document_tokens = canonical_match_tokens(raw_tokens, snapshot.aliases)
             corpus_size = self.store.add_corpus_document(document_tokens)
             bm25_ready = True
 

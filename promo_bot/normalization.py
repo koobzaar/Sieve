@@ -23,6 +23,34 @@ STATED_PRICE_RE = re.compile(
 PERCENT_RE = re.compile(r"(\d{1,3}(?:[.,]\d+)?)\s*%")
 TOKEN_RE = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
 TRACKING_KEYS = {"fbclid", "gclid", "ref", "referrer", "source"}
+MATCH_NORMALIZATION_VERSION = "search-terms-v2"
+
+# Keep this deliberately small. In particular, single-letter words are retained because
+# they are often meaningful in model names such as "E-mount".
+MATCH_CONNECTOR_WORDS = frozenset(
+    {
+        "and",
+        "com",
+        "da",
+        "das",
+        "de",
+        "do",
+        "dos",
+        "em",
+        "for",
+        "na",
+        "nas",
+        "no",
+        "nos",
+        "of",
+        "para",
+        "por",
+        "sem",
+        "the",
+        "with",
+    }
+)
+LETTER_NUMBER_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])")
 
 
 def strip_accents(value: str) -> str:
@@ -45,6 +73,67 @@ def normalize_text(value: str) -> str:
 
 def tokenize(value: str) -> list[str]:
     return TOKEN_RE.findall(normalize_text(value))
+
+
+def significant_tokens(value: str | Sequence[str]) -> list[str]:
+    """Normalize product-identity tokens without weakening model identifiers."""
+    raw_tokens = tokenize(value) if isinstance(value, str) else list(value)
+    result: list[str] = []
+    for raw_token in raw_tokens:
+        for normalized_token in tokenize(str(raw_token)):
+            for component in normalized_token.split("_"):
+                for token in LETTER_NUMBER_BOUNDARY_RE.split(component):
+                    if token and token not in MATCH_CONNECTOR_WORDS:
+                        result.append(token)
+    return result
+
+
+def _alias_marker(canonical: str) -> str:
+    return "_".join(tokenize(canonical))
+
+
+def canonical_match_tokens(
+    value: str | Sequence[str], aliases: Mapping[str, Sequence[str]]
+) -> list[str]:
+    """Return order-independent identity tokens with aliases replaced canonically."""
+    base = significant_tokens(value)
+    available = set(base)
+    matched_tokens: set[str] = set()
+    markers: list[str] = []
+    for canonical, values in aliases.items():
+        marker = _alias_marker(canonical)
+        if not marker:
+            continue
+        variants = (
+            significant_tokens(canonical),
+            *(significant_tokens(item) for item in values),
+        )
+        group_matches = [
+            set(variant)
+            for variant in variants
+            if variant and set(variant) <= available
+        ]
+        if not group_matches:
+            continue
+        for variant in group_matches:
+            matched_tokens.update(variant)
+        if marker not in markers:
+            markers.append(marker)
+    return [token for token in base if token not in matched_tokens] + markers
+
+
+def matches_alternative(
+    document: str | Sequence[str],
+    alternative: str,
+    aliases: Mapping[str, Sequence[str]] | None = None,
+) -> bool:
+    """Match one alternative identity by containment of all significant tokens."""
+    alias_map = aliases or {}
+    required = set(canonical_match_tokens(alternative, alias_map))
+    if not required:
+        return False
+    available = set(canonical_match_tokens(document, alias_map))
+    return required <= available
 
 
 def parse_price(value: object) -> Decimal | None:
@@ -104,17 +193,6 @@ def promotion_hash(promotion: Promotion) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def _contains_phrase(tokens: Sequence[str], phrase: Sequence[str]) -> bool:
-    width = len(phrase)
-    return width > 0 and any(list(tokens[index : index + width]) == list(phrase) for index in range(len(tokens) - width + 1))
-
-
 def expand_aliases(tokens: Sequence[str], aliases: Mapping[str, Sequence[str]]) -> list[str]:
-    """Map either side of each alias group to the same canonical phrase token."""
-    expanded = list(tokens)
-    for canonical, values in aliases.items():
-        canonical_token = "_".join(tokenize(canonical))
-        phrases = [tokenize(canonical), *(tokenize(value) for value in values)]
-        if canonical_token in tokens or any(_contains_phrase(tokens, phrase) for phrase in phrases):
-            expanded.append(canonical_token)
-    return expanded
+    """Backward-compatible name for corpus and preference match normalization."""
+    return canonical_match_tokens(tokens, aliases)
