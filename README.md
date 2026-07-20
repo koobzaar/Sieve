@@ -223,7 +223,7 @@ avoids treating missing information as evidence either way.
   the groups
 - A separate Telegram **bot** that already has an open private conversation with your account —
   this is what delivers
-- A Gemini API key for natural-language preference messages and, by default, promotion evaluation
+- A Gemini API key if you enable natural-language preference messages or promotion evaluation
 
 ### 1. Configure secrets
 
@@ -231,10 +231,10 @@ avoids treating missing information as evidence either way.
 git clone https://github.com/koobzaar/Sieve.git
 cd Sieve
 cp .env.example .env
-cp config/config.local.example.yaml config/config.local.yaml
+cp config/config.example.yaml config/config.yaml
 ```
 
-Fill in `.env`:
+Fill in `.env` with the credentials required by the integrations you plan to enable:
 
 ```dotenv
 TELEGRAM_API_ID=
@@ -245,9 +245,13 @@ GEMINI_API_KEY=
 ```
 
 > [!WARNING]
-> Both `.env` and `config/config.local.yaml` are gitignored — keep them that way. The tracked
-> `config/config.yaml` contains safe shared defaults; put your personal profile, group IDs and
-> rule tuning only in the local override.
+> Both `.env` and `config/config.yaml` are gitignored — keep them that way. The tracked
+> `config/config.example.yaml` is a safe template and is not loaded by Sieve.
+
+Edit `config/config.yaml`: set your profile, aliases and hard rules; add Telegram `chat_ids`;
+configure preference ownership if wanted; and explicitly set `enabled: true` only for the sources,
+Gemini evaluation and preference bot integrations you intend to run. The copied template starts
+with every external integration disabled.
 
 ### 2. Authenticate the Telegram user session
 
@@ -255,16 +259,16 @@ Interactive, one time only. Telethon writes the session file into the persistent
 
 ```bash
 docker compose run --rm sieve \
-  --config /app/config/config.local.yaml auth-telegram --source telegram-principal
+  --config /app/config/config.yaml auth-telegram --source telegram-principal
 ```
 
 Enter the login code and 2FA password when prompted. Then set the source's numeric `chat_ids` and
-`enabled: true` in `config/config.local.yaml`.
+`enabled: true` in `config/config.yaml`.
 
 ### 3. Validate and run
 
 ```bash
-docker compose run --rm sieve --config /app/config/config.local.yaml validate-config
+docker compose run --rm sieve --config /app/config/config.yaml validate-config
 docker compose config
 docker compose up -d --build
 docker compose logs -f sieve
@@ -279,7 +283,7 @@ Health is checked automatically every 60s via the `health` subcommand — it ver
 ```bash
 python -m venv .venv
 .venv/bin/pip install -e .
-.venv/bin/sieve --config config/config.local.yaml run
+.venv/bin/sieve --config config/config.yaml run
 ```
 
 You'll need to point `state.path` and `session_path` at writable local directories instead of
@@ -291,15 +295,14 @@ You'll need to point `state.path` and `session_path` at writable local directori
 
 ## Supported promotion sources
 
-Telegram is enabled in the shared configuration; website adapters are opt-in. The local example
-keeps Telegram enabled and Pelando disabled.
+All sources are disabled in the copied template. Enable only the adapters you have configured.
 
 | Source | Coverage | Default | Required settings |
 | --- | --- | --- | --- |
-| Telegram groups/channels | Any groups or channels accessible to your Telegram user account | Enabled | Telethon API credentials, a persisted user session, and `chat_ids` |
+| Telegram groups/channels | Any groups or channels accessible to your Telegram user account | Disabled | Telethon API credentials, a persisted user session, and `chat_ids` |
 | [Pelando `/recentes`](https://www.pelando.com.br/recentes) | Brazil-focused deal website | Disabled | No account; optional polling interval, timeout, and user agent |
 
-Enable or disable each source independently in `config/config.local.yaml`:
+Enable or disable each source independently in `config/config.yaml`:
 
 ```yaml
 sources:
@@ -317,20 +320,28 @@ At least one source must be enabled before `run`. To add another website, implem
 client, and health reporter; then reference it with a `module:factory` path under `sources`. The
 pipeline does not need source-specific changes.
 
-> [!WARNING]
-> Pelando used to be enabled by the shared configuration. After upgrading, add the `pelando` entry
-> above with `enabled: true` if you want to keep ingesting it.
-
 ---
 
 ## Configuration
 
-Shared, non-personal defaults live in [`config/config.yaml`](config/config.yaml). Copy
-[`config/config.local.example.yaml`](config/config.local.example.yaml) to
-`config/config.local.yaml` for your personal profile, source IDs and filtering preferences. The
-local file uses `extends: config.yaml`; mappings merge recursively, `sources` merge by `name`,
-`hard_rules` merge by `id`, and other lists replace their parent value. Secrets are read from
-environment variables named _by_ the config, never stored in either file.
+Copy the complete tracked [`config/config.example.yaml`](config/config.example.yaml) template to
+the ignored `config/config.yaml`, then edit that one active file. Every Sieve command uses
+`config/config.yaml` by default. Configuration inheritance is not supported. Secrets are read
+from environment variables named _by_ the config, never stored in YAML.
+
+### Upgrading from the layered configuration
+
+Preserve your existing operator-owned configuration before doing anything with the new example:
+
+```bash
+mv config/config.local.yaml config/config.yaml
+# Or copy it if you want to retain the old file:
+# cp config/config.local.yaml config/config.yaml
+```
+
+Do not copy the example over the migrated file. Old overrides may contain an `extends` line and
+omit values that previously came from the tracked base; remove `extends` and compare your migrated
+file with `config/config.example.yaml` to add the complete settings required by this release.
 
 <details>
 <summary><b>Key sections</b></summary>
@@ -380,9 +391,11 @@ using `live`. `GEMINI_API_KEY` is still required while natural-language preferen
 
 ### Live preference commands
 
-On the first startup for a database, Sieve imports the YAML profile losslessly as a baseline note
-and imports each alias and hard rule as its own revision-zero entry. It never imports YAML again for
-that database; deleting the preference database is the automatic reseed path.
+On the first startup for a database, Sieve imports a nonblank YAML profile losslessly as a baseline
+note and imports each alias and hard rule as its own revision-zero entry. It never imports YAML
+again for that database; deleting the preference database is the automatic reseed path. During an
+upgrade, an untouched revision-zero placeholder shipped by the old templates is removed in one
+audited system revision; user-authored baselines and every structured preference are preserved.
 
 The configured private owner can send natural-language instructions to the delivery bot. The app
 checks both private chat and sender IDs before Gemini sees a message. On the first message it uses
@@ -442,7 +455,7 @@ under a `promotion` key. See [`fixtures/labeled.example.jsonl`](fixtures/labeled
 the shape.
 
 ```bash
-sieve --config config/config.local.yaml replay fixtures/labeled.example.jsonl
+sieve --config config/config.yaml replay fixtures/labeled.example.jsonl
 ```
 
 The command exits non-zero unless pre-LLM filtering **rejects ≥90% of labeled irrelevant deals**

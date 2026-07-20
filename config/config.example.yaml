@@ -14,7 +14,7 @@ state:
   retry_ttl_seconds: 3600
 
 pipeline:
-  gemini_evaluation_enabled: true
+  gemini_evaluation_enabled: false
   bm25_threshold: 2.0
   bm25_auto_forward_threshold: 7.0
   bm25_auto_forward_mode: shadow
@@ -23,8 +23,7 @@ pipeline:
   bm25_b: 0.75
   cold_start_documents: 500
   exceptional_temperature: 300
-  profile: |
-    Replace this example with your promotion interests in config.local.yaml.
+  profile: ""
   aliases: {}
   hard_rules:
     - id: prohibited_promotions
@@ -47,7 +46,7 @@ evaluator:
     retries: 3
 
 preferences:
-  enabled: true
+  enabled: false
   owner_id_env: TELEGRAM_PRIVATE_CHAT_ID
   chat_id_env: TELEGRAM_PRIVATE_CHAT_ID
   token_env: TELEGRAM_BOT_TOKEN
@@ -73,7 +72,7 @@ sink:
 sources:
   - name: telegram-principal
     factory: promo_bot.sources.telegram:create_telegram_source
-    enabled: true
+    enabled: false
     mode: shadow
     settings:
       api_id_env: TELEGRAM_API_ID

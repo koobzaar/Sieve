@@ -97,66 +97,19 @@ def _boolean(value: Any, key: str) -> bool:
     return value
 
 
-def _merge_named_lists(
-    base: list[Any], override: list[Any], *, key: str, path: str
-) -> list[Any]:
-    result = [dict(item) if isinstance(item, dict) else item for item in base]
-    positions: dict[str, int] = {}
-    for index, item in enumerate(result):
-        if not isinstance(item, dict) or key not in item:
-            raise ConfigurationError(f"{path} entries must be mappings with {key!r}")
-        positions[str(item[key])] = index
-    for item in override:
-        if not isinstance(item, dict) or key not in item:
-            raise ConfigurationError(f"{path} entries must be mappings with {key!r}")
-        identity = str(item[key])
-        if identity in positions:
-            index = positions[identity]
-            result[index] = _deep_merge(result[index], item, path=f"{path}.{identity}")
-        else:
-            positions[identity] = len(result)
-            result.append(dict(item))
-    return result
-
-
-def _deep_merge(base: Any, override: Any, *, path: str = "root") -> Any:
-    if isinstance(base, dict) and isinstance(override, dict):
-        merged = dict(base)
-        for key, value in override.items():
-            child_path = f"{path}.{key}"
-            merged[key] = (
-                _deep_merge(merged[key], value, path=child_path)
-                if key in merged
-                else value
-            )
-        return merged
-    if isinstance(base, list) and isinstance(override, list):
-        if path.endswith(".sources"):
-            return _merge_named_lists(base, override, key="name", path=path)
-        if path.endswith(".hard_rules"):
-            return _merge_named_lists(base, override, key="id", path=path)
-    return override
-
-
-def _load_raw_config(path: Path, stack: tuple[Path, ...] = ()) -> dict[str, Any]:
+def _load_raw_config(path: Path) -> dict[str, Any]:
     config_path = path.resolve()
-    if config_path in stack:
-        chain = " -> ".join(str(item) for item in (*stack, config_path))
-        raise ConfigurationError(f"configuration inheritance cycle: {chain}")
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigurationError(f"cannot load {config_path}: {exc}") from exc
     root = _mapping(raw, str(config_path))
-    parent = root.get("extends")
-    child = {key: value for key, value in root.items() if key != "extends"}
-    if parent is None:
-        return child
-    if not isinstance(parent, str) or not parent.strip():
-        raise ConfigurationError(f"{config_path}: extends must be a nonempty path")
-    parent_path = (config_path.parent / parent).resolve()
-    base = _load_raw_config(parent_path, (*stack, config_path))
-    return _deep_merge(base, child)
+    if "extends" in root:
+        raise ConfigurationError(
+            f"{config_path}: extends is no longer supported; "
+            "use one complete configuration file"
+        )
+    return root
 
 
 def _phrases(value: Any, key: str) -> tuple[str, ...]:
