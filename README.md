@@ -25,6 +25,8 @@
   <img src="https://img.shields.io/github/stars/koobzaar/Sieve?style=flat" alt="Stars"/>
 </p>
 
+<img src="assets/sieve_telegram.gif" alt="Sieve Telegram bot demonstration" width="100%" />
+
 </div>
 
 ---
