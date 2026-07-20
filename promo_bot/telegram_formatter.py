@@ -293,7 +293,10 @@ class TelegramFormatter:
             terms = data.get("search_terms", ())
             if terms:
                 lines.append(
-                    self.pick("Search terms", "Termos de busca")
+                    self.pick(
+                        "Alternative match terms (each matches independently)",
+                        "Termos alternativos (cada um corresponde separadamente)",
+                    )
                     + ": "
                     + _clean(", ".join(str(item) for item in terms), 150)
                 )

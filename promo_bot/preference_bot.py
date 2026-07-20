@@ -100,6 +100,12 @@ class TelegramBotAPI:
             raise TelegramBotError("Telegram getWebhookInfo returned an invalid result")
         return result
 
+    async def get_me(self) -> dict[str, Any]:
+        result = await self._call("getMe", {})
+        if not isinstance(result, dict):
+            raise TelegramBotError("Telegram getMe returned an invalid result")
+        return result
+
     async def get_updates(
         self,
         *,

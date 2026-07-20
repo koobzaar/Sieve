@@ -1,0 +1,66 @@
+runtime:
+  mode: live
+  queue_capacity: 32
+  memory_limit_mb: 220
+  failure_alert_threshold: 3
+  llm_outage_alert_seconds: 30
+
+state:
+  path: /state/system.db
+  retention_days: 7
+  retention_cap: 1000
+  corpus_limit: 1000
+  retry_limit: 10
+  retry_ttl_seconds: 60
+
+pipeline:
+  profile: >-
+    No promotion interests have been configured yet. Use the private Telegram
+    preference bot to add them.
+  aliases: {}
+  hard_rules: []
+  gemini_evaluation_enabled: true
+  bm25_threshold: 2.0
+  bm25_auto_forward_threshold: 7.0
+  bm25_auto_forward_mode: "off"
+  bm25_below_threshold_audit_rate: 0.0
+  cold_start_documents: 500
+  exceptional_temperature: 300
+
+evaluator:
+  factory: promo_bot.evaluator:create_gemini_evaluator
+  settings:
+    api_key_env: GEMINI_API_KEY
+    model: system-model
+    provider_url: http://emulator:8080/v1beta/models/{model}:generateContent
+    timeout_seconds: 3
+    retries: 1
+
+sink:
+  factory: promo_bot.sink:create_telegram_sink
+  settings:
+    token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_PRIVATE_CHAT_ID
+    api_url: http://emulator:8080
+    timeout_seconds: 3
+
+preferences:
+  enabled: true
+  owner_id: 424242
+  chat_id: 424242
+  token_env: TELEGRAM_BOT_TOKEN
+  api_url: http://emulator:8080
+  polling_timeout: 1
+  queue_capacity: 20
+  rate_per_minute: 20
+  rate_per_hour: 100
+
+sources:
+  - name: pelando-system
+    factory: promo_bot.sources.pelando:create_pelando_source
+    enabled: true
+    mode: live
+    settings:
+      url: http://emulator:8080/pelando/recentes
+      interval_seconds: 0.25
+      timeout_seconds: 3

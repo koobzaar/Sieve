@@ -2,8 +2,10 @@ from decimal import Decimal
 
 from promo_bot.models import Promotion
 from promo_bot.normalization import (
+    canonical_match_tokens,
     canonicalize_url,
     expand_aliases,
+    matches_alternative,
     normalize_text,
     parse_price,
     parse_stated_price,
@@ -35,6 +37,26 @@ def test_aliases_are_bidirectional_and_phrases_become_canonical_tokens() -> None
     aliases = {"placa de video": ["gpu", "graphics card"]}
     assert "placa_de_video" in expand_aliases(tokenize("GPU barata"), aliases)
     assert "placa_de_video" in expand_aliases(tokenize("placa de vídeo barata"), aliases)
+
+
+def test_alternative_matching_normalizes_identity_without_allowing_partials() -> None:
+    aliases = {"placa de video": ["gpu", "radeon"]}
+
+    assert matches_alternative(
+        "Bosch Professional furadeira impacto sem fio",
+        "furadeira de impacto Bosch",
+    )
+    assert matches_alternative("Radeon RX 9070 XT", "GPU RX9070XT", aliases)
+    assert matches_alternative("Notebook memória 16 GB", "notebook 16GB")
+    assert matches_alternative("Câmera Sony E-mount", "camera e mount")
+    assert not matches_alternative("Radeon RX 9070", "GPU RX9070XT", aliases)
+    assert canonical_match_tokens("RX9070XT 16GB", {}) == [
+        "rx",
+        "9070",
+        "xt",
+        "16",
+        "gb",
+    ]
 
 
 def test_content_hash_ignores_tracking_links() -> None:
