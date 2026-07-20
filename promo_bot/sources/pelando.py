@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -203,16 +203,43 @@ def _consolidate_rendered_cards(
     conflicting: set[str] = set()
     for url, siblings in grouped.items():
         merged = {"url": url}
-        for field in ("id", "title", "price", "temperature"):
+        identifiers = {
+            str(card.get("id", "")).strip()
+            for card in siblings
+            if str(card.get("id", "")).strip()
+        }
+        if len(identifiers) > 1:
+            conflicting.add(url)
+            continue
+        identifier = next(iter(identifiers), "")
+        merged["id"] = identifier
+        authoritative = (
+            [card for card in siblings if str(card.get("id", "")).strip() == identifier]
+            if identifier
+            else siblings
+        )
+        ancillary = [card for card in siblings if card not in authoritative]
+        for field in ("title", "price", "temperature"):
             values = {
                 str(card.get(field, "")).strip()
-                for card in siblings
+                for card in authoritative
                 if str(card.get(field, "")).strip()
             }
             if len(values) > 1:
                 conflicting.add(url)
                 break
-            merged[field] = next(iter(values), "")
+            if values:
+                merged[field] = next(iter(values))
+                continue
+            fallback_values = {
+                str(card.get(field, "")).strip()
+                for card in ancillary
+                if str(card.get(field, "")).strip()
+            }
+            if len(fallback_values) > 1:
+                conflicting.add(url)
+                break
+            merged[field] = next(iter(fallback_values), "")
         if url not in conflicting:
             consolidated[url] = merged
     return consolidated, conflicting
@@ -246,6 +273,9 @@ def _parse_rendered_collection(
             continue
         if not url:
             skipped.append((index, "missing_url"))
+            continue
+        if not urlparse(url).path.startswith("/d/"):
+            skipped.append((index, "non_deal_item"))
             continue
         if url in conflicting_urls:
             skipped.append((index, "conflicting_duplicate_card"))

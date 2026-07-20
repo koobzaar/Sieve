@@ -104,6 +104,39 @@ def test_current_pelando_collection_page_is_paired_with_rendered_cards() -> None
     assert promotions[0].temperature == 321
 
 
+def test_current_feed_uses_id_card_and_skips_non_deal_entries(caplog) -> None:
+    deal_url = "https://www.pelando.com.br/d/current-deal"
+    html = _collection_html(
+        [
+            {
+                "name": "Review sem promoção",
+                "url": "https://www.pelando.com.br/r/review-only",
+            },
+            {"name": "Current deal", "url": deal_url},
+        ],
+        (
+            f'<a href="{deal_url}" aria-label="Current deal"><img></a>'
+            f'<a href="{deal_url}" data-deal-id="current-id">Current deal</a>'
+            '<span class="deal-card-stamp">R$ 29,90</span>'
+            '<div data-temperature-level="normal"><span>123°</span></div>'
+            f'<a href="{deal_url}#comments">4</a>'
+            f'<a href="{deal_url}" aria-label="Ver promoção">Ver promoção</a>'
+        ),
+    )
+
+    promotions = parse_feed_schema(html)
+
+    assert [promotion.id for promotion in promotions] == ["current-id"]
+    assert str(promotions[0].price) == "29.90"
+    assert promotions[0].temperature == 123
+    warning = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "pelando_items_skipped"
+    )
+    assert warning.reason_counts == {"non_deal_item": 1}
+
+
 def test_saved_current_three_anchor_fixture_merges_compatible_partial_cards() -> None:
     promotions = parse_feed_schema(
         (FIXTURES / "pelando_current_three_anchors.html").read_text(
