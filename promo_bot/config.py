@@ -19,7 +19,6 @@ class SourceConfig:
     name: str
     factory: str
     enabled: bool = True
-    mode: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
 
 
@@ -35,10 +34,8 @@ class HardFilterRule:
 @dataclass(frozen=True, slots=True)
 class PreferenceConfig:
     enabled: bool = False
-    owner_id: int | None = None
-    owner_id_env: str = "TELEGRAM_PRIVATE_CHAT_ID"
-    chat_id: int | None = None
-    chat_id_env: str = "TELEGRAM_PRIVATE_CHAT_ID"
+    admin_telegram_user_id_env: str = "TELEGRAM_ADMIN_USER_ID"
+    max_users: int = 10
     token_env: str = "TELEGRAM_BOT_TOKEN"
     api_url: str = "https://api.telegram.org"
     polling_timeout: int = 30
@@ -54,7 +51,6 @@ class PreferenceConfig:
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:
-    mode: str
     queue_capacity: int
     state_path: str
     retention_days: int
@@ -177,19 +173,45 @@ def load_config(path: str | Path) -> AppConfig:
     sources_raw = root.get("sources", [])
     if not isinstance(sources_raw, list):
         raise ConfigurationError("sources must be a list")
-    sources = tuple(
-        SourceConfig(
-            name=str(item["name"]),
-            factory=str(item["factory"]),
-            enabled=bool(item.get("enabled", True)),
-            mode=item.get("mode"),
-            settings=_mapping(item.get("settings", {}), f"source {item.get('name')} settings"),
+    if "mode" in runtime:
+        raise ConfigurationError(
+            "runtime.mode was removed; promotion delivery is always live and audible"
         )
-        for item in sources_raw
-    )
-    mode = str(runtime.get("mode", "shadow"))
-    if mode not in {"shadow", "live"}:
-        raise ConfigurationError("runtime.mode must be shadow or live")
+    removed_preferences = {
+        "owner_id",
+        "owner_id_env",
+        "chat_id",
+        "chat_id_env",
+    } & preference_raw.keys()
+    if removed_preferences:
+        key = sorted(removed_preferences)[0]
+        raise ConfigurationError(
+            f"preferences.{key} was removed; use "
+            "preferences.admin_telegram_user_id_env"
+        )
+    if "chat_id_env" in _mapping(sink.get("settings", {}), "sink.settings"):
+        raise ConfigurationError(
+            "sink.settings.chat_id_env was removed; destinations come from UUID users"
+        )
+    source_items: list[SourceConfig] = []
+    for raw_source in sources_raw:
+        item = _mapping(raw_source, "source")
+        if "mode" in item:
+            raise ConfigurationError(
+                f"source {item.get('name')} mode was removed; delivery is always live"
+            )
+        source_items.append(
+            SourceConfig(
+                name=str(item["name"]),
+                factory=str(item["factory"]),
+                enabled=bool(item.get("enabled", True)),
+                settings=_mapping(
+                    item.get("settings", {}),
+                    f"source {item.get('name')} settings",
+                ),
+            )
+        )
+    sources = tuple(source_items)
     aliases = _mapping(pipeline.get("aliases", {}), "pipeline.aliases")
     evaluator_settings = _mapping(llm.get("settings", {}), "evaluator.settings")
     if not str(evaluator_settings.get("model", "")).strip():
@@ -199,22 +221,12 @@ def load_config(path: str | Path) -> AppConfig:
     )
     preference_config = PreferenceConfig(
         enabled=bool(preference_raw.get("enabled", False)),
-        owner_id=(
-            int(preference_raw["owner_id"])
-            if preference_raw.get("owner_id") is not None
-            else None
+        admin_telegram_user_id_env=str(
+            preference_raw.get(
+                "admin_telegram_user_id_env", "TELEGRAM_ADMIN_USER_ID"
+            )
         ),
-        owner_id_env=str(
-            preference_raw.get("owner_id_env", "TELEGRAM_PRIVATE_CHAT_ID")
-        ),
-        chat_id=(
-            int(preference_raw["chat_id"])
-            if preference_raw.get("chat_id") is not None
-            else None
-        ),
-        chat_id_env=str(
-            preference_raw.get("chat_id_env", "TELEGRAM_PRIVATE_CHAT_ID")
-        ),
+        max_users=int(preference_raw.get("max_users", 10)),
         token_env=str(preference_raw.get("token_env", "TELEGRAM_BOT_TOKEN")),
         api_url=str(preference_raw.get("api_url", "https://api.telegram.org")),
         polling_timeout=int(preference_raw.get("polling_timeout", 30)),
@@ -231,6 +243,12 @@ def load_config(path: str | Path) -> AppConfig:
     )
     if not 1 <= preference_config.queue_capacity <= 100:
         raise ConfigurationError("preferences.queue_capacity must be between 1 and 100")
+    if not 1 <= preference_config.max_users <= 100:
+        raise ConfigurationError("preferences.max_users must be between 1 and 100")
+    if not preference_config.admin_telegram_user_id_env.strip():
+        raise ConfigurationError(
+            "preferences.admin_telegram_user_id_env must be nonempty"
+        )
     if not 1 <= preference_config.polling_timeout <= 50:
         raise ConfigurationError("preferences.polling_timeout must be between 1 and 50")
     if preference_config.confirmation_ttl_seconds <= 0:
@@ -280,7 +298,6 @@ def load_config(path: str | Path) -> AppConfig:
             "pipeline.bm25_below_threshold_audit_rate must be between 0 and 1"
         )
     return AppConfig(
-        mode=mode,
         queue_capacity=int(runtime.get("queue_capacity", 256)),
         state_path=str(state.get("path", "/state/sieve.db")),
         retention_days=int(state.get("retention_days", 30)),

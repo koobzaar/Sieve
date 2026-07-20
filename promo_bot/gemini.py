@@ -49,7 +49,7 @@ class GeminiStructuredClient:
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds, connect=min(10, timeout_seconds)),
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
-            headers={"User-Agent": "sieve/1.0"},
+            headers={"User-Agent": "sieve/1.1.0-beta.1"},
         )
 
     @staticmethod

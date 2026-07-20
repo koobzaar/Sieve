@@ -34,7 +34,7 @@ services:
     environment:
       GEMINI_API_KEY: system-dummy-gemini-key
       TELEGRAM_BOT_TOKEN: system-dummy-token
-      TELEGRAM_PRIVATE_CHAT_ID: "424242"
+      TELEGRAM_ADMIN_USER_ID: "424242"
     command: ["--config", "/app/config/config.yaml", "run"]
     depends_on:
       emulator:

@@ -66,7 +66,21 @@ class PipelineResult:
 @dataclass(frozen=True, slots=True)
 class RetryJob:
     id: int
+    user_id: str
     promotion: Promotion
     due_at: datetime
     expires_at: datetime
     attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryJob:
+    id: int
+    user_id: str
+    chat_id: int
+    promotion: Promotion
+    reason: str
+    language: str
+    attempts: int
+    created_at: float
+    next_attempt_at: float

@@ -13,6 +13,7 @@ from .config import ConfigurationError, env_secret, load_config
 from .logging import configure_logging
 from .replay import calibrate, load_labeled_jsonl
 from .runtime import run_service
+from .telegram_auth import authorize_with_qr
 from .telegram_smoke import (
     TelegramSmokeError,
     run_telegram_preferences_smoke,
@@ -38,7 +39,6 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("run", help="run the service")
     auth = commands.add_parser("auth-telegram", help="create/update the persisted user session")
     auth.add_argument("--source", help="configured Telegram source name")
-    auth.add_argument("--phone", help="phone number including country code")
     smoke = commands.add_parser(
         "smoke-telegram-preferences",
         help="run a non-mutating live preference-bot smoke test",
@@ -49,7 +49,6 @@ def _parser() -> argparse.ArgumentParser:
         default="/state/telegram-smoke-user",
         help="dedicated Telethon user-session path",
     )
-    smoke.add_argument("--phone", help="phone number for first-time authorization")
     smoke.add_argument(
         "--timeout",
         type=_smoke_timeout,
@@ -64,7 +63,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _auth_telegram(config_path: str, source_name: str | None, phone: str | None) -> None:
+async def _auth_telegram(config_path: str, source_name: str | None) -> None:
     from telethon import TelegramClient
 
     config = load_config(config_path)
@@ -76,20 +75,11 @@ async def _auth_telegram(config_path: str, source_name: str | None, phone: str |
     Path(session_path).parent.mkdir(parents=True, exist_ok=True)
     client = TelegramClient(session_path, api_id, api_hash)
     try:
-        await _start_telegram_client(client, phone)
+        await authorize_with_qr(client)
         me = await client.get_me()
         print(f"Authorized Telegram session for user id {me.id} at {session_path}.session")
     finally:
         await client.disconnect()
-
-
-async def _start_telegram_client(client: Any, phone: str | None) -> None:
-    # Telethon's omitted phone argument is an interactive input callback.
-    # Passing None explicitly disables that callback and raises ValueError.
-    if phone is None:
-        await client.start()
-    else:
-        await client.start(phone=phone)
 
 
 def _health(config_path: str) -> int:
@@ -104,13 +94,59 @@ def _health(config_path: str) -> int:
         row = connection.execute(
             "SELECT last_success FROM health_state WHERE name='runtime'"
         ).fetchone()
+        active_users = connection.execute(
+            "SELECT COUNT(*) FROM users WHERE status='active'"
+        ).fetchone()[0]
+        corpus_documents = connection.execute(
+            "SELECT COUNT(*) FROM corpus_docs"
+        ).fetchone()[0]
+        outbox = connection.execute(
+            "SELECT "
+            "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),"
+            "MIN(CASE WHEN status='pending' THEN created_at END),"
+            "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) "
+            "FROM delivery_outbox"
+        ).fetchone()
+        retries = connection.execute(
+            "SELECT value FROM delivery_metrics WHERE name='retries'"
+        ).fetchone()
         connection.close()
     except sqlite3.Error as exc:
         print(json.dumps({"healthy": False, "reason": f"database error: {exc}"}))
         return 1
     age = time.time() - float(row[0]) if row and row[0] else None
     healthy = check == "ok" and age is not None and age < 180
-    print(json.dumps({"healthy": healthy, "database": check, "heartbeat_age_seconds": age}))
+    oldest_age = (
+        max(0.0, time.time() - float(outbox[1]))
+        if outbox and outbox[1] is not None
+        else None
+    )
+    print(
+        json.dumps(
+            {
+                "healthy": healthy,
+                "database": check,
+                "heartbeat_age_seconds": age,
+                "active_users": int(active_users),
+                "corpus": {
+                    "documents": int(corpus_documents),
+                    "cold_start_documents": config.cold_start_documents,
+                    "readiness": (
+                        "ready"
+                        if int(corpus_documents) >= config.cold_start_documents
+                        else "warming"
+                    ),
+                },
+                "outbox": {
+                    "depth": int(outbox[0] or 0),
+                    "oldest_age_seconds": oldest_age,
+                    "failed": int(outbox[2] or 0),
+                    "retries": int(retries[0]) if retries else 0,
+                },
+                "queues": {"promotions": None, "preferences": None},
+            }
+        )
+    )
     return 0 if healthy else 1
 
 
@@ -121,7 +157,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "run":
             asyncio.run(run_service(load_config(args.config)))
         elif args.command == "auth-telegram":
-            asyncio.run(_auth_telegram(args.config, args.source, args.phone))
+            asyncio.run(_auth_telegram(args.config, args.source))
         elif args.command == "smoke-telegram-preferences":
             try:
                 report = asyncio.run(
@@ -129,7 +165,6 @@ def main(argv: list[str] | None = None) -> None:
                         load_config(args.config),
                         source_name=args.source,
                         session_path=args.session_path,
-                        phone=args.phone,
                         timeout_seconds=args.timeout,
                     )
                 )

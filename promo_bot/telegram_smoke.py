@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import AppConfig, ConfigurationError, SourceConfig, env_secret
 from .preference_bot import TelegramBotAPI, TelegramBotError
+from .telegram_auth import authorize_with_qr
 
 
 class TelegramSmokeError(RuntimeError):
@@ -38,13 +39,6 @@ def _default_client_factory(session_path: str, api_id: int, api_hash: str) -> An
     return TelegramClient(session_path, api_id, api_hash)
 
 
-async def _start_client(client: Any, phone: str | None) -> None:
-    if phone is None:
-        await client.start()
-    else:
-        await client.start(phone=phone)
-
-
 def _message_text(message: Any) -> str:
     return str(
         getattr(message, "raw_text", None)
@@ -68,7 +62,6 @@ async def run_telegram_preferences_smoke(
     *,
     source_name: str | None,
     session_path: str,
-    phone: str | None,
     timeout_seconds: float,
     client_factory: Callable[[str, int, str], Any] | None = None,
     bot_api_factory: Callable[..., TelegramBotAPI] | None = None,
@@ -88,17 +81,17 @@ async def run_telegram_preferences_smoke(
         )
 
     try:
-        owner_id = (
-            config.preferences.owner_id
-            if config.preferences.owner_id is not None
-            else int(env_secret(config.preferences.owner_id_env))
+        owner_id = int(
+            env_secret(
+                config.preferences.admin_telegram_user_id_env
+            )
         )
         api_id = int(
             env_secret(str(source.settings.get("api_id_env", "TELEGRAM_API_ID")))
         )
     except ValueError as exc:
         raise TelegramSmokeError(
-            "the configured Telegram owner and API ID must be integers"
+            "the configured Telegram administrator and API ID must be integers"
         ) from exc
     api_hash = env_secret(
         str(source.settings.get("api_hash_env", "TELEGRAM_API_HASH"))
@@ -117,7 +110,7 @@ async def run_telegram_preferences_smoke(
             api_url=config.preferences.api_url,
             timeout_seconds=timeout_seconds,
         )
-        await _start_client(client, phone)
+        await authorize_with_qr(client)
         me = await client.get_me()
         if int(getattr(me, "id", 0)) != owner_id:
             raise TelegramSmokeError(

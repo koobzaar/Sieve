@@ -6,7 +6,6 @@ __pycache__/
 htmlcov/
 .venv/
 .env
-/config/config.yaml
 /config/config.local.yaml
 state/
 *.session

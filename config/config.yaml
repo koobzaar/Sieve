@@ -1,5 +1,4 @@
 runtime:
-  mode: shadow
   queue_capacity: 256
   memory_limit_mb: 220
   failure_alert_threshold: 3
@@ -29,11 +28,7 @@ pipeline:
     - id: prohibited_promotions
       priority: 100
       action: deny
-      any:
-        - aposta
-        - cassino
-        - bet
-        - renda extra
+      any: [aposta, cassino, bet, renda extra]
 
 evaluator:
   factory: promo_bot.evaluator:create_gemini_evaluator
@@ -47,8 +42,8 @@ evaluator:
 
 preferences:
   enabled: false
-  owner_id_env: TELEGRAM_PRIVATE_CHAT_ID
-  chat_id_env: TELEGRAM_PRIVATE_CHAT_ID
+  admin_telegram_user_id_env: TELEGRAM_ADMIN_USER_ID
+  max_users: 10
   token_env: TELEGRAM_BOT_TOKEN
   api_url: https://api.telegram.org
   polling_timeout: 30
@@ -65,7 +60,6 @@ sink:
   factory: promo_bot.sink:create_telegram_sink
   settings:
     token_env: TELEGRAM_BOT_TOKEN
-    chat_id_env: TELEGRAM_PRIVATE_CHAT_ID
     api_url: https://api.telegram.org
     timeout_seconds: 15
 
@@ -73,7 +67,6 @@ sources:
   - name: telegram-principal
     factory: promo_bot.sources.telegram:create_telegram_source
     enabled: false
-    mode: shadow
     settings:
       api_id_env: TELEGRAM_API_ID
       api_hash_env: TELEGRAM_API_HASH
@@ -83,9 +76,8 @@ sources:
   - name: pelando
     factory: promo_bot.sources.pelando:create_pelando_source
     enabled: false
-    mode: shadow
     settings:
       url: https://www.pelando.com.br/recentes
       interval_seconds: 120
       timeout_seconds: 20
-      user_agent: sieve/1.0 (+private-use)
+      user_agent: sieve/1.1.0-beta.1 (+private-use)

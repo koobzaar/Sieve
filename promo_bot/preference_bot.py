@@ -31,32 +31,65 @@ from .preferences import (
 )
 from .protocols import PreferenceInterpreter
 from .telegram_formatter import TelegramFormatter
+from .tenancy import InvitationError, MembershipError, UnauthorizedMembershipError, User
+from .translation import translations
 
 logger = logging.getLogger(__name__)
 
-BOT_COMMANDS_EN: tuple[dict[str, str], ...] = (
-    {"command": "start", "description": "Open the welcome screen"},
-    {"command": "preferences", "description": "Review your current preferences"},
-    {"command": "history", "description": "Review recent changes"},
-    {"command": "preview", "description": "Test a change without saving"},
-    {"command": "undo", "description": "Reverse the latest change"},
-    {"command": "language", "description": "Choose English or Portuguese"},
-    {"command": "help", "description": "Learn how to use Sieve"},
-)
-BOT_COMMANDS_PT_BR: tuple[dict[str, str], ...] = (
-    {"command": "start", "description": "Abrir a tela de boas-vindas"},
-    {"command": "preferences", "description": "Revisar suas preferências atuais"},
-    {"command": "history", "description": "Revisar alterações recentes"},
-    {"command": "preview", "description": "Testar uma mudança sem salvar"},
-    {"command": "undo", "description": "Desfazer a última alteração"},
-    {"command": "language", "description": "Escolher inglês ou português"},
-    {"command": "help", "description": "Aprender a usar o Sieve"},
-)
+def _bot_commands(locale: str) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {
+            "command": command,
+            "description": translations.translate(
+                f"command.{command}", locale=locale
+            ),
+        }
+        for command in (
+            "start",
+            "account",
+            "preferences",
+            "history",
+            "preview",
+            "undo",
+            "language",
+            "help",
+        )
+    )
+
+
+BOT_COMMANDS_EN = _bot_commands("en")
+BOT_COMMANDS_PT_BR = _bot_commands("pt-BR")
 BOT_COMMANDS = BOT_COMMANDS_EN
 
 
 class TelegramBotError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str | None = None,
+        category: str | None = None,
+        status_code: int | None = None,
+        error_code: int | None = None,
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.method = method
+        self.category = category
+        self.status_code = status_code
+        self.error_code = error_code
+        self.retry_after = retry_after
+
+    def log_fields(self) -> dict[str, Any]:
+        return {
+            "error": str(self),
+            "error_type": type(self).__name__,
+            "telegram_method": self.method,
+            "failure_category": self.category,
+            "http_status": self.status_code,
+            "telegram_error_code": self.error_code,
+            "retry_after_seconds": self.retry_after,
+        }
 
 
 class WebhookConflictError(TelegramBotError):
@@ -77,21 +110,84 @@ class TelegramBotAPI:
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds, connect=min(10, timeout_seconds)),
             limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
-            headers={"User-Agent": "sieve/1.0"},
+            headers={"User-Agent": "sieve/1.1.0-beta.1"},
         )
 
     async def _call(self, method: str, payload: Mapping[str, Any]) -> Any:
         try:
             response = await self.client.post(f"{self.base_url}/{method}", json=dict(payload))
-            response.raise_for_status()
-            body = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.RequestError as exc:
             raise TelegramBotError(
-                f"Telegram {method} transport failure: {type(exc).__name__}"
+                f"Telegram {method} network failure: {type(exc).__name__}",
+                method=method,
+                category="network",
             ) from exc
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            category = "http_status" if response.is_error else "invalid_json"
+            raise TelegramBotError(
+                f"Telegram {method} HTTP {response.status_code}: invalid JSON response",
+                method=method,
+                category=category,
+                status_code=response.status_code,
+            ) from exc
+
+        description = "invalid response"
+        error_code: int | None = None
+        retry_after: int | None = None
+        if isinstance(body, dict):
+            description = " ".join(
+                str(body.get("description", "invalid response")).split()
+            )[:300]
+            try:
+                error_code = int(body["error_code"])
+            except (KeyError, TypeError, ValueError):
+                error_code = None
+            parameters = body.get("parameters")
+            if isinstance(parameters, Mapping):
+                try:
+                    retry_after = int(parameters["retry_after"])
+                except (KeyError, TypeError, ValueError):
+                    retry_after = None
+
+        telegram_category = (
+            "message_not_modified"
+            if method == "editMessageText"
+            and "message is not modified" in description.casefold()
+            else "edit_target_unavailable"
+            if method == "editMessageText"
+            and any(
+                marker in description.casefold()
+                for marker in (
+                    "message to edit not found",
+                    "message can't be edited",
+                    "message can not be edited",
+                    "message identifier is not specified",
+                )
+            )
+            else None
+        )
+
+        if response.is_error:
+            raise TelegramBotError(
+                f"Telegram {method} HTTP {response.status_code}: {description}",
+                method=method,
+                category=telegram_category or "http_status",
+                status_code=response.status_code,
+                error_code=error_code,
+                retry_after=retry_after,
+            )
         if not isinstance(body, dict) or not body.get("ok"):
-            description = body.get("description", "invalid response") if isinstance(body, dict) else "invalid response"
-            raise TelegramBotError(f"Telegram {method} failed: {description}")
+            raise TelegramBotError(
+                f"Telegram {method} API failure: {description}",
+                method=method,
+                category=telegram_category or "api_response",
+                status_code=response.status_code,
+                error_code=error_code,
+                retry_after=retry_after,
+            )
         return body.get("result")
 
     async def get_webhook_info(self) -> dict[str, Any]:
@@ -135,15 +231,51 @@ class TelegramBotAPI:
         parse_mode: str | None = None,
     ) -> Any:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        payload["link_preview_options"] = {"is_disabled": True}
         if parse_mode is not None:
             payload["parse_mode"] = parse_mode
-            payload["link_preview_options"] = {"is_disabled": True}
         if reply_markup is not None:
             payload["reply_markup"] = dict(reply_markup)
         return await self._call("sendMessage", payload)
 
-    async def answer_callback_query(self, callback_query_id: str) -> Any:
-        return await self._call("answerCallbackQuery", {"callback_query_id": callback_query_id})
+    async def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: Mapping[str, Any] | None = None,
+        parse_mode: str | None = None,
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "link_preview_options": {"is_disabled": True},
+        }
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = dict(reply_markup)
+        return await self._call("editMessageText", payload)
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str | None = None,
+        show_alert: bool = False,
+        cache_time: int = 0,
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "cache_time": max(0, cache_time),
+        }
+        if text is not None:
+            payload["text"] = text[:200]
+        if show_alert:
+            payload["show_alert"] = True
+        return await self._call("answerCallbackQuery", payload)
 
     async def set_my_commands(
         self,
@@ -184,6 +316,9 @@ class PreferenceCommandProcessor:
         rate_per_minute: int = 5,
         rate_per_hour: int = 20,
         timezone_name: str = "America/Sao_Paulo",
+        account: User | None = None,
+        membership_state: Any | None = None,
+        ephemeral_replies: list[OutboxReply] | None = None,
     ) -> None:
         self.store = store
         self.interpreter = interpreter
@@ -192,11 +327,35 @@ class PreferenceCommandProcessor:
         self.rate_per_minute = rate_per_minute
         self.rate_per_hour = rate_per_hour
         self.zone = ZoneInfo(timezone_name)
+        self.account = account
+        self.membership_state = membership_state
+        self.ephemeral_replies = ephemeral_replies
+        self.account_id = account.id if account is not None else store.user_id
+        self.account_role = (
+            account.role
+            if account is not None
+            else "admin"
+            if store.is_admin
+            else "member"
+        )
+        self.account_status = account.status if account is not None else "active"
+        self.is_admin = self.account_role == "admin"
+        self.can_admin_members = (
+            self.is_admin and self.membership_state is not None
+        )
 
     @staticmethod
     def _envelope(
         update: Mapping[str, Any],
-    ) -> tuple[int, int | None, int | None, str, str | None, str | None]:
+    ) -> tuple[
+        int,
+        int | None,
+        int | None,
+        str,
+        str | None,
+        str | None,
+        int | None,
+    ]:
         update_id = int(update.get("update_id", -1))
         callback = update.get("callback_query")
         if isinstance(callback, Mapping):
@@ -212,6 +371,12 @@ class PreferenceCommandProcessor:
                 str(sender.get("language_code", "")) or None
                 if isinstance(sender, Mapping)
                 else None,
+                (
+                    int(message["message_id"])
+                    if isinstance(message, Mapping)
+                    and "message_id" in message
+                    else None
+                ),
             )
         message = update.get("message")
         if isinstance(message, Mapping):
@@ -226,8 +391,9 @@ class PreferenceCommandProcessor:
                 str(sender.get("language_code", "")) or None
                 if isinstance(sender, Mapping)
                 else None,
+                None,
             )
-        return update_id, None, None, "", None, None
+        return update_id, None, None, "", None, None, None
 
     def _reply(
         self,
@@ -236,13 +402,24 @@ class PreferenceCommandProcessor:
         callback_query_id: str | None = None,
         reply_markup: Mapping[str, Any] | None = None,
         parse_mode: str | None = "HTML",
+        operation: str = "send",
+        target_message_id: int | None = None,
     ) -> OutboxReply:
+        resolved_operation = (
+            "edit"
+            if operation == "edit" and target_message_id is not None
+            else "send"
+        )
         return OutboxReply(
             chat_id=self.owner_chat_id,
             text=text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
             callback_query_id=callback_query_id,
+            operation=resolved_operation,
+            target_message_id=(
+                target_message_id if resolved_operation == "edit" else None
+            ),
         )
 
     def _ui(self, actor_id: int) -> TelegramFormatter:
@@ -253,7 +430,11 @@ class PreferenceCommandProcessor:
     ) -> tuple[str, dict[str, Any]]:
         ui = self._ui(actor_id)
         text, page, pages = ui.preferences(self.store.current_snapshot(), page)
-        return text, ui.menu_markup(preference_page=page, preference_pages=pages)
+        return text, ui.menu_markup(
+            preference_page=page,
+            preference_pages=pages,
+            is_admin=self.can_admin_members,
+        )
 
     @staticmethod
     def _deterministic_text_intent(text: str) -> str | None:
@@ -300,6 +481,8 @@ class PreferenceCommandProcessor:
         reply_markup: Mapping[str, Any] | None = None,
         parse_mode: str | None = "HTML",
         clear_clarification: bool = False,
+        operation: str = "send",
+        target_message_id: int | None = None,
     ) -> None:
         self.store.record_update(
             update_id,
@@ -311,6 +494,8 @@ class PreferenceCommandProcessor:
                 callback_query_id=callback_query_id,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode,
+                operation=operation,
+                target_message_id=target_message_id,
             ),
             clear_clarification=clear_clarification,
         )
@@ -323,6 +508,7 @@ class PreferenceCommandProcessor:
         actor_id: int,
         original: str,
         callback_query_id: str | None,
+        target_message_id: int | None = None,
     ) -> None:
         ui = self._ui(actor_id)
         try:
@@ -336,9 +522,11 @@ class PreferenceCommandProcessor:
                 reply=self._reply(
                     ui.applied(
                         revision,
-                        ui.pick("Confirmed change", "Alteração confirmada"),
+                        ui.t("summary.confirmed"),
                     ),
                     callback_query_id=callback_query_id,
+                    operation="edit",
+                    target_message_id=target_message_id,
                 ),
             )
         except ConfirmationExpiredError:
@@ -347,31 +535,21 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "confirmation_expired",
-                ui.notice(
-                    "Confirmation expired",
-                    "Confirmação expirada",
-                    "This request was not applied.",
-                    "Esta solicitação não foi aplicada.",
-                    next_en="Send the original instruction again to create a new request.",
-                    next_pt="Envie a instrução original novamente para criar uma nova solicitação.",
-                ),
+                ui.notice_key("expired"),
                 callback_query_id=callback_query_id,
+                operation="edit",
+                target_message_id=target_message_id,
             )
-        except (ConfirmationError, StaleRevisionError) as exc:
+        except (ConfirmationError, StaleRevisionError):
             self._record_reply(
                 update_id,
                 actor_id,
                 original,
                 "confirmation_invalid",
-                ui.notice(
-                    "Confirmation unavailable",
-                    "Confirmação indisponível",
-                    f"The request could not be confirmed: {escape(str(exc))}",
-                    f"A solicitação não pôde ser confirmada: {escape(str(exc))}",
-                    next_en="Open Preferences to review the current state.",
-                    next_pt="Abra Preferências para revisar o estado atual.",
-                ),
+                ui.notice_key("confirmation_unavailable"),
                 callback_query_id=callback_query_id,
+                operation="edit",
+                target_message_id=target_message_id,
             )
 
     def _cancel(
@@ -382,6 +560,7 @@ class PreferenceCommandProcessor:
         actor_id: int,
         original: str,
         callback_query_id: str | None,
+        target_message_id: int | None = None,
     ) -> None:
         ui = self._ui(actor_id)
         try:
@@ -391,28 +570,22 @@ class PreferenceCommandProcessor:
                 update_id=update_id,
                 original_message=original,
                 reply=self._reply(
-                    ui.notice(
-                        "Change cancelled",
-                        "Alteração cancelada",
-                        "Nothing was changed.",
-                        "Nada foi alterado.",
-                    ),
+                    ui.notice_key("cancelled"),
                     callback_query_id=callback_query_id,
+                    operation="edit",
+                    target_message_id=target_message_id,
                 ),
             )
-        except ConfirmationError as exc:
+        except ConfirmationError:
             self._record_reply(
                 update_id,
                 actor_id,
                 original,
                 "confirmation_invalid",
-                ui.notice(
-                    "Cancellation unavailable",
-                    "Cancelamento indisponível",
-                    f"The request could not be cancelled: {escape(str(exc))}",
-                    f"A solicitação não pôde ser cancelada: {escape(str(exc))}",
-                ),
+                ui.notice_key("cancellation_unavailable"),
                 callback_query_id=callback_query_id,
+                operation="edit",
+                target_message_id=target_message_id,
             )
 
     def _pending(
@@ -465,14 +638,12 @@ class PreferenceCommandProcessor:
                 actor_id=actor_id,
                 update_id=update_id,
                 original=original,
-                summary=ui.pick(
-                    f"Reverse the latest change and restore revision {target_revision}.",
-                    f"Desfazer a última mudança e restaurar a revisão {target_revision}.",
+                summary=ui.t(
+                    "summary.undo", revision=target_revision
                 ),
                 target_revision=target_revision,
-                detail=ui.pick(
-                    f"{count} preferences will be affected.",
-                    f"{count} preferências serão afetadas.",
+                detail=ui.t(
+                    "summary.undo_detail", count=count
                 ),
             )
             return
@@ -482,14 +653,13 @@ class PreferenceCommandProcessor:
             original_message=original,
             actor_id=actor_id,
             update_id=update_id,
-            summary=ui.pick(
-                f"Undo to revision {target_revision}",
-                f"Desfazer para a revisão {target_revision}",
+            summary=ui.t(
+                "summary.undo_audit", revision=target_revision
             ),
             reply=self._reply(
                 ui.applied(
                     current.revision + 1,
-                    ui.pick("Latest change reversed", "Última mudança desfeita"),
+                    ui.t("summary.undo_applied"),
                 )
             ),
         )
@@ -517,14 +687,12 @@ class PreferenceCommandProcessor:
             actor_id=actor_id,
             update_id=update_id,
             original=original,
-            summary=ui.pick(
-                f"Restore the state from revision {target_revision}, before local midnight.",
-                f"Restaurar o estado da revisão {target_revision}, anterior à meia-noite local.",
+            summary=ui.t(
+                "summary.revert", revision=target_revision
             ),
             target_revision=target_revision,
-            detail=ui.pick(
-                f"Preview: {count} preferences will be affected.",
-                f"Prévia: {count} preferências serão afetadas.",
+            detail=ui.t(
+                "summary.revert_detail", count=count
             ),
         )
 
@@ -555,13 +723,13 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "rate_limited",
-                ui.notice(
-                    "AI command limit reached",
-                    "Limite de comandos de IA atingido",
-                    f"The {escape(str(window))} safety limit has been reached.",
-                    f"O limite de segurança de {escape(str(window))} foi atingido.",
-                    next_en="Wait a little and try again. Reviews and confirmations still work.",
-                    next_pt="Aguarde um pouco e tente novamente. Consultas e confirmações continuam funcionando.",
+                ui.notice_key(
+                    "rate_limit",
+                    window=ui.t(
+                        "rate.minute"
+                        if window == "minute"
+                        else "rate.hour"
+                    ),
                 ),
             )
             return
@@ -593,7 +761,7 @@ class PreferenceCommandProcessor:
                         "preview",
                         ui.preview(
                             proposal.summary
-                            or ui.pick("Valid preference change", "Alteração válida"),
+                            or ui.t("summary.valid_change"),
                             snapshot.revision,
                             len(operations),
                             len(candidate.entries),
@@ -611,7 +779,7 @@ class PreferenceCommandProcessor:
                         update_id=update_id,
                         original=original,
                         summary=proposal.summary
-                        or ui.pick("Preference change", "Alteração de preferências"),
+                        or ui.t("summary.preference_change"),
                         detail=ui.reason_for_confirmation(reason),
                     )
                     return
@@ -622,12 +790,12 @@ class PreferenceCommandProcessor:
                     actor_id=actor_id,
                     update_id=update_id,
                     summary=proposal.summary
-                    or ui.pick("Preference change", "Alteração de preferências"),
+                    or ui.t("summary.preference_change"),
                     reply=self._reply(
                         ui.applied(
                             snapshot.revision + 1,
                             proposal.summary
-                            or ui.pick("Change applied", "Alteração aplicada"),
+                            or ui.t("summary.change_applied"),
                         )
                     ),
                 )
@@ -635,10 +803,7 @@ class PreferenceCommandProcessor:
             if proposal.intent == PreferenceIntent.CLARIFY:
                 question = (
                     proposal.clarification_question
-                    or ui.pick(
-                        "Please clarify the preference you want to change.",
-                        "Esclareça a preferência que deseja alterar.",
-                    )
+                    or ui.t("clarification.default")
                 )
                 if pending is None:
                     context = PreferenceClarificationContext(
@@ -653,26 +818,13 @@ class PreferenceCommandProcessor:
                         actor_id,
                         original,
                         "clarification_limit",
-                        ui.notice(
-                            "I still need more detail",
-                            "Ainda preciso de mais detalhes",
-                            "I could not complete this request after several questions. "
-                            "Nothing was changed.",
-                            "Não consegui concluir esta solicitação após várias perguntas. "
-                            "Nada foi alterado.",
-                            next_en="Send one complete instruction with the product and any required limits.",
-                            next_pt="Envie uma instrução completa com o produto e os limites necessários.",
-                        ),
+                        ui.notice_key("clarification_limit"),
                         clear_clarification=True,
                     )
                     return
-                text = ui.notice(
-                    "I need one detail",
-                    "Preciso de um detalhe",
-                    escape(question),
-                    escape(question),
-                    next_en="Reply naturally, or send “cancel” to abandon this request.",
-                    next_pt="Responda naturalmente ou envie “cancelar” para abandonar esta solicitação.",
+                text = ui.notice_key(
+                    "clarification",
+                    body=escape(question),
                 )
                 self.store.save_clarification(
                     context,
@@ -689,22 +841,24 @@ class PreferenceCommandProcessor:
                 if proposal.intent == PreferenceIntent.UNDO:
                     target, target_revision = self.store.undo_target()
                     count = changed_entry_count(snapshot, target)
-                    text = ui.pick(
-                        f"Undo would restore revision {target_revision} and affect {count} preferences.",
-                        f"Desfazer restauraria a revisão {target_revision} e afetaria {count} preferências.",
+                    text = ui.t(
+                        "summary.preview_undo",
+                        count=count,
+                        revision=target_revision,
                     )
                 elif proposal.intent == PreferenceIntent.REVERT:
                     target, target_revision = self._select_revert_target(instruction)
                     count = changed_entry_count(snapshot, target)
-                    text = ui.pick(
-                        f"The restore would use revision {target_revision} and affect {count} preferences.",
-                        f"A restauração usaria a revisão {target_revision} e afetaria {count} preferências.",
+                    text = ui.t(
+                        "summary.preview_revert",
+                        count=count,
+                        revision=target_revision,
                     )
                 else:
                     text = proposal.clarification_question or proposal.summary or (
-                        ui.pick(
-                            f"The instruction was interpreted as {proposal.intent.value}.",
-                            f"A instrução foi interpretada como {proposal.intent.value}.",
+                        ui.t(
+                            "summary.interpreted",
+                            intent=proposal.intent.value,
                         )
                     )
                 self._record_reply(
@@ -712,11 +866,9 @@ class PreferenceCommandProcessor:
                     actor_id,
                     original,
                     "preview",
-                    ui.notice(
-                        "Preview only — nothing was saved",
-                        "Somente prévia — nada foi salvo",
-                        escape(text),
-                        escape(text),
+                    ui.notice_key(
+                        "preview",
+                        body=escape(text),
                     ),
                     clear_clarification=stored_pending is not None,
                 )
@@ -733,11 +885,13 @@ class PreferenceCommandProcessor:
                 text, markup = self._preferences_screen(actor_id)
                 outcome = "query"
             else:
-                text = ui.notice(
-                    "No change requested",
-                    "Nenhuma alteração solicitada",
-                    escape(proposal.summary or "Your preferences were not changed."),
-                    escape(proposal.summary or "Suas preferências não foram alteradas."),
+                text = ui.notice_key(
+                    "noop",
+                    body=(
+                        escape(proposal.summary)
+                        if proposal.summary
+                        else None
+                    ),
                 )
                 outcome = "noop"
             self._record_reply(
@@ -751,7 +905,7 @@ class PreferenceCommandProcessor:
                 ),
                 clear_clarification=stored_pending is not None,
             )
-        except (PreferenceError, StaleRevisionError) as exc:
+        except (PreferenceError, StaleRevisionError):
             if not consumed:
                 self.store.record_rate_event(actor_id)
             self._record_reply(
@@ -759,14 +913,7 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "clarify",
-                ui.notice(
-                    "I could not validate that request",
-                    "Não consegui validar a solicitação",
-                    f"No change was made. Details: {escape(str(exc))}",
-                    f"Nenhuma mudança foi feita. Detalhes: {escape(str(exc))}",
-                    next_en="Rephrase it with one product, action, and any limit you need.",
-                    next_pt="Reescreva com um produto, uma ação e o limite desejado.",
-                ),
+                ui.notice_key("validation"),
             )
         except GeminiError as exc:
             if not consumed:
@@ -785,14 +932,7 @@ class PreferenceCommandProcessor:
                 actor_id,
                 original,
                 "parser_failure",
-                ui.notice(
-                    "I could not interpret that request",
-                    "Não consegui interpretar a solicitação",
-                    "The AI service did not return a usable answer. Nothing was changed.",
-                    "O serviço de IA não retornou uma resposta utilizável. Nada foi alterado.",
-                    next_en="Try again in a moment, or use /preferences to review the current state.",
-                    next_pt="Tente novamente em instantes ou use /preferences para revisar o estado atual.",
-                ),
+                ui.notice_key("parser"),
             )
 
     async def process_update(self, update: Mapping[str, Any]) -> None:
@@ -803,6 +943,7 @@ class PreferenceCommandProcessor:
             text,
             callback_query_id,
             telegram_language,
+            target_message_id,
         ) = self._envelope(update)
         if update_id < 0:
             return
@@ -819,22 +960,27 @@ class PreferenceCommandProcessor:
         assert actor_id is not None
         self.store.ensure_ui_language(actor_id, telegram_language)
         ui = self._ui(actor_id)
+        if text.casefold() == "pref:noop":
+            self.store.record_update(
+                update_id,
+                outcome="callback_noop",
+                actor_id=actor_id,
+                command="pref:noop",
+            )
+            return
         if not text.strip():
             self._record_reply(
                 update_id,
                 actor_id,
                 text,
                 "ignored",
-                ui.notice(
-                    "Text message needed",
-                    "É necessária uma mensagem de texto",
-                    "This interface understands text instructions and the buttons below.",
-                    "Esta interface entende instruções de texto e os botões abaixo.",
-                    next_en="Select Help to see examples.",
-                    next_pt="Escolha Ajuda para ver exemplos.",
-                ),
+                ui.notice_key("text_required"),
                 callback_query_id=callback_query_id,
-                reply_markup=ui.menu_markup(),
+                reply_markup=ui.menu_markup(
+                    is_admin=self.can_admin_members
+                ),
+                operation="edit",
+                target_message_id=target_message_id,
             )
             return
 
@@ -850,12 +996,7 @@ class PreferenceCommandProcessor:
                 actor_id,
                 text,
                 "clarification_cancelled",
-                ui.notice(
-                    "Request cancelled",
-                    "Solicitação cancelada",
-                    "The pending preference request was discarded. Nothing was changed.",
-                    "A solicitação de preferência pendente foi descartada. Nada foi alterado.",
-                ),
+                ui.notice_key("request_cancelled"),
                 callback_query_id=callback_query_id,
                 clear_clarification=True,
             )
@@ -871,6 +1012,7 @@ class PreferenceCommandProcessor:
                     actor_id=actor_id,
                     original=text,
                     callback_query_id=callback_query_id,
+                    target_message_id=target_message_id,
                 )
             else:
                 self._cancel(
@@ -879,10 +1021,13 @@ class PreferenceCommandProcessor:
                     actor_id=actor_id,
                     original=text,
                     callback_query_id=callback_query_id,
+                    target_message_id=target_message_id,
                 )
             return
 
-        language_match = re.fullmatch(r"pref:language:(en|pt-br)", text.casefold())
+        language_match = re.fullmatch(
+            r"pref:language:([a-z0-9_-]{2,20})", text.casefold()
+        )
         if language_match:
             self.store.set_ui_language(actor_id, language_match.group(1))
             ui = self._ui(actor_id)
@@ -893,7 +1038,11 @@ class PreferenceCommandProcessor:
                 "language_changed",
                 ui.language_changed(),
                 callback_query_id=callback_query_id,
-                reply_markup=ui.menu_markup(),
+                reply_markup=ui.menu_markup(
+                    is_admin=self.can_admin_members
+                ),
+                operation="edit",
+                target_message_id=target_message_id,
             )
             return
 
@@ -910,22 +1059,53 @@ class PreferenceCommandProcessor:
                 rendered,
                 callback_query_id=callback_query_id,
                 reply_markup=markup,
+                operation="edit",
+                target_message_id=target_message_id,
             )
             return
 
         menu_match = re.fullmatch(
-            r"pref:menu:(preferences|history|help|language)", text.casefold()
+            r"pref:menu:(home|preferences|history|help|language|account|members)",
+            text.casefold(),
         )
         if menu_match:
             destination = menu_match.group(1)
-            if destination == "preferences":
+            if destination == "home":
+                rendered = ui.home(
+                    self.store.current_snapshot(),
+                    is_admin=self.can_admin_members,
+                )
+                markup = ui.menu_markup(
+                    is_admin=self.can_admin_members
+                )
+            elif destination == "preferences":
                 rendered, markup = self._preferences_screen(actor_id)
             elif destination == "history":
-                rendered, markup = self._history_text(actor_id), ui.menu_markup()
+                rendered, markup = (
+                    self._history_text(actor_id),
+                    ui.menu_markup(screen="history"),
+                )
             elif destination == "language":
                 rendered, markup = ui.language_screen(), ui.language_markup()
+            elif destination == "account":
+                rendered = ui.account(
+                    self.account_id,
+                    self.account_role,
+                    self.account_status,
+                )
+                markup = ui.menu_markup(screen="account")
+            elif (
+                destination == "members"
+                and self.can_admin_members
+            ):
+                members = self.membership_state.list_users(
+                    self.account_id
+                )
+                rendered = ui.members(members)
+                markup = ui.members_markup(members)
             else:
-                rendered, markup = ui.help(self.store.current_snapshot()), ui.menu_markup()
+                rendered = ui.help(self.store.current_snapshot())
+                markup = ui.menu_markup(screen="help")
             self._record_reply(
                 update_id,
                 actor_id,
@@ -934,6 +1114,84 @@ class PreferenceCommandProcessor:
                 rendered,
                 callback_query_id=callback_query_id,
                 reply_markup=markup,
+                operation="edit",
+                target_message_id=target_message_id,
+            )
+            return
+
+        if text.casefold() == "pref:invite":
+            if (
+                not self.can_admin_members
+                or self.ephemeral_replies is None
+            ):
+                self._record_reply(
+                    update_id,
+                    actor_id,
+                    text,
+                    "admin_required",
+                    ui.notice_key("admin_required"),
+                    operation="edit",
+                    target_message_id=target_message_id,
+                )
+                return
+            token = self.membership_state.create_invitation(
+                self.account_id
+            )
+            self.ephemeral_replies.append(
+                OutboxReply(
+                    chat_id=self.owner_chat_id,
+                    text=ui.invitation(token),
+                    parse_mode="HTML",
+                )
+            )
+            self.store.record_update(
+                update_id,
+                outcome="invitation_created",
+                actor_id=actor_id,
+                command="pref:invite",
+            )
+            return
+
+        member_match = re.fullmatch(
+            r"pref:member:(enable|disable):"
+            r"([0-9a-f]{8}-[0-9a-f-]{27})",
+            text.casefold(),
+        )
+        if member_match:
+            action, member_id = member_match.groups()
+            try:
+                if not self.can_admin_members:
+                    raise UnauthorizedMembershipError(
+                        "administrator required"
+                    )
+                if action == "enable":
+                    self.membership_state.enable_user(
+                        self.account_id, member_id
+                    )
+                else:
+                    self.membership_state.disable_user(
+                        self.account_id, member_id
+                    )
+                members = self.membership_state.list_users(
+                    self.account_id
+                )
+                rendered = ui.members(members)
+                markup = ui.members_markup(members)
+                outcome = action
+            except (MembershipError, UnauthorizedMembershipError):
+                rendered = ui.notice_key("membership_error")
+                markup = ui.menu_markup(screen="members")
+                outcome = "membership_error"
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                outcome,
+                rendered,
+                callback_query_id=callback_query_id,
+                reply_markup=markup,
+                operation="edit",
+                target_message_id=target_message_id,
             )
             return
 
@@ -945,8 +1203,13 @@ class PreferenceCommandProcessor:
                 actor_id,
                 text,
                 "start",
-                ui.home(self.store.current_snapshot()),
-                reply_markup=ui.menu_markup(),
+                ui.home(
+                    self.store.current_snapshot(),
+                    is_admin=self.can_admin_members,
+                ),
+                reply_markup=ui.menu_markup(
+                    is_admin=self.can_admin_members
+                ),
             )
             return
         if command == "/help" or deterministic_intent == "help":
@@ -956,7 +1219,21 @@ class PreferenceCommandProcessor:
                 text,
                 "help",
                 ui.help(self.store.current_snapshot()),
-                reply_markup=ui.menu_markup(),
+                reply_markup=ui.menu_markup(screen="help"),
+            )
+            return
+        if command == "/account":
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                "account",
+                ui.account(
+                    self.account_id,
+                    self.account_role,
+                    self.account_status,
+                ),
+                reply_markup=ui.menu_markup(screen="account"),
             )
             return
         if command in {"/preferences", "/preferencias", "/prefs"} or (
@@ -979,7 +1256,7 @@ class PreferenceCommandProcessor:
                 text,
                 "query",
                 self._history_text(actor_id),
-                reply_markup=ui.menu_markup(),
+                reply_markup=ui.menu_markup(screen="history"),
             )
             return
         if command in {"/language", "/idioma"}:
@@ -1003,12 +1280,7 @@ class PreferenceCommandProcessor:
                     actor_id,
                     text,
                     "invalid_confirmation",
-                    ui.notice(
-                        "Confirmation reference needed",
-                        "Referência de confirmação necessária",
-                        "Use <code>/confirm &lt;id&gt;</code> or <code>/cancel &lt;id&gt;</code>.",
-                        "Use <code>/confirm &lt;id&gt;</code> ou <code>/cancel &lt;id&gt;</code>.",
-                    ),
+                    ui.notice_key("invalid_confirmation"),
                 )
                 return
         elif explicit:
@@ -1023,12 +1295,7 @@ class PreferenceCommandProcessor:
                     actor_id,
                     text,
                     "invalid_confirmation",
-                    ui.notice(
-                        "Confirmation reference needed",
-                        "Referência de confirmação necessária",
-                        "Use <code>confirm &lt;id&gt;</code> or <code>cancel &lt;id&gt;</code>.",
-                        "Use <code>confirm &lt;id&gt;</code> ou <code>cancel &lt;id&gt;</code>.",
-                    ),
+                    ui.notice_key("invalid_confirmation"),
                 )
                 return
         if action:
@@ -1055,31 +1322,19 @@ class PreferenceCommandProcessor:
                 actor_id,
                 text,
                 "bare_confirmation_rejected",
-                ui.notice(
-                    "A specific confirmation is required",
-                    "É necessária uma confirmação específica",
-                    "A generic “yes” cannot approve a risky change.",
-                    "Um “sim” genérico não pode aprovar uma mudança arriscada.",
-                    next_en="Use the Confirm change button on the pending request.",
-                    next_pt="Use o botão Confirmar alteração na solicitação pendente.",
-                ),
+                ui.notice_key("bare_confirmation"),
             )
             return
         if command == "/undo":
             try:
                 self._undo(update_id=update_id, actor_id=actor_id, original=text)
-            except PreferenceError as exc:
+            except PreferenceError:
                 self._record_reply(
                     update_id,
                     actor_id,
                     text,
                     "undo_unavailable",
-                    ui.notice(
-                        "Nothing to undo",
-                        "Nada para desfazer",
-                        escape(str(exc)),
-                        escape(str(exc)),
-                    ),
+                    ui.notice_key("undo_unavailable"),
                 )
             return
         if command == "/preview":
@@ -1089,14 +1344,7 @@ class PreferenceCommandProcessor:
                     actor_id,
                     text,
                     "invalid_preview",
-                    ui.notice(
-                        "Instruction needed",
-                        "Instrução necessária",
-                        "Add the change you want to test after <code>/preview</code>.",
-                        "Adicione a mudança que deseja testar depois de <code>/preview</code>.",
-                        next_en="Example: <code>/preview add an interest in OLED monitors</code>",
-                        next_pt="Exemplo: <code>/preview adicione interesse em monitores OLED</code>",
-                    ),
+                    ui.notice_key("preview_needed"),
                 )
                 return
             await self._interpret(
@@ -1114,15 +1362,10 @@ class PreferenceCommandProcessor:
                 actor_id,
                 text,
                 "unknown_command",
-                ui.notice(
-                    "Unknown command",
-                    "Comando desconhecido",
-                    "That command is not available. You can also write what you want naturally.",
-                    "Esse comando não está disponível. Você também pode escrever naturalmente o que deseja.",
-                    next_en="Select Help to see every option.",
-                    next_pt="Escolha Ajuda para ver todas as opções.",
+                ui.notice_key("unknown_command"),
+                reply_markup=ui.menu_markup(
+                    is_admin=self.can_admin_members
                 ),
-                reply_markup=ui.menu_markup(),
             )
             return
         await self._interpret(
@@ -1132,6 +1375,340 @@ class PreferenceCommandProcessor:
             original=text,
             preview=False,
         )
+
+
+class MultiUserCommandProcessor:
+    """Authenticate Telegram IDs and route each command to its UUID-scoped store."""
+
+    def __init__(
+        self,
+        *,
+        state: Any,
+        interpreter: PreferenceInterpreter,
+        admin_store: SQLitePreferenceStore,
+        max_users: int = 10,
+        rate_per_minute: int = 5,
+        rate_per_hour: int = 20,
+    ) -> None:
+        self.state = state
+        self.interpreter = interpreter
+        self.admin_store = admin_store
+        self.max_users = max_users
+        self.rate_per_minute = rate_per_minute
+        self.rate_per_hour = rate_per_hour
+        admin = state.user_by_id(admin_store.user_id)
+        if admin is None or admin.role != "admin":
+            raise ValueError("admin_store must belong to the administrator")
+        self.owner_user_id = admin.telegram_user_id
+        self.owner_chat_id = admin.telegram_chat_id
+        self._stores: dict[str, SQLitePreferenceStore] = {admin.id: admin_store}
+        self._processors: dict[str, PreferenceCommandProcessor] = {}
+        self.ephemeral_replies: list[OutboxReply] = []
+
+    @staticmethod
+    def _message_envelope(
+        update: Mapping[str, Any],
+    ) -> tuple[int, int | None, int | None, str, str, str | None]:
+        try:
+            update_id = int(update.get("update_id", -1))
+        except (TypeError, ValueError):
+            update_id = -1
+        message = update.get("message")
+        callback = update.get("callback_query")
+        callback_sender: Mapping[str, Any] | None = None
+        callback_data = ""
+        if not isinstance(message, Mapping):
+            message = (
+                callback.get("message")
+                if isinstance(callback, Mapping)
+                and isinstance(callback.get("message"), Mapping)
+                else {}
+            )
+            if isinstance(callback, Mapping):
+                callback_sender = (
+                    callback.get("from")
+                    if isinstance(callback.get("from"), Mapping)
+                    else None
+                )
+                callback_data = str(callback.get("data", ""))
+        chat = message.get("chat") if isinstance(message, Mapping) else {}
+        actor = (
+            callback_sender
+            if callback_sender is not None
+            else message.get("from")
+            if isinstance(message, Mapping)
+            else {}
+        )
+        try:
+            chat_id = int(chat.get("id")) if isinstance(chat, Mapping) else None
+        except (TypeError, ValueError):
+            chat_id = None
+        try:
+            actor_id = int(actor.get("id")) if isinstance(actor, Mapping) else None
+        except (TypeError, ValueError):
+            actor_id = None
+        text = (
+            callback_data
+            if callback_sender is not None
+            else str(message.get("text", ""))
+            if isinstance(message, Mapping)
+            else ""
+        )
+        chat_type = str(chat.get("type", "")) if isinstance(chat, Mapping) else ""
+        telegram_language = (
+            str(actor.get("language_code", "")) or None
+            if isinstance(actor, Mapping)
+            else None
+        )
+        return (
+            update_id,
+            chat_id,
+            actor_id,
+            text,
+            chat_type,
+            telegram_language,
+        )
+
+    def _store(self, user: User) -> SQLitePreferenceStore:
+        store = self._stores.get(user.id)
+        if store is None:
+            store = SQLitePreferenceStore(self.state, user_id=user.id)
+            try:
+                store.current_snapshot()
+            except Exception:
+                store.initialize(profile="", aliases={}, hard_rules=())
+            self._stores[user.id] = store
+        return store
+
+    def _processor(self, user: User) -> PreferenceCommandProcessor:
+        processor = self._processors.get(user.id)
+        if processor is None:
+            processor = PreferenceCommandProcessor(
+                store=self._store(user),
+                interpreter=self.interpreter,
+                owner_chat_id=user.telegram_chat_id,
+                owner_user_id=user.telegram_user_id,
+                rate_per_minute=self.rate_per_minute,
+                rate_per_hour=self.rate_per_hour,
+                account=user,
+                membership_state=self.state,
+                ephemeral_replies=self.ephemeral_replies,
+            )
+            self._processors[user.id] = processor
+        return processor
+
+    def stores(self) -> list[SQLitePreferenceStore]:
+        for account in self.state.active_users():
+            self._store(account)
+        return list(self._stores.values())
+
+    def _reply(
+        self,
+        store: SQLitePreferenceStore,
+        *,
+        update_id: int,
+        actor_id: int,
+        chat_id: int,
+        command: str,
+        outcome: str,
+        text: str,
+        parse_mode: str | None = "HTML",
+        reply_markup: Mapping[str, Any] | None = None,
+    ) -> None:
+        store.record_update(
+            update_id,
+            outcome=outcome,
+            actor_id=actor_id,
+            command=command,
+            reply=OutboxReply(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            ),
+        )
+
+    def _mark_unregistered(
+        self,
+        update_id: int,
+        *,
+        chat_id: int | None = None,
+        text: str | None = None,
+    ) -> None:
+        reply = (
+            OutboxReply(
+                chat_id=chat_id, text=text, parse_mode="HTML"
+            )
+            if chat_id is not None and text
+            else None
+        )
+        self.admin_store.record_update(
+            update_id,
+            outcome="registration_rejected",
+            actor_id=None,
+            command="",
+            reply=reply,
+        )
+
+    async def _register(
+        self,
+        *,
+        update_id: int,
+        chat_id: int | None,
+        actor_id: int | None,
+        token: str,
+        chat_type: str,
+        telegram_language: str | None,
+    ) -> None:
+        if chat_id is None or actor_id is None:
+            self._mark_unregistered(update_id)
+            return
+        if chat_type != "private":
+            self._mark_unregistered(update_id)
+            return
+        try:
+            member = self.state.redeem_invitation(
+                token,
+                telegram_user_id=actor_id,
+                telegram_chat_id=chat_id,
+                chat_type=chat_type,
+                max_users=self.max_users,
+                ui_language=TelegramFormatter(
+                    telegram_language
+                ).language,
+            )
+        except (InvitationError, MembershipError):
+            ui = TelegramFormatter(telegram_language)
+            self._mark_unregistered(
+                update_id,
+                chat_id=chat_id,
+                text=ui.notice_key("invitation_invalid"),
+            )
+            return
+        store = self._store(member)
+        language = store.ensure_ui_language(
+            actor_id, telegram_language
+        )
+        ui = TelegramFormatter(language)
+        self._reply(
+            store,
+            update_id=update_id,
+            actor_id=actor_id,
+            chat_id=chat_id,
+            command="",
+            outcome="registered",
+            text=ui.registration(member.id),
+        )
+
+    async def process_update(self, update: Mapping[str, Any]) -> None:
+        (
+            update_id,
+            chat_id,
+            actor_id,
+            text,
+            chat_type,
+            telegram_language,
+        ) = self._message_envelope(update)
+        if update_id < 0 or self.admin_store.is_update_processed(update_id):
+            return
+        command, argument = _command_name(text)
+        user = self.state.user_for_telegram(actor_id) if actor_id is not None else None
+        if user is None:
+            if command == "/start" and argument:
+                await self._register(
+                    update_id=update_id,
+                    chat_id=chat_id,
+                    actor_id=actor_id,
+                    token=argument,
+                    chat_type=chat_type,
+                    telegram_language=telegram_language,
+                )
+            else:
+                self._mark_unregistered(update_id)
+            return
+        if (
+            user.status != "active"
+            or chat_type != "private"
+            or chat_id != user.telegram_chat_id
+            or actor_id != user.telegram_user_id
+        ):
+            self.admin_store.record_update(
+                update_id,
+                outcome="unauthorized",
+                actor_id=None,
+                command="",
+            )
+            return
+        store = self._store(user)
+        store.ensure_ui_language(actor_id, telegram_language)
+        ui = TelegramFormatter(store.ui_language(actor_id))
+        assert chat_id is not None and actor_id is not None
+        if command in {"/invite", "/users", "/disable", "/enable"}:
+            if user.role != "admin":
+                self._reply(
+                    store,
+                    update_id=update_id,
+                    actor_id=actor_id,
+                    chat_id=chat_id,
+                    command=command,
+                    outcome="admin_required",
+                    text=ui.notice_key("admin_required"),
+                )
+                return
+            try:
+                if command == "/invite":
+                    token = self.state.create_invitation(user.id)
+                    self.ephemeral_replies.append(
+                        OutboxReply(
+                            chat_id=chat_id,
+                            text=ui.invitation(token),
+                            parse_mode="HTML",
+                        )
+                    )
+                    store.record_update(
+                        update_id,
+                        outcome="invitation_created",
+                        actor_id=actor_id,
+                        command="/invite",
+                    )
+                    return
+                if command == "/users":
+                    members = self.state.list_users(user.id)
+                    response = ui.members(members)
+                    outcome = "users"
+                else:
+                    if not argument:
+                        raise MembershipError("a user UUID is required")
+                    changed = (
+                        self.state.disable_user(user.id, argument)
+                        if command == "/disable"
+                        else self.state.enable_user(user.id, argument)
+                    )
+                    outcome = command.removeprefix("/")
+                    response = ui.notice_key(
+                        "member_changed",
+                        account_id=changed.id,
+                        status=ui.t(f"status.{changed.status}"),
+                    )
+            except (MembershipError, UnauthorizedMembershipError):
+                outcome = "membership_error"
+                response = ui.notice_key("membership_error")
+            self._reply(
+                store,
+                update_id=update_id,
+                actor_id=actor_id,
+                chat_id=chat_id,
+                command=command,
+                outcome=outcome,
+                text=response,
+                reply_markup=(
+                    ui.members_markup(members)
+                    if command == "/users"
+                    else None
+                ),
+            )
+            return
+        await self._processor(user).process_update(update)
 
 
 class TelegramPreferenceBot:
@@ -1156,19 +1733,44 @@ class TelegramPreferenceBot:
         )
         self._batch_failed = asyncio.Event()
         self._outbox_lock = asyncio.Lock()
+        self._acknowledged_callbacks: set[str] = set()
+        self.max_outbox_attempts = 5
+
+    async def _acknowledge_callback(
+        self, update: Mapping[str, Any]
+    ) -> None:
+        callback = update.get("callback_query")
+        if not isinstance(callback, Mapping):
+            return
+        callback_id = str(callback.get("id", "")).strip()
+        if not callback_id:
+            return
+        try:
+            await self.api.answer_callback_query(callback_id)
+        except TelegramBotError as exc:
+            logger.warning(
+                "callback_acknowledgement_failed",
+                extra={
+                    "event": "callback_acknowledgement_failed",
+                    "failure_category": exc.category,
+                    "http_status": exc.status_code,
+                    "error_type": type(exc).__name__,
+                },
+            )
+        else:
+            if len(self._acknowledged_callbacks) >= 1_024:
+                self._acknowledged_callbacks.clear()
+            self._acknowledged_callbacks.add(callback_id)
+            logger.debug(
+                "callback_acknowledged",
+                extra={"event": "callback_acknowledged"},
+            )
 
     async def check_webhook(self) -> None:
         info = await self.api.get_webhook_info()
         if str(info.get("url", "")).strip():
             ui = TelegramFormatter(self.store.ui_language(self.processor.owner_user_id))
-            message = ui.notice(
-                "Sieve could not start",
-                "O Sieve não pôde iniciar",
-                "This bot has an active webhook, so private preference polling was not started.",
-                "Este bot possui um webhook ativo; por isso, a consulta privada de preferências não foi iniciada.",
-                next_en="Remove the webhook explicitly, then restart Sieve.",
-                next_pt="Remova o webhook explicitamente e reinicie o Sieve.",
-            )
+            message = ui.notice_key("webhook")
             with suppress(Exception):
                 await self.api.send_message(
                     self.owner_chat_id, message, parse_mode="HTML"
@@ -1179,7 +1781,9 @@ class TelegramPreferenceBot:
     async def drain_outbox(self) -> int:
         async with self._outbox_lock:
             delivered = 0
-            for item in self.store.next_outbox(20):
+            ephemeral = getattr(self.processor, "ephemeral_replies", None)
+            while isinstance(ephemeral, list) and ephemeral:
+                item = ephemeral[0]
                 try:
                     await self.api.send_message(
                         item.chat_id,
@@ -1187,14 +1791,191 @@ class TelegramPreferenceBot:
                         reply_markup=item.reply_markup,
                         parse_mode=item.parse_mode,
                     )
-                except TelegramBotError as exc:
-                    self.store.fail_outbox(item.id, str(exc))
+                except TelegramBotError:
                     break
                 else:
+                    ephemeral.pop(0)
+                    delivered += 1
+            stores_method = getattr(self.processor, "stores", None)
+            stores = stores_method() if callable(stores_method) else [self.store]
+            for current_store in stores:
+                for item in current_store.next_outbox(20):
+                    logger.debug(
+                        "telegram_outbox_attempt",
+                        extra={
+                            "event": "telegram_outbox_attempt",
+                            "operation": item.operation,
+                            "attempt": item.attempts + 1,
+                        },
+                    )
+                    try:
+                        if item.operation == "edit":
+                            assert item.target_message_id is not None
+                            await self.api.edit_message_text(
+                                item.chat_id,
+                                item.target_message_id,
+                                item.text,
+                                reply_markup=item.reply_markup,
+                                parse_mode=item.parse_mode,
+                            )
+                        else:
+                            await self.api.send_message(
+                                item.chat_id,
+                                item.text,
+                                reply_markup=item.reply_markup,
+                                parse_mode=item.parse_mode,
+                            )
+                    except TelegramBotError as exc:
+                        if (
+                            item.operation == "edit"
+                            and exc.category == "message_not_modified"
+                        ):
+                            logger.debug(
+                                "telegram_outbox_completed",
+                                extra={
+                                    "event": "telegram_outbox_completed",
+                                    "operation": "edit",
+                                    "response_category": "message_not_modified",
+                                },
+                            )
+                        elif (
+                            item.operation == "edit"
+                            and exc.category == "edit_target_unavailable"
+                        ):
+                            current_store.convert_outbox_edit_to_send(
+                                item.id, str(exc)
+                            )
+                            logger.info(
+                                "telegram_edit_fallback",
+                                extra={
+                                    "event": "telegram_edit_fallback",
+                                    "operation": "edit",
+                                    "attempt": item.attempts + 1,
+                                    "response_category": exc.category,
+                                },
+                            )
+                            try:
+                                await self.api.send_message(
+                                    item.chat_id,
+                                    item.text,
+                                    reply_markup=item.reply_markup,
+                                    parse_mode=item.parse_mode,
+                                )
+                            except TelegramBotError as fallback_exc:
+                                permanent_fallback = (
+                                    (
+                                        fallback_exc.status_code is not None
+                                        and 400 <= fallback_exc.status_code < 500
+                                        and fallback_exc.status_code != 429
+                                    )
+                                    or (
+                                        fallback_exc.error_code is not None
+                                        and 400 <= fallback_exc.error_code < 500
+                                        and fallback_exc.error_code != 429
+                                    )
+                                )
+                                if (
+                                    permanent_fallback
+                                    or item.attempts + 2
+                                    >= self.max_outbox_attempts
+                                ):
+                                    current_store.complete_outbox(item.id)
+                                    logger.error(
+                                        "telegram_outbox_permanent_failure",
+                                        extra={
+                                            "event": (
+                                                "telegram_outbox_permanent_failure"
+                                            ),
+                                            "operation": "send",
+                                            "attempt": item.attempts + 2,
+                                            "failure_category": (
+                                                fallback_exc.category
+                                            ),
+                                            "http_status": (
+                                                fallback_exc.status_code
+                                            ),
+                                        },
+                                    )
+                                    continue
+                                current_store.fail_outbox(
+                                    item.id, str(fallback_exc)
+                                )
+                                logger.warning(
+                                    "telegram_outbox_retry",
+                                    extra={
+                                        "event": "telegram_outbox_retry",
+                                        "operation": "send",
+                                        "attempt": item.attempts + 2,
+                                        "failure_category": fallback_exc.category,
+                                        "http_status": fallback_exc.status_code,
+                                    },
+                                )
+                                break
+                        else:
+                            permanent_response = (
+                                (
+                                    exc.status_code is not None
+                                    and 400 <= exc.status_code < 500
+                                    and exc.status_code != 429
+                                )
+                                or (
+                                    exc.error_code is not None
+                                    and 400 <= exc.error_code < 500
+                                    and exc.error_code != 429
+                                )
+                            )
+                            if (
+                                permanent_response
+                                or item.attempts + 1
+                                >= self.max_outbox_attempts
+                            ):
+                                current_store.complete_outbox(item.id)
+                                logger.error(
+                                    "telegram_outbox_permanent_failure",
+                                    extra={
+                                        "event": "telegram_outbox_permanent_failure",
+                                        "operation": item.operation,
+                                        "attempt": item.attempts + 1,
+                                        "failure_category": exc.category,
+                                        "http_status": exc.status_code,
+                                    },
+                                )
+                                continue
+                            else:
+                                current_store.fail_outbox(item.id, str(exc))
+                                logger.warning(
+                                    "telegram_outbox_retry",
+                                    extra={
+                                        "event": "telegram_outbox_retry",
+                                        "operation": item.operation,
+                                        "attempt": item.attempts + 1,
+                                        "failure_category": exc.category,
+                                        "http_status": exc.status_code,
+                                    },
+                                )
+                                break
+                    else:
+                        logger.debug(
+                            "telegram_outbox_completed",
+                            extra={
+                                "event": "telegram_outbox_completed",
+                                "operation": item.operation,
+                                "response_category": "ok",
+                            },
+                        )
                     if item.callback_query_id:
-                        with suppress(TelegramBotError):
-                            await self.api.answer_callback_query(item.callback_query_id)
-                    self.store.complete_outbox(item.id)
+                        if (
+                            item.callback_query_id
+                            not in self._acknowledged_callbacks
+                        ):
+                            with suppress(TelegramBotError):
+                                await self.api.answer_callback_query(
+                                    item.callback_query_id
+                                )
+                        self._acknowledged_callbacks.discard(
+                            item.callback_query_id
+                        )
+                    current_store.complete_outbox(item.id)
                     delivered += 1
             return delivered
 
@@ -1206,11 +1987,13 @@ class TelegramPreferenceBot:
             limit=20,
         )
         for update in updates:
+            await self._acknowledge_callback(update)
             await self.processor.process_update(update)
             await self.drain_outbox()
         return len(updates)
 
     async def _poll(self, stop: asyncio.Event) -> None:
+        failures = 0
         while not stop.is_set():
             try:
                 updates = await self.api.get_updates(
@@ -1218,8 +2001,10 @@ class TelegramPreferenceBot:
                     timeout=self.polling_timeout,
                     limit=20,
                 )
+                failures = 0
                 self._batch_failed.clear()
                 for update in updates:
+                    await self._acknowledge_callback(update)
                     await self.queue.put(update)
                 if updates:
                     await self.queue.join()
@@ -1230,13 +2015,36 @@ class TelegramPreferenceBot:
                         pass
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except TelegramBotError as exc:
+                failures += 1
+                retry_delay = min(300, 2 ** min(failures, 8))
                 logger.error(
                     "preference_poll_failure",
-                    extra={"event": "preference_poll_failure", "error": str(exc)},
+                    extra={
+                        "event": "preference_poll_failure",
+                        "consecutive_failures": failures,
+                        "retry_in_seconds": retry_delay,
+                        **exc.log_fields(),
+                    },
                 )
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=2)
+                    await asyncio.wait_for(stop.wait(), timeout=retry_delay)
+                except TimeoutError:
+                    pass
+            except Exception as exc:
+                failures += 1
+                retry_delay = min(300, 2 ** min(failures, 8))
+                logger.exception(
+                    "preference_poll_unexpected_failure",
+                    extra={
+                        "event": "preference_poll_unexpected_failure",
+                        "error_type": type(exc).__name__,
+                        "consecutive_failures": failures,
+                        "retry_in_seconds": retry_delay,
+                    },
+                )
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=retry_delay)
                 except TimeoutError:
                     pass
 
@@ -1254,16 +2062,30 @@ class TelegramPreferenceBot:
                 raise
             except Exception as exc:
                 self._batch_failed.set()
-                logger.error(
+                logger.exception(
                     "preference_command_failure",
-                    extra={"event": "preference_command_failure", "error": str(exc)},
+                    extra={
+                        "event": "preference_command_failure",
+                        "error_type": type(exc).__name__,
+                    },
                 )
             finally:
                 self.queue.task_done()
 
     async def _deliver(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
-            await self.drain_outbox()
+            try:
+                await self.drain_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "preference_outbox_failure",
+                    extra={
+                        "event": "preference_outbox_failure",
+                        "error_type": type(exc).__name__,
+                    },
+                )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=2)
             except TimeoutError:
@@ -1285,7 +2107,7 @@ class TelegramPreferenceBot:
         except TelegramBotError as exc:
             logger.warning(
                 "preference_command_menu_failure",
-                extra={"event": "preference_command_menu_failure", "error": str(exc)},
+                extra={"event": "preference_command_menu_failure", **exc.log_fields()},
             )
         tasks = [
             asyncio.create_task(self._poll(stop), name="preference-poll"),

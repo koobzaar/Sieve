@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,6 +14,7 @@ from promo_bot.preference_bot import (
     BOT_COMMANDS_PT_BR,
     PreferenceCommandProcessor,
     TelegramBotAPI,
+    TelegramBotError,
     TelegramPreferenceBot,
     WebhookConflictError,
 )
@@ -182,6 +186,35 @@ async def test_narrow_apply_is_live_once_and_preview_is_a_dry_run(tmp_path) -> N
     state.close()
 
 
+async def test_command_audit_labels_never_store_message_or_callback_payload(
+    tmp_path,
+) -> None:
+    interpreter = FakeInterpreter(PreferenceIntent.QUERY)
+    state, store, processor = setup(tmp_path, interpreter)
+    private_text = "show my secret walnut preferences"
+    await processor.process_update(message(1, private_text))
+    await processor.process_update(
+        callback(
+            2,
+            "pref:member:disable:"
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+    )
+
+    labels = [
+        row["command"]
+        for row in store._connection.execute(
+            "SELECT command FROM preference_command_log ORDER BY id"
+        )
+    ]
+    serialized = " ".join(labels)
+    assert private_text not in serialized
+    assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" not in serialized
+    assert labels[0] == "text"
+    assert labels[1] == "pref:member:disable"
+    state.close()
+
+
 async def test_malformed_multi_interest_response_is_repaired_and_applied_atomically(
     tmp_path,
 ) -> None:
@@ -329,7 +362,7 @@ async def test_two_invalid_interpretations_use_generic_failure_and_persist_nothi
     assert current.revision == 0
     assert current.interests == ()
     reply = store.next_outbox()[0].text
-    assert "Não consegui interpretar a solicitação" in reply
+    assert "Solicitação não compreendida" in reply
     assert "interest name must be nonempty" not in reply
     outcome = store._connection.execute(
         "SELECT outcome FROM telegram_processed_updates WHERE update_id = 1"
@@ -472,7 +505,7 @@ async def test_clarification_questions_are_bounded_and_then_cleared(tmp_path) ->
     assert len(interpreter.calls) == 4
     assert store.pending_clarification(42) is None
     assert store.current_snapshot().revision == 0
-    assert "I still need more detail" in store.next_outbox()[-1].text
+    assert "More detail is still needed" in store.next_outbox()[-1].text
     state.close()
 
 
@@ -526,7 +559,7 @@ async def test_persistent_sliding_limit_blocks_before_another_gemini_call(tmp_pa
     await processor.process_update(message(2, "segundo"))
     assert len(interpreter.calls) == 1
     assert store.current_snapshot().revision == 1
-    assert "AI command limit" in store.next_outbox()[-1].text
+    assert "AI limit reached" in store.next_outbox()[-1].text
     state.close()
 
 
@@ -555,16 +588,15 @@ async def test_onboarding_queries_and_unknown_commands_are_deterministic(tmp_pat
     outbox = store.next_outbox()
     replies = [item.text for item in outbox]
     assert interpreter.calls == []
-    assert "Welcome to Sieve" in replies[0]
-    assert "How to use Sieve" in replies[1]
-    assert "Your preferences" in replies[2]
+    assert "<b>Sieve</b>" in replies[0]
+    assert "<b>Help</b>" in replies[1]
+    assert "<b>Preferences</b>" in replies[2]
     assert "Unknown command" in replies[3]
-    assert "Your preferences" in replies[4]
+    assert "<b>Preferences</b>" in replies[4]
     assert all(item.parse_mode == "HTML" for item in outbox)
     assert outbox[4].callback_query_id == "cb-menu"
-    assert outbox[4].reply_markup["inline_keyboard"][0][0]["callback_data"] == (
-        "pref:menu:preferences"
-    )
+    pagination = outbox[4].reply_markup["inline_keyboard"][0]
+    assert [button["text"] for button in pagination] == ["‹", "1/1", "›"]
     state.close()
 
 
@@ -574,7 +606,7 @@ async def test_gemini_query_renders_authoritative_preferences(tmp_path) -> None:
     await processor.process_update(message(1, "pode me dizer o que voce sabe sobre meus gostos?"))
     reply = store.next_outbox()[0].text
     assert len(interpreter.calls) == 1
-    assert "Your preferences" in reply
+    assert "<b>Preferences</b>" in reply
     assert "resumo sem estado" not in reply
     state.close()
 
@@ -633,6 +665,88 @@ async def test_direct_bot_api_uses_required_long_polling_shape() -> None:
     }
 
 
+async def test_direct_bot_api_reports_actionable_http_failure_without_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "ok": False,
+                "error_code": 409,
+                "description": "Conflict: terminated by another getUpdates request",
+                "parameters": {"retry_after": 7},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        api = TelegramBotAPI(token="secret-token", api_url="https://telegram.test", client=client)
+        with pytest.raises(TelegramBotError) as raised:
+            await api.get_updates(offset=1)
+
+    error = raised.value
+    assert error.method == "getUpdates"
+    assert error.category == "http_status"
+    assert error.status_code == 409
+    assert error.error_code == 409
+    assert error.retry_after == 7
+    assert "another getUpdates request" in str(error)
+    assert "secret-token" not in str(error)
+
+
+async def test_outbox_worker_logs_unexpected_failure_and_stays_contained(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bot = object.__new__(TelegramPreferenceBot)
+    stop = asyncio.Event()
+
+    async def fail_once() -> int:
+        stop.set()
+        raise RuntimeError("unexpected delivery fault")
+
+    bot.drain_outbox = fail_once  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        await bot._deliver(stop)
+
+    record = next(
+        item for item in caplog.records if item.msg == "preference_outbox_failure"
+    )
+    assert record.event == "preference_outbox_failure"
+    assert record.error_type == "RuntimeError"
+
+
+async def test_poll_failure_log_includes_backoff_and_consecutive_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bot = object.__new__(TelegramPreferenceBot)
+    stop = asyncio.Event()
+
+    class ConflictAPI:
+        async def get_updates(self, **_: object) -> list[dict[str, object]]:
+            stop.set()
+            raise TelegramBotError(
+                "Telegram getUpdates HTTP 409: competing poller",
+                method="getUpdates",
+                category="http_status",
+                status_code=409,
+                error_code=409,
+            )
+
+    bot.api = ConflictAPI()
+    bot.store = SimpleNamespace(telegram_offset=lambda: 0)
+    bot.polling_timeout = 30
+    bot._batch_failed = asyncio.Event()
+    bot.queue = asyncio.Queue()
+
+    with caplog.at_level(logging.ERROR):
+        await bot._poll(stop)
+
+    record = next(
+        item for item in caplog.records if item.msg == "preference_poll_failure"
+    )
+    assert record.http_status == 409
+    assert record.consecutive_failures == 1
+    assert record.retry_in_seconds == 2
+
+
 async def test_direct_bot_api_get_me_returns_bot_identity() -> None:
     bodies = []
 
@@ -677,21 +791,21 @@ async def test_language_is_detected_selectable_and_persistent(tmp_path) -> None:
     state, store, processor = setup(tmp_path, interpreter)
     await processor.process_update(message(1, "/start", language_code="pt-BR"))
     first = store.next_outbox()[0]
-    assert "Bem-vindo ao Sieve" in first.text
+    assert "<b>Sieve</b>" in first.text
     assert store.ui_language(42) == "pt-BR"
 
     await processor.process_update(
         callback(2, "pref:language:en", callback_id="cb-language")
     )
     changed = store.next_outbox()[-1]
-    assert "Language changed to English" in changed.text
+    assert "Language updated" in changed.text
     assert changed.callback_query_id == "cb-language"
     assert store.ui_language(42) == "en"
 
     reloaded = SQLitePreferenceStore(state)
     assert reloaded.ui_language(42) == "en"
     await processor.process_update(message(3, "/language", language_code="pt"))
-    assert "Choose your language" in store.next_outbox()[-1].text
+    assert "<b>Language</b>" in store.next_outbox()[-1].text
     state.close()
 
 

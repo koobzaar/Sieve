@@ -11,11 +11,12 @@ from typing import Any
 import httpx
 
 from .config import AppConfig, env_secret, load_factory
+from .delivery import TelegramDeliveryWorker
 from .evaluator import RetryableEvaluationError
 from .models import Decision, Promotion
-from .pipeline import PromotionPipeline
+from .pipeline import MultiUserPromotionPipeline, PromotionPipeline
 from .preference_bot import (
-    PreferenceCommandProcessor,
+    MultiUserCommandProcessor,
     TelegramBotAPI,
     TelegramPreferenceBot,
 )
@@ -24,6 +25,7 @@ from .preference_store import SQLitePreferenceStore
 from .preferences import AtomicPreferenceProvider, PreferenceSnapshot
 from .sources.pelando import PelandoSchemaError
 from .store import SQLiteStateStore, StoreError
+from .telegram_formatter import TelegramFormatter
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +65,24 @@ class Service:
             timeout=httpx.Timeout(20, connect=10),
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
             follow_redirects=True,
-            headers={"User-Agent": "sieve/1.0"},
+            headers={"User-Agent": "sieve/1.1.0-beta.1"},
         )
         preference_settings = config.preferences
+        if preference_settings.enabled:
+            admin_telegram_user_id = int(
+                env_secret(
+                    preference_settings.admin_telegram_user_id_env
+                )
+            )
+            administrator = self.store.bootstrap_admin(
+                telegram_user_id=admin_telegram_user_id,
+                telegram_chat_id=admin_telegram_user_id,
+            )
+        else:
+            administrator = self.store.ensure_legacy_admin()
         self.preference_store = SQLitePreferenceStore(
             self.store,
+            user_id=administrator.id,
             max_entries=preference_settings.max_entries,
             max_operations=preference_settings.max_operations,
             max_state_bytes=preference_settings.max_state_bytes,
@@ -82,51 +97,74 @@ class Service:
         )
         self.preference_provider = AtomicPreferenceProvider(initial_snapshot)
         self.preference_store.provider = self.preference_provider
-        self.store.ensure_alias_generation(dict(initial_snapshot.aliases))
+        self.preference_stores: dict[str, SQLitePreferenceStore] = {
+            administrator.id: self.preference_store
+        }
         evaluator_factory = load_factory(config.evaluator_factory)
         sink_factory = load_factory(config.sink_factory)
         self.evaluator = evaluator_factory(config.evaluator, profile=config.profile, client=self.http)
         self.sink = sink_factory(config.sink, client=self.http)
-        source_modes = {
-            item.name: item.mode for item in config.sources if item.mode is not None
-        }
-        self.pipeline = PromotionPipeline(
+        alert_destination = getattr(self.sink, "set_alert_destination", None)
+        if callable(alert_destination):
+            alert_destination(administrator.telegram_chat_id)
+
+        def preference_store_for(account: Any) -> SQLitePreferenceStore:
+            existing = self.preference_stores.get(account.id)
+            if existing is not None:
+                return existing
+            scoped = SQLitePreferenceStore(
+                self.store,
+                user_id=account.id,
+                max_entries=preference_settings.max_entries,
+                max_operations=preference_settings.max_operations,
+                max_state_bytes=preference_settings.max_state_bytes,
+                confirmation_ttl_seconds=preference_settings.confirmation_ttl_seconds,
+                outbox_capacity=preference_settings.queue_capacity,
+                on_snapshot=self._preference_snapshot_changed,
+            )
+            try:
+                scoped.current_snapshot()
+            except Exception:
+                scoped.initialize(profile="", aliases={}, hard_rules=())
+            self.preference_stores[account.id] = scoped
+            return scoped
+
+        def pipeline_for(
+            account: Any, provider: AtomicPreferenceProvider
+        ) -> PromotionPipeline:
+            return PromotionPipeline(
+                store=self.store,
+                evaluator=self.evaluator,
+                sink=self.sink,
+                profile="",
+                aliases={},
+                hard_rules=(),
+                gemini_evaluation_enabled=config.gemini_evaluation_enabled,
+                threshold=config.bm25_threshold,
+                auto_forward_threshold=config.bm25_auto_forward_threshold,
+                auto_forward_mode=config.bm25_auto_forward_mode,
+                below_threshold_audit_rate=config.bm25_below_threshold_audit_rate,
+                k1=config.bm25_k1,
+                b=config.bm25_b,
+                cold_start_documents=config.cold_start_documents,
+                exceptional_temperature=config.exceptional_temperature,
+                preference_provider=provider,
+            )
+
+        self.pipeline = MultiUserPromotionPipeline(
             store=self.store,
-            evaluator=self.evaluator,
-            sink=self.sink,
-            profile=config.profile,
-            aliases=config.aliases,
-            hard_rules=config.hard_rules,
-            gemini_evaluation_enabled=config.gemini_evaluation_enabled,
-            threshold=config.bm25_threshold,
-            auto_forward_threshold=config.bm25_auto_forward_threshold,
-            auto_forward_mode=config.bm25_auto_forward_mode,
-            below_threshold_audit_rate=config.bm25_below_threshold_audit_rate,
-            k1=config.bm25_k1,
-            b=config.bm25_b,
-            cold_start_documents=config.cold_start_documents,
-            exceptional_temperature=config.exceptional_temperature,
-            default_mode=config.mode,
-            source_modes=source_modes,
-            preference_provider=self.preference_provider,
+            pipeline_factory=pipeline_for,
+            preference_store_factory=preference_store_for,
         )
+        self.delivery_worker = TelegramDeliveryWorker(self.store, self.sink)
         self.preference_interpreter = None
         self.preference_bot = None
-        self.preference_owner_id: int | None = None
+        self.preference_owner_id: int | None = administrator.telegram_user_id
         if preference_settings.enabled:
-            owner_id = (
-                preference_settings.owner_id
-                if preference_settings.owner_id is not None
-                else int(env_secret(preference_settings.owner_id_env))
-            )
-            owner_chat_id = (
-                preference_settings.chat_id
-                if preference_settings.chat_id is not None
-                else int(env_secret(preference_settings.chat_id_env))
-            )
-            self.preference_owner_id = owner_id
             def language_provider() -> str:
-                return self.preference_store.ui_language(owner_id)
+                return self.preference_store.ui_language(
+                    administrator.telegram_user_id
+                )
 
             evaluator_language = getattr(self.evaluator, "set_language_provider", None)
             if callable(evaluator_language):
@@ -145,11 +183,11 @@ class Service:
                 api_url=preference_settings.api_url,
                 timeout_seconds=max(40, preference_settings.polling_timeout + 10),
             )
-            processor = PreferenceCommandProcessor(
-                store=self.preference_store,
+            processor = MultiUserCommandProcessor(
+                state=self.store,
                 interpreter=self.preference_interpreter,
-                owner_chat_id=owner_chat_id,
-                owner_user_id=owner_id,
+                admin_store=self.preference_store,
+                max_users=preference_settings.max_users,
                 rate_per_minute=preference_settings.rate_per_minute,
                 rate_per_hour=preference_settings.rate_per_hour,
             )
@@ -157,7 +195,7 @@ class Service:
                 api=bot_api,
                 processor=processor,
                 store=self.preference_store,
-                owner_chat_id=owner_chat_id,
+                owner_chat_id=administrator.telegram_chat_id,
                 polling_timeout=preference_settings.polling_timeout,
                 queue_capacity=preference_settings.queue_capacity,
             )
@@ -180,25 +218,38 @@ class Service:
         if previous is None or dict(snapshot.aliases) != dict(previous.aliases):
             self.store.start_alias_rebuild(dict(snapshot.aliases))
 
-    def _pick(self, english: str, portuguese: str) -> str:
-        if self.preference_owner_id is not None and self.preference_store.ui_language(
-            self.preference_owner_id
-        ) == "pt-BR":
-            return portuguese
-        return english
+    def _alert_text(self, key: str, **values: object) -> str:
+        preference_store = getattr(
+            self, "preference_store", None
+        )
+        owner_id = getattr(self, "preference_owner_id", None)
+        language = (
+            preference_store.ui_language(owner_id)
+            if preference_store is not None
+            and owner_id is not None
+            else "en"
+        )
+        return TelegramFormatter(language).t(key, **values)
 
     async def report_health(self, name: str, error: Exception | None) -> None:
         try:
             failures = self.store.record_health(name, None if error is None else str(error))
         except Exception as store_error:
-            logger.critical(
+            logger.exception(
                 "database_health_failure",
-                extra={"event": "database_health_failure", "error": str(store_error)},
+                extra={
+                    "event": "database_health_failure",
+                    "component": name,
+                    "error_type": type(store_error).__name__,
+                    "error": str(store_error)[:500],
+                },
             )
             with suppress(Exception):
                 await self.sink.alert(
-                    self._pick("Database", "Banco de dados")
-                    + f": {type(store_error).__name__}: {str(store_error)[:350]}"
+                    self._alert_text(
+                        "alert.database_failure",
+                        error_type=type(store_error).__name__,
+                    )
                 )
             return
         if error is None:
@@ -207,10 +258,6 @@ class Service:
             return
         started = self._failure_started.setdefault(name, time.monotonic())
         elapsed = time.monotonic() - started
-        logger.error(
-            "component_failure",
-            extra={"event": "component_failure", "component": name, "failures": failures, "error": str(error)},
-        )
         schema_failure = isinstance(error, PelandoSchemaError)
         immediate = isinstance(error, StoreError)
         persistent_llm = (
@@ -222,14 +269,33 @@ class Service:
         should_alert = not schema_failure and (
             immediate or persistent_llm or repeated_component
         )
-        if should_alert and name not in self._failure_alerted:
+        alert_will_send = should_alert and name not in self._failure_alerted
+        logger.error(
+            "component_failure",
+            extra={
+                "event": "component_failure",
+                "component": name,
+                "failures": failures,
+                "error_type": type(error).__name__,
+                "error": str(error)[:500],
+                "failure_duration_seconds": round(elapsed, 3),
+                "schema_failure": schema_failure,
+                "immediate_alert_class": immediate,
+                "alert_eligible": should_alert,
+                "alert_will_send": alert_will_send,
+                "failure_alert_threshold": self.config.failure_alert_threshold,
+                "llm_outage_alert_seconds": self.config.llm_outage_alert_seconds,
+            },
+        )
+        if alert_will_send:
             self._failure_alerted.add(name)
             with suppress(Exception):
                 await self.sink.alert(
-                    f"{name}: {type(error).__name__}: {str(error)[:350]} "
-                    + self._pick(
-                        f"(consecutive failures: {failures})",
-                        f"(falhas consecutivas: {failures})",
+                    self._alert_text(
+                        "alert.component_failure",
+                        component=name,
+                        count=failures,
+                        error_type=type(error).__name__,
                     )
                 )
 
@@ -243,13 +309,14 @@ class Service:
             except TimeoutError:
                 continue
             try:
-                result = await self.pipeline.process(promotion)
-                if result.decision == Decision.RETRY:
-                    await self.report_health("llm", RuntimeError(result.reason))
-                elif result.reason.startswith("llm_permanent_error:"):
-                    await self.report_health("llm", RuntimeError(result.reason))
-                elif result.stage == "llm":
-                    await self.report_health("llm", None)
+                results = await self.pipeline.process(promotion)
+                for result in results.values():
+                    if result.decision == Decision.RETRY:
+                        await self.report_health("llm", RuntimeError(result.reason))
+                    elif result.reason.startswith("llm_permanent_error:"):
+                        await self.report_health("llm", RuntimeError(result.reason))
+                    elif result.stage == "llm":
+                        await self.report_health("llm", None)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -261,7 +328,7 @@ class Service:
         while not self.stop.is_set():
             for job in self.store.due_retries(limit=10):
                 try:
-                    await self.pipeline.process_retry(job.promotion)
+                    await self.pipeline.process_retry(job.user_id, job.promotion)
                 except RetryableEvaluationError as exc:
                     alive = self.store.reschedule_retry(job.id, str(exc))
                     await self.report_health("llm", exc)
@@ -281,20 +348,46 @@ class Service:
             except TimeoutError:
                 pass
 
+    async def _delivery_worker(self) -> None:
+        while not self.stop.is_set():
+            try:
+                await self.delivery_worker.drain_once(limit=20)
+            except Exception as exc:
+                await self.report_health("delivery", exc)
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=1)
+            except TimeoutError:
+                pass
+
     async def _maintenance(self) -> None:
         while not self.stop.is_set():
             try:
                 removed = self.store.prune()
-                removed.update(
-                    {
-                        f"preferences_{key}": value
-                        for key, value in self.preference_store.prune_transient().items()
-                    }
-                )
+                for user_id, preference_store in self.preference_stores.items():
+                    removed.update(
+                        {
+                            f"preferences_{user_id}_{key}": value
+                            for key, value in preference_store.prune_transient().items()
+                        }
+                    )
                 self.store.record_health("runtime")
+                operational = self.store.operational_health(
+                    queue_depth=self.queue.qsize(),
+                    preference_queue_depth=(
+                        self.preference_bot.queue.qsize()
+                        if self.preference_bot is not None
+                        else 0
+                    ),
+                    cold_start_documents=self.config.cold_start_documents,
+                )
                 logger.info(
                     "maintenance",
-                    extra={"event": "maintenance", "queue_size": self.queue.qsize(), "removed": removed},
+                    extra={
+                        "event": "maintenance",
+                        "queue_size": self.queue.qsize(),
+                        "removed": removed,
+                        "operational": operational,
+                    },
                 )
             except Exception as exc:
                 await self.report_health("database", exc)
@@ -328,9 +421,9 @@ class Service:
                 )
                 with suppress(Exception):
                     await self.sink.alert(
-                        self._pick(
-                            f"Memory pressure: {used / 1024 / 1024:.1f} MB; preventive restart.",
-                            f"Pressão de memória: {used / 1024 / 1024:.1f} MB; reinício preventivo.",
+                        self._alert_text(
+                            "alert.memory_pressure",
+                            memory_mb=f"{used / 1024 / 1024:.1f}",
                         )
                     )
                 self.store.flush()
@@ -354,6 +447,7 @@ class Service:
         tasks = [
             asyncio.create_task(self._pipeline_worker(), name="pipeline"),
             asyncio.create_task(self._retry_worker(), name="retry"),
+            asyncio.create_task(self._delivery_worker(), name="delivery"),
             asyncio.create_task(self._maintenance(), name="maintenance"),
             asyncio.create_task(self._memory_monitor(), name="memory"),
             asyncio.create_task(self._alias_rebuild_worker(), name="alias-rebuild"),

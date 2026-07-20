@@ -1,5 +1,4 @@
 runtime:
-  mode: live
   queue_capacity: 32
   memory_limit_mb: 220
   failure_alert_threshold: 3
@@ -40,14 +39,13 @@ sink:
   factory: promo_bot.sink:create_telegram_sink
   settings:
     token_env: TELEGRAM_BOT_TOKEN
-    chat_id_env: TELEGRAM_PRIVATE_CHAT_ID
     api_url: http://emulator:8080
     timeout_seconds: 3
 
 preferences:
   enabled: true
-  owner_id: 424242
-  chat_id: 424242
+  admin_telegram_user_id_env: TELEGRAM_ADMIN_USER_ID
+  max_users: 10
   token_env: TELEGRAM_BOT_TOKEN
   api_url: http://emulator:8080
   polling_timeout: 1
@@ -59,7 +57,6 @@ sources:
   - name: pelando-system
     factory: promo_bot.sources.pelando:create_pelando_source
     enabled: true
-    mode: live
     settings:
       url: http://emulator:8080/pelando/recentes
       interval_seconds: 0.25

@@ -98,7 +98,7 @@ async def test_gemini_reason_is_bounded_to_one_sentence() -> None:
     assert result.reason == "Não combina."
 
 
-async def test_telegram_sink_formats_shadow_and_silences_notification() -> None:
+async def test_telegram_sink_formats_live_audible_notification_without_test_banner() -> None:
     bodies: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -115,14 +115,15 @@ async def test_telegram_sink_formats_shadow_and_silences_notification() -> None:
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         sink = TelegramBotSink(token="token", chat_id="42", client=client)
-        await sink.send(promotion, "Menor preço.", shadow=True)
+        await sink.send(promotion, "Menor preço.")
         await sink.alert("parser alterado")
-    assert "Test delivery" in bodies[0]["text"]
+    assert "Test delivery" not in bodies[0]["text"]
+    assert "Envio de teste" not in bodies[0]["text"]
     assert "R$ 1,299.90" in bodies[0]["text"]
     assert bodies[0]["parse_mode"] == "HTML"
-    assert bodies[0]["disable_notification"] is True
+    assert bodies[0]["disable_notification"] is False
     assert bodies[1]["disable_notification"] is False
-    assert "SIEVE ALERT" in bodies[1]["text"]
+    assert "Sieve alert" in bodies[1]["text"]
     assert format_promotion(promotion, "x").startswith("<b>SSD</b>")
 
 
@@ -150,9 +151,14 @@ async def test_sink_and_evaluator_follow_persistent_ui_language() -> None:
         )
         await sink.send(promotion, "Combina <muito>.")
     text = bodies[0]["text"]
-    assert "<b>Preço:</b> R$ 1.299,90" in text
+    assert "<b>R$ 1.299,90</b>" in text
     assert "Por que combinou" in text
     assert "&lt;rápido&gt;" in text and "&amp;" in text
+    assert "<blockquote>Combina &lt;muito&gt;.</blockquote>" in text
+    assert bodies[0]["link_preview_options"] == {"is_disabled": True}
+    assert bodies[0]["reply_markup"]["inline_keyboard"][0][0]["text"].endswith(
+        "Ver promoção"
+    )
 
     evaluator = GeminiEvaluator(
         api_key="x",
@@ -163,3 +169,20 @@ async def test_sink_and_evaluator_follow_persistent_ui_language() -> None:
     prompt = request["contents"][0]["parts"][0]["text"]
     assert "Brazilian Portuguese" in prompt
     await evaluator.close()
+
+
+def test_promotion_omits_unavailable_fields_and_escapes_reason() -> None:
+    promotion = Promotion(
+        id="missing",
+        source="",
+        title="Deal <today>",
+    )
+    text = format_promotion(
+        promotion, "Matches <unsafe>", language="en"
+    )
+
+    assert "R$" not in text
+    assert "Source:" not in text
+    assert "Temperature:" not in text
+    assert "&lt;today&gt;" in text
+    assert "<blockquote>Matches &lt;unsafe&gt;</blockquote>" in text

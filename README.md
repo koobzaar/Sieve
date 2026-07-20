@@ -31,10 +31,17 @@
 
 ---
 
+> [!WARNING]
+> **Sieve is beta software and releases may break existing deployments.** Pin a known-working
+> release, and do not update a healthy bot without reviewing [CHANGELOG.md](CHANGELOG.md). Back up
+> SQLite state before every update. Downgrades require restoring the pre-migration backup. Sieve
+> never requires or stores phone numbers.
+
 ## Overview
 
-Sieve watches enabled promotion sources, throws away everything that doesn't match your live
-preference profile, and forwards the survivors to a private Telegram chat.
+Sieve watches enabled promotion sources, evaluates each promotion independently against every
+active member's private preference profile, and forwards the survivors to that member's private
+Telegram chat.
 
 To track something, just send the bot a message. You can describe a product by name, set a maximum
 price, require a model or attribute, add aliases, or exclude entire categories—no preference syntax
@@ -57,10 +64,13 @@ It's designed to sit on a Raspberry Pi 4B (2 GB) indefinitely: one process, a bo
 SQLite WAL database that prunes itself.
 
 > [!IMPORTANT]
-> Fresh deployments run in **shadow mode**. Shadow deliveries land in the same private chat with a
-> visible `SHADOW` prefix and a silent notification, so you can calibrate against real traffic
-> without trusting the filter yet. Switching to `live` is a deliberate, staged decision — see
-> [Rollout](#rollout).
+> Promotion delivery is always live and audible. BM25 keeps its own independent
+> `off`/`shadow`/`live` auto-forward calibration control; `shadow` there records candidates but
+> does not create test deliveries.
+
+Sieve uses immutable UUIDv4 member identities and never uses Telegram names or phone numbers as
+identifiers. The administrator invites members with `/invite`; members redeem the single-use token
+in a private `/start <token>`, see only their own state, and can retrieve their UUID with `/account`.
 
 ---
 
@@ -93,7 +103,7 @@ flowchart TD
     BM -->|2 &le; score &lt; 7| LLM
     BM -->|score &ge; 7| GATE{Deterministic gates?}
     GATE -->|no| LLM
-    GATE -->|yes + shadow| CAND[Mark candidate]
+    GATE -->|yes + BM25 shadow| CAND[Mark candidate]
     CAND --> LLM[Gemini structured decision]
     GATE -->|yes + validated live mode| DEL
 
@@ -102,7 +112,8 @@ flowchart TD
     LLM -->|transient error| RQ[Retry queue<br/>100 items / 1h TTL]
     RQ --> LLM
 
-    DEL --> OUT[Private Telegram chat<br/><i>SHADOW prefix while shadow</i>]
+    DEL --> OBOX[Persistent per-user outbox]
+    OBOX --> OUT[Private Telegram chats<br/><i>audible, localized delivery</i>]
 ```
 
 ### Stage notes
@@ -110,12 +121,12 @@ flowchart TD
 | Stage                  | Behaviour                                                                                                                                                                                                                                                                                                                              |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Spam / exclusions / hard rules** | Fixed spam checks run first, followed by live explicit exclusions. Ordered, token-aware `allow`/`deny` rules use the first matching priority, so narrow exceptions can precede broader category denials. |
-| **Deduplication**      | Exact content hash and native source ID, persisted in SQLite.                                                                                                                                                                                                                                                                          |
+| **Deduplication**      | Global native replay protection plus per-user, cross-group URL/product fingerprints persisted for 24 hours. |
 | **Constraints**        | Reliably matched interest price violations and excluded attributes are discarded before any exceptional bypass. Missing required attributes remain undecided. |
 | **Exceptional bypass** | Normally skips BM25 and the LLM. If a promotion may match an interest but its required attributes cannot be proven, it skips BM25 and goes to Gemini instead. |
 | **BM25**               | Weighted Okapi BM25 (`k1=1.2`, `b=0.75`) with lower `2.0` and experimental upper `7.0` routing thresholds. Importance `0–100` maps to `0.5×–1.5×`. BM25 fails open to Gemini during cold start and alias rebuilds. |
 | **Gemini**             | Structured JSON decision, minimal thinking budget, ≤160 output tokens, no conversation history, 3 retries on transient failure.                                                                                                                                                                                                        |
-| **Delivery**           | Single-claim delivery per promotion, so a restart mid-send can't double-post.                                                                                                                                                                                                                                                          |
+| **Delivery**           | Per-user persistent outbox with restart recovery, bounded retries, and visible permanent failures. Delivery is at least once, so an ambiguous timeout may rarely duplicate a notification rather than lose it. |
 
 Gemini promotion evaluation is optional. When `pipeline.gemini_evaluation_enabled` is `false`,
 natural-language preference messages still use Gemini, but promotion decisions are deterministic.
@@ -231,7 +242,6 @@ avoids treating missing information as evidence either way.
 git clone https://github.com/koobzaar/Sieve.git
 cd Sieve
 cp .env.example .env
-cp config/config.example.yaml config/config.yaml
 ```
 
 Fill in `.env` with the credentials required by the integrations you plan to enable:
@@ -240,17 +250,18 @@ Fill in `.env` with the credentials required by the integrations you plan to ena
 TELEGRAM_API_ID=
 TELEGRAM_API_HASH=
 TELEGRAM_BOT_TOKEN=
-TELEGRAM_PRIVATE_CHAT_ID=
+TELEGRAM_ADMIN_USER_ID=
 GEMINI_API_KEY=
 ```
 
 > [!WARNING]
-> Both `.env` and `config/config.yaml` are gitignored — keep them that way. The tracked
-> `config/config.example.yaml` is a safe template and is not loaded by Sieve.
+> Keep `.env`, Telegram session files, and SQLite state private. The tracked
+> `config/config.yaml` is complete and contains no secrets; secrets are resolved from environment
+> variable names.
 
 Edit `config/config.yaml`: set your profile, aliases and hard rules; add Telegram `chat_ids`;
-configure preference ownership if wanted; and explicitly set `enabled: true` only for the sources,
-Gemini evaluation and preference bot integrations you intend to run. The copied template starts
+set `preferences.admin_telegram_user_id_env`; and explicitly set `enabled: true` only for the sources,
+Gemini evaluation and preference bot integrations you intend to run. The tracked config starts
 with every external integration disabled.
 
 ### 2. Authenticate the Telegram user session
@@ -262,8 +273,9 @@ docker compose run --rm sieve \
   --config /app/config/config.yaml auth-telegram --source telegram-principal
 ```
 
-Enter the login code and 2FA password when prompted. Then set the source's numeric `chat_ids` and
-`enabled: true` in `config/config.yaml`.
+Scan the terminal QR code from Telegram's **Settings → Devices → Link Desktop Device**. Enter only
+your 2FA password if Telegram requests it. Then set the source's numeric `chat_ids` and `enabled:
+true` in `config/config.yaml`.
 
 ### 3. Validate and run
 
@@ -275,7 +287,9 @@ docker compose logs -f sieve
 ```
 
 Health is checked automatically every 60s via the `health` subcommand — it verifies
-`PRAGMA quick_check` and a runtime heartbeat newer than 180 seconds.
+`PRAGMA quick_check` and a runtime heartbeat newer than 180 seconds. JSON logs report component,
+exception type, provider status/code, consecutive failures, retry timing, and alert decisions
+without logging message bodies, contact data, Telegram tokens, usernames, or display names.
 
 <details>
 <summary><b>Running without Docker</b></summary>
@@ -295,7 +309,7 @@ You'll need to point `state.path` and `session_path` at writable local directori
 
 ## Supported promotion sources
 
-All sources are disabled in the copied template. Enable only the adapters you have configured.
+All sources are disabled in the tracked configuration. Enable only the adapters you have configured.
 
 | Source | Coverage | Default | Required settings |
 | --- | --- | --- | --- |
@@ -324,14 +338,13 @@ pipeline does not need source-specific changes.
 
 ## Configuration
 
-Copy the complete tracked [`config/config.example.yaml`](config/config.example.yaml) template to
-the ignored `config/config.yaml`, then edit that one active file. Every Sieve command uses
-`config/config.yaml` by default. Configuration inheritance is not supported. Secrets are read
-from environment variables named _by_ the config, never stored in YAML.
+Edit the complete tracked [`config/config.yaml`](config/config.yaml). Every Sieve command uses this
+single file by default. Configuration inheritance is not supported. Secrets are read from
+environment variables named _by_ the config, never stored in YAML.
 
 ### Upgrading from the layered configuration
 
-Preserve your existing operator-owned configuration before doing anything with the new example:
+Back up your database and preserve the existing configuration before replacing layered settings:
 
 ```bash
 mv config/config.local.yaml config/config.yaml
@@ -339,22 +352,22 @@ mv config/config.local.yaml config/config.yaml
 # cp config/config.local.yaml config/config.yaml
 ```
 
-Do not copy the example over the migrated file. Old overrides may contain an `extends` line and
-omit values that previously came from the tracked base; remove `extends` and compare your migrated
-file with `config/config.example.yaml` to add the complete settings required by this release.
+Old overrides may contain an `extends` line and omit values that came from a base file. Remove
+`extends` and compare the migrated file with `config/config.yaml`. Removed runtime/source modes,
+owner/chat keys, or sink chat destinations cause a clear validation error and must be deleted.
 
 <details>
 <summary><b>Key sections</b></summary>
 
 | Block       | Notable keys                                                                                                                |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `runtime`   | `mode` (`shadow`/`live`), `queue_capacity`, `memory_limit_mb`, `failure_alert_threshold`, `llm_outage_alert_seconds`        |
+| `runtime`   | `queue_capacity`, `memory_limit_mb`, `failure_alert_threshold`, `llm_outage_alert_seconds`                            |
 | `state`     | `path`, `retention_days`, `retention_cap`, `corpus_limit`, `retry_limit`, `retry_ttl_seconds`                               |
 | `pipeline`  | `gemini_evaluation_enabled`, BM25 thresholds/mode/audit parameters, profile, aliases and rules                         |
 | `evaluator` | `factory`, model name, provider URL, timeout, `max_output_tokens`, `retries`                                                |
-| `preferences` | enablement, owner/chat ID env vars, polling/queue limits, confirmation TTL, entry/operation/state caps, optional parser overrides |
-| `sink`      | `factory`, token/chat-ID env var names, API URL, timeout                                                                    |
-| `sources`   | list of `{name, factory, enabled, mode, settings}`                                                                          |
+| `preferences` | enablement, admin Telegram user-ID env var, `max_users`, polling/queue limits, confirmation TTL, state caps, parser overrides |
+| `sink`      | `factory`, token env var, API URL, timeout                                                                                  |
+| `sources`   | list of `{name, factory, enabled, settings}`                                                                                |
 
 </details>
 
@@ -369,9 +382,6 @@ listing mentioning any of those terms matches the profile's mention of any other
 has a stable `id`, an `allow` or `deny` action, and either `any` phrases or `all` groups. Phrase
 matching is accent-insensitive and token-aware. The first matching rule wins, which makes narrow
 allows predictable and leaves generic products to broader denials.
-
-Per-source `mode` overrides `runtime.mode`, which is what lets you promote one Telegram group to
-`live` while everything else stays in shadow.
 
 ### Deterministic promotion filtering
 
@@ -409,8 +419,16 @@ The configured private owner can send natural-language instructions to the deliv
 checks both private chat and sender IDs before Gemini sees a message. On the first message it uses
 the Telegram profile language as a hint; the selected language is then persisted in SQLite and can
 be changed with `/language`. User-facing UI and generated reasons are currently available in
-English and Brazilian Portuguese. The interface uses descriptive HTML screens and buttons and
-paginates long preference lists. Deterministic commands are:
+English and Brazilian Portuguese. All Telegram copy lives in validated YAML catalogs under
+`promo_bot/locales`; startup rejects missing/extra keys, mismatched placeholders, duplicate YAML
+keys, translated HTML, and inconsistent plural forms. Unknown locale hints fall back to English.
+
+The interface uses safe HTML templates and a hybrid navigation model. Typed requests, onboarding,
+promotions, and operational alerts create messages; inline menu navigation edits one live panel.
+Callbacks are acknowledged before state access, confirmation cards replace themselves with their
+final state, language choices show a check mark, and preference pagination uses compact
+`‹` / `2/4` / `›` controls. Home is role-aware and exposes Preferences, History, Language,
+Account, Help, and administrator membership management. Deterministic commands are:
 
 - `/start` and `/help`
 - `/preferences` and `/history`
@@ -418,6 +436,7 @@ paginates long preference lists. Deterministic commands are:
 - `/undo`
 - `/confirm <id>` and `/cancel <id>`
 - `/language`
+- `/account`
 
 The presentation follows Telegram's official [Bot API HTML and inline keyboard
 features](https://core.telegram.org/bots/api) and its guidance for discoverable `/start`, `/help`,
@@ -433,9 +452,16 @@ reverts, and multi-entry undo always require an ID-bound confirmation. Applied r
 indefinitely and rollback always creates a new revision.
 
 Telegram commands use Bot API long polling (`getUpdates`, 30 seconds, 20 updates) and refuse to
-start if the bot has an active webhook. The durable SQLite outbox and processed-update offset make
-restarts safe. Gemini-backed mutations are limited persistently to five per minute and twenty per
-hour; previews consume the limit, while queries and confirmations do not.
+start if the bot has an active webhook. The durable SQLite reply outbox persists both `send` and
+`edit` operations with target message IDs. Telegram's “message is not modified” result completes
+an edit; an unavailable edit target is converted once into a fresh send so restarts cannot create
+an edit/fallback loop. The processed-update offset makes update handling restart-safe.
+Gemini-backed mutations are limited persistently to five per minute and twenty per hour; previews
+consume the limit, while queries and confirmations do not.
+
+Promotion notifications are audible compact cards with an escaped title and price, concise
+source/temperature metadata, a short blockquoted match reason, disabled link previews, and a
+localized URL button. Missing values are omitted instead of rendered as placeholders.
 
 ---
 
@@ -446,8 +472,8 @@ The `sieve` entrypoint takes a global `--config` and `--log-level`, then a subco
 | Command                                                                                  | Purpose                                                                        |
 | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | `run`                                                                                    | Start the service.                                                             |
-| `auth-telegram [--source NAME] [--phone NUMBER]`                                         | Create or refresh the persisted Telethon source session.                       |
-| `smoke-telegram-preferences [--source NAME] [--session-path PATH] [--phone NUMBER] [--timeout SECONDS]` | Run the non-mutating live preference-bot gate with a dedicated user session. |
+| `auth-telegram [--source NAME]`                                                          | Create or refresh the persisted Telethon source session with QR login.         |
+| `smoke-telegram-preferences [--source NAME] [--session-path PATH] [--timeout SECONDS]`   | Run the non-mutating live preference-bot gate with a dedicated user session.   |
 | `replay FIXTURE [--no-fail]`                                                             | Score pre-LLM filtering against a labeled JSONL file.                          |
 | `health`                                                                                 | Print JSON health status; exit 1 if unhealthy. Used by the Docker healthcheck. |
 | `validate-config`                                                                        | Parse the YAML without touching secrets.                                       |
@@ -509,17 +535,17 @@ and removes its isolated SQLite volume unconditionally.
 
 ## Rollout
 
-Shadow mode exists because a filter that silently eats a good deal is worse than one that's noisy.
-Advance one step at a time:
+Promotion delivery has no shadow mode. Calibrate the independent BM25 auto-forward path before
+changing `pipeline.bm25_auto_forward_mode` to `live`:
 
 - [ ] Run the full suite — fixture, contract, integration, recovery and soak tests
 - [ ] Run the deterministic Docker black-box gate:
       `SIEVE_RUN_SYSTEM=1 python -m pytest -m system`
-- [ ] Run **all** sources in shadow for seven days
-- [ ] Review replay metrics; tune initial YAML before the first seed, then use live preference commands
+- [ ] Keep BM25 auto-forward in `shadow` until its candidate evidence is acceptable
+- [ ] Review replay metrics; tune the initial profile, aliases, rules, and BM25 threshold
 - [ ] With the deployed preference bot running, run the non-mutating live gate:
       `docker compose run --rm sieve --config /app/config/config.yaml smoke-telegram-preferences --source telegram-principal`
-- [ ] Promote **one** Telegram source to `live` for 48 hours
+- [ ] Switch only BM25 auto-forward to `live`; promotion sources themselves have no mode
 - [ ] Enable remaining Telegram sources, then Pelando
 
 Do not advance unless all of the following hold: no duplicate live deliveries, no sustained memory
@@ -529,9 +555,10 @@ The live gate resolves the bot username from its configured token, verifies that
 Telethon user is the configured preference owner, sends `/preferences`, performs a nonce-bearing
 `/preview`, and proves the authoritative response is unchanged. Its default session is
 `/state/telegram-smoke-user`; never point `--session-path` at a configured source session.
-First-time authorization may require `--phone`, a login code and 2FA. The command prints only a
-concise JSON report and exits non-zero on timeouts, identity/webhook conflicts, ambiguous previews,
-or changed state. `--timeout` defaults to 90 seconds and accepts a bounded 10–300 seconds.
+First-time authorization displays a QR code and may request a 2FA password; no phone number is
+accepted. The command prints only a concise JSON report and exits non-zero on timeouts,
+identity/webhook conflicts, ambiguous previews, or changed state. `--timeout` defaults to 90
+seconds and accepts a bounded 10–300 seconds.
 
 ---
 

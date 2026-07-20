@@ -29,8 +29,15 @@
 
 </div>
 
+> [!WARNING]
+> **O Sieve está em beta e novas versões podem quebrar implantações existentes.** Fixe uma versão
+> conhecida e não atualize um bot saudável sem revisar o [CHANGELOG.md](CHANGELOG.md). Faça backup
+> do SQLite antes de atualizar. Para fazer downgrade, restaure o backup anterior à migração. O
+> Sieve nunca exige nem armazena números de telefone.
+
 O Sieve acompanha as fontes de promoções habilitadas, descarta o que não corresponde às suas
-preferências ao vivo e envia somente as promoções relevantes para uma conversa privada. Ele foi
+preferências privadas e envia cada promoção relevante de forma independente para cada membro
+ativo. Ele foi
 projetado para funcionar continuamente em hardware pequeno: processo único, filas limitadas,
 SQLite em modo WAL e limite de memória do contêiner.
 
@@ -46,8 +53,13 @@ Não quero promoções de perfumes
 ```
 
 > [!IMPORTANT]
-> Uma instalação nova começa em modo `shadow`. As promoções são enviadas silenciosamente como
-> teste até você validar os filtros e mudar deliberadamente para `live`.
+> A entrega de promoções é sempre ao vivo e com som. O autoencaminhamento BM25 mantém seu controle
+> de calibração independente `off`/`shadow`/`live`; o `shadow` do BM25 registra candidatos, mas não
+> cria entregas de teste.
+
+Cada membro recebe um UUIDv4 imutável. O administrador cria convites com `/invite`; o membro resgata
+o token de uso único em uma conversa privada com `/start <token>` e consulta seu UUID com
+`/account`. Nomes, usernames e números de telefone não são usados como identidade.
 
 ## Como funciona
 
@@ -75,11 +87,13 @@ flowchart TD
     B -->|2 até menos de 7| G
     B -->|7 ou mais| K{Gates determinísticos?}
     K -->|não| G
-    K -->|sim e shadow| S[Marcar candidato]
+    K -->|sim e shadow BM25| S[Marcar candidato]
     S --> G
     K -->|sim e live validado| O
     G -->|forward| O
     G -->|discard| D
+    O --> X[Outbox persistente por usuário]
+    X --> T[Conversas privadas<br/>entrega audível e localizada]
 ```
 
 A ordem é intencional:
@@ -275,32 +289,34 @@ não autorizadas não consomem. O estado persiste após reinicializações.
 
 O Sieve usa duas identidades diferentes:
 
-- a **conta de usuário** do Telethon lê os grupos e exige login único por telefone/código;
-- o **bot** entrega promoções e recebe comandos por Bot API; ele não faz login por telefone.
+- a **conta de usuário** do Telethon lê os grupos e é autorizada por QR code;
+- o **bot** entrega promoções e recebe comandos por Bot API usando IDs numéricos do Telegram e
+  UUIDs internos.
 
 ### 1. Configuração
 
 ```powershell
-Copy-Item config/config.example.yaml config/config.yaml
 Copy-Item .env.example .env
 ```
 
 Preencha `.env` apenas com as credenciais das integrações que pretende ativar. Depois edite
-`config/config.yaml`: configure perfil, aliases, regras, `chat_ids` e preferências; ative
-explicitamente somente as fontes, a avaliação Gemini e o bot de preferências que pretende usar.
-O exemplo começa com todas as integrações externas desativadas. Nunca faça commit de tokens,
-chaves, `config/config.yaml` ou do arquivo de sessão do Telegram.
+`config/config.yaml`: configure perfil, aliases, regras, `chat_ids`,
+`preferences.admin_telegram_user_id_env` e preferências; ative explicitamente somente as fontes,
+a avaliação Gemini e o bot de preferências que pretende usar. A configuração rastreada começa com
+todas as integrações externas desativadas. Nunca faça commit de tokens, chaves, estado SQLite ou
+arquivos de sessão do Telegram.
 
 ### 2. Login único da conta que lê grupos
 
-No PowerShell, informe o telefone explicitamente ou configure a variável esperada:
+No PowerShell, execute o comando interativo:
 
 ```powershell
 docker compose run --rm -it sieve --config /app/config/config.yaml `
-  auth-telegram --source telegram-principal --phone +55SEUNUMERO
+  auth-telegram --source telegram-principal
 ```
 
-Esse comando é somente para a sessão Telethon. O bot de entrega usa `TELEGRAM_BOT_TOKEN` diretamente.
+Escaneie o QR code em **Telegram → Configurações → Dispositivos → Conectar Desktop**. Somente a
+senha de 2FA pode ser solicitada. O bot de entrega usa `TELEGRAM_BOT_TOKEN` diretamente.
 
 ### 3. Validar e iniciar
 
@@ -312,6 +328,10 @@ docker compose logs -f sieve
 ```
 
 Se ativou o bot de preferências, abra a conversa privada com ele e envie `/start`.
+
+Os logs JSON informam componente, tipo da exceção, status/código do provedor, falhas consecutivas,
+tempo até nova tentativa e decisão de alerta sem registrar corpos de mensagens, contatos, tokens do
+Telegram, usernames ou nomes de exibição.
 
 ## Preferências e persistência
 
@@ -333,10 +353,9 @@ atomicamente e o anterior é removido depois.
 
 ## Configuração principal
 
-Copie o modelo completo [`config/config.example.yaml`](config/config.example.yaml) para o arquivo
-ignorado `config/config.yaml` e edite esse único arquivo ativo. Todos os comandos do Sieve usam
-`config/config.yaml` por padrão. Herança de configuração não é suportada. Segredos são lidos de
-variáveis de ambiente.
+Edite o arquivo completo e rastreado [`config/config.yaml`](config/config.yaml). Todos os comandos
+do Sieve usam esse único arquivo por padrão. Herança de configuração não é suportada. Segredos são
+lidos de variáveis de ambiente.
 
 ### Atualização da configuração em camadas
 
@@ -348,19 +367,19 @@ Move-Item config/config.local.yaml config/config.yaml
 # Copy-Item config/config.local.yaml config/config.yaml
 ```
 
-Não copie o exemplo por cima do arquivo migrado. Overrides antigos podem conter `extends` e omitir
-valores que vinham do arquivo-base; remova `extends` e compare o arquivo migrado com
-`config/config.example.yaml` para incluir todas as configurações exigidas nesta versão.
+Overrides antigos podem conter `extends` e omitir valores que vinham do arquivo-base; remova
+`extends` e compare o arquivo migrado com `config/config.yaml`. Modos de runtime/fonte, chaves
+antigas de proprietário/chat e o destino de chat no sink foram removidos e geram erro claro.
 
 | Bloco | Responsabilidade |
 | --- | --- |
-| `runtime` | modo, capacidade de fila, memória e alertas |
+| `runtime` | capacidade de fila, memória e alertas |
 | `state` | caminho SQLite, retenção, corpus e tentativas |
 | `pipeline` | opção de avaliação Gemini, limiares e modo BM25, auditoria, perfil, aliases e regras |
 | `evaluator` | modelo Gemini, timeout e tentativas |
-| `preferences` | proprietário, polling, confirmações, limites e parser |
-| `sink` | bot e conversa privada de destino |
-| `sources` | origens Telegram/Pelando e seus modos |
+| `preferences` | administrador, `max_users`, polling, confirmações, limites e parser |
+| `sink` | token do bot, API e timeout |
+| `sources` | origens Telegram/Pelando habilitadas e configurações |
 
 ### Fontes de promoções suportadas
 
@@ -410,8 +429,8 @@ estiverem ativadas.
 
 ```text
 sieve [--config ARQUIVO] [--log-level NÍVEL] run
-sieve [--config ARQUIVO] auth-telegram [--source NOME] [--phone NÚMERO]
-sieve [--config ARQUIVO] smoke-telegram-preferences [--source NOME] [--session-path CAMINHO] [--phone NÚMERO] [--timeout SEGUNDOS]
+sieve [--config ARQUIVO] auth-telegram [--source NOME]
+sieve [--config ARQUIVO] smoke-telegram-preferences [--source NOME] [--session-path CAMINHO] [--timeout SEGUNDOS]
 sieve [--config ARQUIVO] replay FIXTURE [--no-fail]
 ```
 
@@ -438,23 +457,25 @@ BM25, reconstruções de aliases, integração e carga.
 - [ ] Execute a suíte completa, incluindo contrato, recuperação e carga.
 - [ ] Execute o gate Docker determinístico:
       `$env:SIEVE_RUN_SYSTEM="1"; python -m pytest -m system`.
-- [ ] Mantenha todas as fontes em `shadow` por sete dias e revise as métricas de replay.
+- [ ] Mantenha apenas o autoencaminhamento BM25 em `shadow` até a evidência ser aceitável e revise
+      as métricas de replay.
 - [ ] Com o bot implantado em execução, execute o gate Telegram sem mutação:
       `docker compose run --rm sieve --config /app/config/config.yaml smoke-telegram-preferences --source telegram-principal`.
-- [ ] Promova uma fonte por vez para `live` e confirme ausência de duplicatas e recuperação limpa
-      após reinícios.
+- [ ] Mude apenas `pipeline.bm25_auto_forward_mode` para `live`; fontes de promoção não têm modo.
 
 O gate ao vivo descobre o usuário do bot pelo token configurado, confirma que a conta Telethon é a
 proprietária das preferências, envia `/preferences`, usa uma solicitação `/preview` com nonce e
 confirma que o estado autoritativo não mudou. Ele usa por padrão a sessão dedicada
-`/state/telegram-smoke-user`; nunca reutilize o caminho da sessão de uma fonte. No primeiro uso,
-`--phone`, código de login e 2FA podem ser necessários. A saída contém somente um relatório JSON
-conciso e qualquer timeout, webhook, identidade divergente, prévia ambígua ou mudança de estado
-encerra o comando com falha. `--timeout` usa 90 segundos por padrão e aceita de 10 a 300 segundos.
+`/state/telegram-smoke-user`; nunca reutilize o caminho da sessão de uma fonte. No primeiro uso, o
+comando mostra um QR code e pode pedir a senha de 2FA; números de telefone não são aceitos. A saída
+contém somente um relatório JSON conciso e qualquer timeout, webhook, identidade divergente, prévia
+ambígua ou mudança de estado encerra o comando com falha. `--timeout` usa 90 segundos por padrão e
+aceita de 10 a 300 segundos.
 
 ## Segurança operacional
 
-- chat e remetente precisam coincidir com o proprietário antes de qualquer chamada ao Gemini;
+- chat e remetente precisam corresponder ao UUID ativo antes de qualquer chamada ao Gemini;
+- somente um administrador ativo pode convidar, listar, desabilitar ou reabilitar membros;
 - o bot recusa iniciar o polling quando existe webhook ativo e não o remove automaticamente;
 - respostas e offsets só avançam depois que o resultado e a resposta estão duráveis;
 - a fila e o outbox têm capacidade limitada;
