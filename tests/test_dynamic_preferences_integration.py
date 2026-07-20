@@ -34,6 +34,7 @@ def setup(
     threshold=0.1,
     auto_forward_threshold=None,
     auto_forward_mode="shadow",
+    gemini_evaluation_enabled=True,
 ):
     state = SQLiteStateStore(tmp_path / "state.db")
 
@@ -55,6 +56,7 @@ def setup(
         profile=profile,
         aliases={},
         hard_rules=(),
+        gemini_evaluation_enabled=gemini_evaluation_enabled,
         threshold=threshold,
         auto_forward_threshold=auto_forward_threshold,
         auto_forward_mode=auto_forward_mode,
@@ -100,6 +102,82 @@ async def test_high_score_shadow_candidate_still_uses_gemini(tmp_path) -> None:
         "SELECT auto_forward_candidate FROM decisions WHERE native_id='shadow-high'"
     ).fetchone()
     assert int(stored[0]) == 1
+    state.close()
+
+
+async def test_disabled_gemini_keeps_only_live_deterministic_auto_forward(tmp_path) -> None:
+    state, preferences, evaluator, sink, pipeline = setup(
+        tmp_path,
+        profile="ssd",
+        threshold=0,
+        auto_forward_threshold=0.01,
+        auto_forward_mode="live",
+        gemini_evaluation_enabled=False,
+    )
+    preferences.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={"name": "SSD", "search_terms": ["ssd"]},
+            )
+        ],
+        base_revision=0,
+        original_message="quero SSD",
+        actor_id=42,
+        update_id=1,
+        summary="SSD",
+    )
+
+    rejected = await pipeline.process(
+        Promotion(id="accessory", source="telegram", title="Capa para SSD externo")
+    )
+    forwarded = await pipeline.process(
+        Promotion(id="product", source="telegram", title="SSD NVMe 1TB")
+    )
+
+    assert rejected.stage == "deterministic"
+    assert rejected.reason.endswith("deterministic_gates_failed")
+    assert forwarded.stage == "bm25_auto_forward"
+    assert forwarded.decision == Decision.FORWARD
+    assert evaluator.calls == []
+    assert [item[0].id for item in sink.sent] == ["product"]
+    state.close()
+
+
+async def test_disabled_gemini_records_shadow_candidate_without_delivery(tmp_path) -> None:
+    state, preferences, evaluator, sink, pipeline = setup(
+        tmp_path,
+        profile="ssd",
+        threshold=0,
+        auto_forward_threshold=0.01,
+        auto_forward_mode="shadow",
+        gemini_evaluation_enabled=False,
+    )
+    preferences.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={"name": "SSD", "search_terms": ["ssd"]},
+            )
+        ],
+        base_revision=0,
+        original_message="quero SSD",
+        actor_id=42,
+        update_id=1,
+        summary="SSD",
+    )
+
+    result = await pipeline.process(
+        Promotion(id="shadow-only", source="telegram", title="SSD NVMe 1TB")
+    )
+
+    assert result.stage == "deterministic"
+    assert result.reason.endswith("auto_forward_shadow")
+    assert result.auto_forward_candidate
+    assert evaluator.calls == []
+    assert sink.sent == []
     state.close()
 
 
@@ -310,6 +388,43 @@ async def test_exceptional_with_unproven_attributes_skips_bm25_but_satisfied_byp
     assert satisfied.stage == "exceptional"
     assert len(evaluator.calls) == 1
     assert len(sink.sent) == 1
+    state.close()
+
+
+async def test_disabled_gemini_discards_uncertain_exceptional_offer(tmp_path) -> None:
+    state, preferences, evaluator, sink, pipeline = setup(
+        tmp_path,
+        profile="notebook",
+        threshold=999,
+        gemini_evaluation_enabled=False,
+    )
+    preferences.apply(
+        [
+            PreferenceOperation(
+                OperationAction.ADD,
+                PreferenceKind.INTEREST,
+                data={
+                    "name": "notebook",
+                    "search_terms": ["notebook"],
+                    "constraints": {"attributes": {"memory": ["16gb"]}},
+                },
+            )
+        ],
+        base_revision=0,
+        original_message="notebook 16gb",
+        actor_id=42,
+        update_id=1,
+        summary="notebook",
+    )
+
+    result = await pipeline.process(
+        Promotion(id="uncertain", source="pelando", title="Notebook", temperature=300)
+    )
+
+    assert result.stage == "deterministic"
+    assert result.reason.endswith("uncertain_exceptional")
+    assert evaluator.calls == []
+    assert sink.sent == []
     state.close()
 
 

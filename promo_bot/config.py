@@ -66,6 +66,7 @@ class AppConfig:
     profile: str
     aliases: dict[str, list[str]]
     hard_rules: tuple[HardFilterRule, ...]
+    gemini_evaluation_enabled: bool
     bm25_threshold: float
     bm25_auto_forward_threshold: float
     bm25_auto_forward_mode: Literal["off", "shadow", "live"]
@@ -87,6 +88,12 @@ class AppConfig:
 def _mapping(value: Any, key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigurationError(f"{key} must be a mapping")
+    return value
+
+
+def _boolean(value: Any, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigurationError(f"{key} must be a boolean")
     return value
 
 
@@ -285,6 +292,10 @@ def load_config(path: str | Path) -> AppConfig:
         )
     if preference_config.rate_per_minute <= 0 or preference_config.rate_per_hour <= 0:
         raise ConfigurationError("preference rate limits must be positive")
+    gemini_evaluation_enabled = _boolean(
+        pipeline.get("gemini_evaluation_enabled", True),
+        "pipeline.gemini_evaluation_enabled",
+    )
     bm25_threshold = float(pipeline.get("bm25_threshold", 2.0))
     bm25_auto_forward_threshold = float(
         pipeline.get("bm25_auto_forward_threshold", 7.0)
@@ -328,6 +339,7 @@ def load_config(path: str | Path) -> AppConfig:
         profile=str(pipeline.get("profile", "")),
         aliases={str(k): [str(v) for v in values] for k, values in aliases.items()},
         hard_rules=_hard_rules(pipeline),
+        gemini_evaluation_enabled=gemini_evaluation_enabled,
         bm25_threshold=bm25_threshold,
         bm25_auto_forward_threshold=bm25_auto_forward_threshold,
         bm25_auto_forward_mode=bm25_auto_forward_mode,  # type: ignore[arg-type]

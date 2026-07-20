@@ -23,3 +23,6 @@ sources:
     settings:
       chat_ids:
         - -1001234567890
+
+  - name: pelando
+    enabled: false
