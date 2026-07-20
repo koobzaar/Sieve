@@ -203,7 +203,7 @@ def test_tracked_base_and_local_example_are_safe_and_valid() -> None:
     base = load_config("config/config.yaml")
     example = load_config("config/config.local.example.yaml")
 
-    assert not base.sources[0].enabled
+    assert base.sources[0].enabled
     assert not base.sources[1].enabled
     assert base.sources[0].settings["chat_ids"] == []
     assert "config.local.yaml" in base.profile

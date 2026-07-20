@@ -73,7 +73,7 @@ sink:
 sources:
   - name: telegram-principal
     factory: promo_bot.sources.telegram:create_telegram_source
-    enabled: false
+    enabled: true
     mode: shadow
     settings:
       api_id_env: TELEGRAM_API_ID

@@ -7,7 +7,7 @@
 
 # Sieve
 
-**A bounded, single-process promotion filter for Telegram and Pelando with BM25 pre-ranking and artificial intelligence.**
+**A bounded, source-pluggable promotion tracker with natural-language preferences, BM25 filtering, and optional artificial intelligence.**
 
 <p>
   <a href="#how-it-works">How it works</a> •
@@ -25,15 +25,16 @@
   <img src="https://img.shields.io/github/stars/koobzaar/Sieve?style=flat" alt="Stars"/>
 </p>
 
+<img src="assets/sieve_telegram.gif" alt="Sieve Telegram bot demonstration" width="100%" />
+
 </div>
 
 ---
 
 ## Overview
 
-Sieve watches deal-sharing Telegram groups and the Pelando `/recentes` feed, throws away
-everything that doesn't match a written preference profile, and forwards the survivors to a
-private Telegram chat.
+Sieve watches enabled promotion sources, throws away everything that doesn't match your live
+preference profile, and forwards the survivors to a private Telegram chat.
 
 To track something, just send the bot a message. You can describe a product by name, set a maximum
 price, require a model or attribute, add aliases, or exclude entire categories—no preference syntax
@@ -290,12 +291,12 @@ You'll need to point `state.path` and `session_path` at writable local directori
 
 ## Supported promotion sources
 
-Built-in sources are disabled in the shared configuration so each installation explicitly chooses
-where its promotions come from. The local example enables Telegram and leaves Pelando disabled.
+Telegram is enabled in the shared configuration; website adapters are opt-in. The local example
+keeps Telegram enabled and Pelando disabled.
 
 | Source | Coverage | Default | Required settings |
 | --- | --- | --- | --- |
-| Telegram groups/channels | Any groups or channels accessible to your Telegram user account | Disabled | Telethon API credentials, a persisted user session, and `chat_ids` |
+| Telegram groups/channels | Any groups or channels accessible to your Telegram user account | Enabled | Telethon API credentials, a persisted user session, and `chat_ids` |
 | [Pelando `/recentes`](https://www.pelando.com.br/recentes) | Brazil-focused deal website | Disabled | No account; optional polling interval, timeout, and user agent |
 
 Enable or disable each source independently in `config/config.local.yaml`:
