@@ -23,6 +23,7 @@ from .tenancy import (
     UnauthorizedMembershipError,
     User,
 )
+from .translation import translations
 
 
 class StoreError(RuntimeError):
@@ -37,10 +38,18 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL CHECK(role IN ('admin','member')),
     status TEXT NOT NULL CHECK(status IN ('active','disabled')),
     inviter_id TEXT REFERENCES users(id),
-    ui_language TEXT NOT NULL DEFAULT 'en' CHECK(ui_language IN ('en','pt-BR')),
+    ui_language TEXT NOT NULL DEFAULT 'en',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS user_locales (
+    user_id TEXT PRIMARY KEY REFERENCES users(id),
+    locale TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE VIEW IF NOT EXISTS resolved_users AS
+SELECT u.*, COALESCE(l.locale,u.ui_language) AS resolved_ui_language
+FROM users u LEFT JOIN user_locales l ON l.user_id=u.id;
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status, role, created_at);
 CREATE TRIGGER IF NOT EXISTS users_id_immutable
 BEFORE UPDATE OF id ON users
@@ -399,7 +408,11 @@ class SQLiteStateStore:
             role=str(row["role"]),
             status=str(row["status"]),
             inviter_id=(str(row["inviter_id"]) if row["inviter_id"] is not None else None),
-            ui_language=str(row["ui_language"]),
+            ui_language=str(
+                row["resolved_ui_language"]
+                if "resolved_ui_language" in row.keys()
+                else row["ui_language"]
+            ),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
@@ -408,13 +421,18 @@ class SQLiteStateStore:
         self, *, telegram_user_id: int, telegram_chat_id: int, ui_language: str = "en"
     ) -> User:
         """Create the one administrator, or return its stable existing identity."""
-        if ui_language not in {"en", "pt-BR"}:
+        if ui_language not in translations.supported_locales:
             raise MembershipError("unsupported UI language")
+        stored_ui_language = (
+            ui_language
+            if ui_language in {"en", "pt-BR"}
+            else "en"
+        )
         with self._lock:
             connection = self._begin()
             try:
                 existing = connection.execute(
-                    "SELECT * FROM users WHERE telegram_user_id=?",
+                    "SELECT * FROM resolved_users WHERE telegram_user_id=?",
                     (int(telegram_user_id),),
                 ).fetchone()
                 if existing is not None:
@@ -425,7 +443,7 @@ class SQLiteStateStore:
                     connection.execute("COMMIT")
                     return user
                 administrator = connection.execute(
-                    "SELECT * FROM users WHERE role='admin' ORDER BY created_at,id LIMIT 1"
+                    "SELECT * FROM resolved_users WHERE role='admin' ORDER BY created_at,id LIMIT 1"
                 ).fetchone()
                 if administrator is not None:
                     if (
@@ -439,13 +457,23 @@ class SQLiteStateStore:
                             (
                                 int(telegram_user_id),
                                 int(telegram_chat_id),
-                                ui_language,
+                                stored_ui_language,
                                 now,
                                 str(administrator["id"]),
                             ),
                         )
+                        connection.execute(
+                            "INSERT INTO user_locales(user_id,locale,updated_at) "
+                            "VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                            "locale=excluded.locale,updated_at=excluded.updated_at",
+                            (
+                                str(administrator["id"]),
+                                ui_language,
+                                now,
+                            ),
+                        )
                         adopted = connection.execute(
-                            "SELECT * FROM users WHERE id=?",
+                            "SELECT * FROM resolved_users WHERE id=?",
                             (str(administrator["id"]),),
                         ).fetchone()
                         connection.execute("COMMIT")
@@ -463,13 +491,19 @@ class SQLiteStateStore:
                         user_id,
                         int(telegram_user_id),
                         int(telegram_chat_id),
-                        ui_language,
+                        stored_ui_language,
                         now,
                         now,
                     ),
                 )
+                connection.execute(
+                    "INSERT INTO user_locales(user_id,locale,updated_at) "
+                    "VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                    "locale=excluded.locale,updated_at=excluded.updated_at",
+                    (user_id, ui_language, now),
+                )
                 created = connection.execute(
-                    "SELECT * FROM users WHERE id=?", (user_id,)
+                    "SELECT * FROM resolved_users WHERE id=?", (user_id,)
                 ).fetchone()
                 connection.execute("COMMIT")
                 user = self._user_from_row(created)
@@ -491,7 +525,7 @@ class SQLiteStateStore:
         """Return the migrated single-owner UUID before Telegram IDs are configured."""
         with self._lock:
             row = self._connection.execute(
-                "SELECT * FROM users WHERE role='admin' ORDER BY created_at,id LIMIT 1"
+                "SELECT * FROM resolved_users WHERE role='admin' ORDER BY created_at,id LIMIT 1"
             ).fetchone()
             user = self._user_from_row(row)
             if user is not None:
@@ -502,7 +536,7 @@ class SQLiteStateStore:
         with self._lock:
             return self._user_from_row(
                 self._connection.execute(
-                    "SELECT * FROM users WHERE telegram_user_id=?",
+                    "SELECT * FROM resolved_users WHERE telegram_user_id=?",
                     (int(telegram_user_id),),
                 ).fetchone()
             )
@@ -511,7 +545,7 @@ class SQLiteStateStore:
         with self._lock:
             return self._user_from_row(
                 self._connection.execute(
-                    "SELECT * FROM users WHERE id=?", (str(user_id),)
+                    "SELECT * FROM resolved_users WHERE id=?", (str(user_id),)
                 ).fetchone()
             )
 
@@ -520,7 +554,7 @@ class SQLiteStateStore:
             return [
                 user
                 for row in self._connection.execute(
-                    "SELECT * FROM users WHERE status='active' ORDER BY created_at,id"
+                    "SELECT * FROM resolved_users WHERE status='active' ORDER BY created_at,id"
                 ).fetchall()
                 if (user := self._user_from_row(row)) is not None
             ]
@@ -585,8 +619,13 @@ class SQLiteStateStore:
             raise InvitationError("malformed invitation token")
         if max_users < 1:
             raise MembershipError("membership capacity must be positive")
-        if ui_language not in {"en", "pt-BR"}:
+        if ui_language not in translations.supported_locales:
             raise MembershipError("unsupported UI language")
+        stored_ui_language = (
+            ui_language
+            if ui_language in {"en", "pt-BR"}
+            else "en"
+        )
         token_hash = self._invitation_hash(token)
         with self._lock:
             connection = self._begin()
@@ -636,10 +675,15 @@ class SQLiteStateStore:
                         int(telegram_user_id),
                         int(telegram_chat_id),
                         str(invitation["inviter_id"]),
-                        ui_language,
+                        stored_ui_language,
                         now,
                         now,
                     ),
+                )
+                connection.execute(
+                    "INSERT INTO user_locales(user_id,locale,updated_at) "
+                    "VALUES(?,?,?)",
+                    (user_id, ui_language, now),
                 )
                 changed = connection.execute(
                     "UPDATE invitations SET redeemed_at=?,redeemed_by=? "
@@ -649,7 +693,7 @@ class SQLiteStateStore:
                 if changed != 1:
                     raise InvitationError("invitation token was already used")
                 row = connection.execute(
-                    "SELECT * FROM users WHERE id=?", (user_id,)
+                    "SELECT * FROM resolved_users WHERE id=?", (user_id,)
                 ).fetchone()
                 connection.execute("COMMIT")
                 user = self._user_from_row(row)
@@ -673,7 +717,7 @@ class SQLiteStateStore:
             return [
                 user
                 for row in self._connection.execute(
-                    "SELECT * FROM users ORDER BY created_at,id"
+                    "SELECT * FROM resolved_users ORDER BY created_at,id"
                 ).fetchall()
                 if (user := self._user_from_row(row)) is not None
             ]
@@ -684,7 +728,7 @@ class SQLiteStateStore:
             try:
                 self._require_admin_locked(connection, actor_id)
                 target = connection.execute(
-                    "SELECT * FROM users WHERE id=?", (str(target_id),)
+                    "SELECT * FROM resolved_users WHERE id=?", (str(target_id),)
                 ).fetchone()
                 if target is None:
                     raise MembershipError("unknown user UUID")
@@ -696,7 +740,7 @@ class SQLiteStateStore:
                     (status, now, str(target_id)),
                 )
                 row = connection.execute(
-                    "SELECT * FROM users WHERE id=?", (str(target_id),)
+                    "SELECT * FROM resolved_users WHERE id=?", (str(target_id),)
                 ).fetchone()
                 connection.execute("COMMIT")
                 user = self._user_from_row(row)
@@ -1333,8 +1377,8 @@ class SQLiteStateStore:
         *,
         language: str,
     ) -> bool:
-        if language not in {"en", "pt-BR"}:
-            raise StoreError("delivery language must be en or pt-BR")
+        if language not in translations.supported_locales:
+            raise StoreError("unsupported delivery language")
         now = self.clock()
         with self._lock:
             connection = self._begin()

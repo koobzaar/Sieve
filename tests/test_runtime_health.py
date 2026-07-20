@@ -72,7 +72,7 @@ async def test_non_schema_source_failures_still_alert_at_threshold(
 
     assert len(sink.alerts) == 1
     assert "TimeoutError" in sink.alerts[0]
-    assert "consecutive failures: 3" in sink.alerts[0]
+    assert "failed 3 consecutive times" in sink.alerts[0]
     threshold_log = next(
         record
         for record in caplog.records

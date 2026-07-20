@@ -91,6 +91,7 @@ def test_revisions_entries_history_languages_and_rate_limits_are_uuid_scoped(tmp
 
     first.set_ui_language(101, "pt-BR")
     assert first.ui_language(101) == "pt-BR"
+    assert state.user_by_id(admin.id).ui_language == "pt-BR"
     assert second.ui_language(102) == "en"
     first.record_rate_event(101)
     assert not first.rate_limit_available(101, per_minute=1)[0]

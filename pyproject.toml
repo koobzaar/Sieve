@@ -27,6 +27,9 @@ sieve = "promo_bot.cli:main"
 [tool.setuptools.packages.find]
 include = ["promo_bot*"]
 
+[tool.setuptools.package-data]
+promo_bot = ["locales/*.yaml"]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"

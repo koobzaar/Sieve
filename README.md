@@ -419,8 +419,16 @@ The configured private owner can send natural-language instructions to the deliv
 checks both private chat and sender IDs before Gemini sees a message. On the first message it uses
 the Telegram profile language as a hint; the selected language is then persisted in SQLite and can
 be changed with `/language`. User-facing UI and generated reasons are currently available in
-English and Brazilian Portuguese. The interface uses descriptive HTML screens and buttons and
-paginates long preference lists. Deterministic commands are:
+English and Brazilian Portuguese. All Telegram copy lives in validated YAML catalogs under
+`promo_bot/locales`; startup rejects missing/extra keys, mismatched placeholders, duplicate YAML
+keys, translated HTML, and inconsistent plural forms. Unknown locale hints fall back to English.
+
+The interface uses safe HTML templates and a hybrid navigation model. Typed requests, onboarding,
+promotions, and operational alerts create messages; inline menu navigation edits one live panel.
+Callbacks are acknowledged before state access, confirmation cards replace themselves with their
+final state, language choices show a check mark, and preference pagination uses compact
+`‹` / `2/4` / `›` controls. Home is role-aware and exposes Preferences, History, Language,
+Account, Help, and administrator membership management. Deterministic commands are:
 
 - `/start` and `/help`
 - `/preferences` and `/history`
@@ -428,6 +436,7 @@ paginates long preference lists. Deterministic commands are:
 - `/undo`
 - `/confirm <id>` and `/cancel <id>`
 - `/language`
+- `/account`
 
 The presentation follows Telegram's official [Bot API HTML and inline keyboard
 features](https://core.telegram.org/bots/api) and its guidance for discoverable `/start`, `/help`,
@@ -443,9 +452,16 @@ reverts, and multi-entry undo always require an ID-bound confirmation. Applied r
 indefinitely and rollback always creates a new revision.
 
 Telegram commands use Bot API long polling (`getUpdates`, 30 seconds, 20 updates) and refuse to
-start if the bot has an active webhook. The durable SQLite outbox and processed-update offset make
-restarts safe. Gemini-backed mutations are limited persistently to five per minute and twenty per
-hour; previews consume the limit, while queries and confirmations do not.
+start if the bot has an active webhook. The durable SQLite reply outbox persists both `send` and
+`edit` operations with target message IDs. Telegram's “message is not modified” result completes
+an edit; an unavailable edit target is converted once into a fresh send so restarts cannot create
+an edit/fallback loop. The processed-update offset makes update handling restart-safe.
+Gemini-backed mutations are limited persistently to five per minute and twenty per hour; previews
+consume the limit, while queries and confirmations do not.
+
+Promotion notifications are audible compact cards with an escaped title and price, concise
+source/temperature metadata, a short blockquoted match reason, disabled link previews, and a
+localized URL button. Missing values are omitted instead of rendered as placeholders.
 
 ---
 

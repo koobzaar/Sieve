@@ -25,6 +25,7 @@ from .preference_store import SQLitePreferenceStore
 from .preferences import AtomicPreferenceProvider, PreferenceSnapshot
 from .sources.pelando import PelandoSchemaError
 from .store import SQLiteStateStore, StoreError
+from .telegram_formatter import TelegramFormatter
 
 logger = logging.getLogger(__name__)
 
@@ -217,12 +218,18 @@ class Service:
         if previous is None or dict(snapshot.aliases) != dict(previous.aliases):
             self.store.start_alias_rebuild(dict(snapshot.aliases))
 
-    def _pick(self, english: str, portuguese: str) -> str:
-        if self.preference_owner_id is not None and self.preference_store.ui_language(
-            self.preference_owner_id
-        ) == "pt-BR":
-            return portuguese
-        return english
+    def _alert_text(self, key: str, **values: object) -> str:
+        preference_store = getattr(
+            self, "preference_store", None
+        )
+        owner_id = getattr(self, "preference_owner_id", None)
+        language = (
+            preference_store.ui_language(owner_id)
+            if preference_store is not None
+            and owner_id is not None
+            else "en"
+        )
+        return TelegramFormatter(language).t(key, **values)
 
     async def report_health(self, name: str, error: Exception | None) -> None:
         try:
@@ -239,8 +246,10 @@ class Service:
             )
             with suppress(Exception):
                 await self.sink.alert(
-                    self._pick("Database", "Banco de dados")
-                    + f": {type(store_error).__name__}: {str(store_error)[:350]}"
+                    self._alert_text(
+                        "alert.database_failure",
+                        error_type=type(store_error).__name__,
+                    )
                 )
             return
         if error is None:
@@ -282,10 +291,11 @@ class Service:
             self._failure_alerted.add(name)
             with suppress(Exception):
                 await self.sink.alert(
-                    f"{name}: {type(error).__name__}: {str(error)[:350]} "
-                    + self._pick(
-                        f"(consecutive failures: {failures})",
-                        f"(falhas consecutivas: {failures})",
+                    self._alert_text(
+                        "alert.component_failure",
+                        component=name,
+                        count=failures,
+                        error_type=type(error).__name__,
                     )
                 )
 
@@ -411,9 +421,9 @@ class Service:
                 )
                 with suppress(Exception):
                     await self.sink.alert(
-                        self._pick(
-                            f"Memory pressure: {used / 1024 / 1024:.1f} MB; preventive restart.",
-                            f"Pressão de memória: {used / 1024 / 1024:.1f} MB; reinício preventivo.",
+                        self._alert_text(
+                            "alert.memory_pressure",
+                            memory_mb=f"{used / 1024 / 1024:.1f}",
                         )
                     )
                 self.store.flush()

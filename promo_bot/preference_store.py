@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import sqlite3
 import threading
@@ -35,6 +36,7 @@ from .preferences import (
     thaw,
     validate_entry_data,
 )
+from .translation import normalize_locale
 
 
 PREFERENCE_SCHEMA = """
@@ -128,6 +130,8 @@ CREATE TABLE IF NOT EXISTS telegram_reply_outbox (
     parse_mode TEXT,
     reply_markup_json TEXT,
     callback_query_id TEXT,
+    operation TEXT NOT NULL DEFAULT 'send',
+    target_message_id INTEGER,
     created_at REAL NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT
@@ -227,12 +231,22 @@ def _migrate_legacy_preferences(
                 connection, "telegram_reply_outbox_legacy"
             )
             parse_mode = "parse_mode" if "parse_mode" in old_columns else "NULL"
+            operation = (
+                "operation" if "operation" in old_columns else "'send'"
+            )
+            target_message_id = (
+                "target_message_id"
+                if "target_message_id" in old_columns
+                else "NULL"
+            )
             connection.execute(
                 "INSERT INTO telegram_reply_outbox("
                 "id,user_id,chat_id,text,parse_mode,reply_markup_json,"
-                "callback_query_id,created_at,attempts,last_error) "
+                "callback_query_id,operation,target_message_id,"
+                "created_at,attempts,last_error) "
                 "SELECT id,?,chat_id,text,"
-                f"{parse_mode},reply_markup_json,callback_query_id,created_at,"
+                f"{parse_mode},reply_markup_json,callback_query_id,"
+                f"{operation},{target_message_id},created_at,"
                 "attempts,last_error FROM telegram_reply_outbox_legacy",
                 (user_id,),
             )
@@ -326,6 +340,8 @@ class OutboxReply:
     reply_markup: Mapping[str, Any] | None = None
     callback_query_id: str | None = None
     parse_mode: str | None = None
+    operation: str = "send"
+    target_message_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +353,8 @@ class OutboxMessage:
     reply_markup: dict[str, Any] | None
     callback_query_id: str | None
     attempts: int
+    operation: str
+    target_message_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +381,31 @@ class PendingClarification:
 
 def _json(value: Any) -> str:
     return json.dumps(thaw(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _safe_command_label(command: str) -> str:
+    """Reduce audit labels to non-sensitive, language-neutral categories."""
+    stripped = str(command).strip()
+    if not stripped:
+        return ""
+    if stripped.startswith("/"):
+        return (
+            stripped.partition(" ")[0]
+            .split("@", 1)[0]
+            .casefold()[:80]
+        )
+    lowered = stripped.casefold()
+    if lowered.startswith("pref:"):
+        parts = lowered.split(":")
+        if len(parts) >= 3 and parts[1] == "member":
+            return ":".join(parts[:3])[:80]
+        if len(parts) >= 2:
+            return ":".join(parts[:2])[:80]
+    if re.fullmatch(
+        r"(?:confirm|cancel)\s+[0-9a-f]{8}", lowered
+    ):
+        return "confirmation"
+    return "text"
 
 
 def _proposal_to_dict(proposal: PreferenceProposal) -> dict[str, Any]:
@@ -493,6 +536,16 @@ class SQLitePreferenceStore:
             if "parse_mode" not in columns:
                 self._connection.execute(
                     "ALTER TABLE telegram_reply_outbox ADD COLUMN parse_mode TEXT"
+                )
+            if "operation" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE telegram_reply_outbox "
+                    "ADD COLUMN operation TEXT NOT NULL DEFAULT 'send'"
+                )
+            if "target_message_id" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE telegram_reply_outbox "
+                    "ADD COLUMN target_message_id INTEGER"
                 )
 
     def attach_provider(self, provider: AtomicPreferenceProvider) -> None:
@@ -884,10 +937,20 @@ class SQLitePreferenceStore:
         text = reply.text.strip()
         if not text:
             raise PreferenceStoreError("outbox reply text cannot be empty")
+        if reply.operation not in {"send", "edit"}:
+            raise PreferenceStoreError("outbox operation must be send or edit")
+        if reply.operation == "edit" and (
+            reply.target_message_id is None
+            or int(reply.target_message_id) <= 0
+        ):
+            raise PreferenceStoreError(
+                "edit outbox replies require a target message ID"
+            )
         self._connection.execute(
             "INSERT INTO telegram_reply_outbox("
-            "user_id,chat_id,text,parse_mode,reply_markup_json,callback_query_id,created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
+            "user_id,chat_id,text,parse_mode,reply_markup_json,"
+            "callback_query_id,operation,target_message_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 self.user_id,
                 reply.chat_id,
@@ -895,6 +958,8 @@ class SQLitePreferenceStore:
                 reply.parse_mode,
                 _json(reply.reply_markup) if reply.reply_markup is not None else None,
                 reply.callback_query_id,
+                reply.operation,
+                reply.target_message_id,
                 self.clock(),
             ),
         )
@@ -935,7 +1000,7 @@ class SQLitePreferenceStore:
                 update_id,
                 actor_id,
                 self.clock(),
-                command[:2_000],
+                _safe_command_label(command),
                 outcome[:200],
             ),
         )
@@ -1396,8 +1461,7 @@ class SQLitePreferenceStore:
 
     @staticmethod
     def _normalize_ui_language(value: str | None) -> str:
-        normalized = str(value or "").strip().replace("_", "-").casefold()
-        return "pt-BR" if normalized == "pt-br" or normalized.startswith("pt") else "en"
+        return normalize_locale(value)
 
     def ui_language(self, actor_id: int) -> str:
         with self._lock:
@@ -1405,7 +1469,15 @@ class SQLitePreferenceStore:
                 "SELECT value FROM preference_meta WHERE name=?",
                 (f"ui_language:{self.user_id}",),
             ).fetchone()
-        return self._normalize_ui_language(str(row[0]) if row else None)
+            if row is None:
+                row = self._connection.execute(
+                    "SELECT resolved_ui_language FROM resolved_users "
+                    "WHERE id=?",
+                    (self.user_id,),
+                ).fetchone()
+        return self._normalize_ui_language(
+            str(row[0]) if row else None
+        )
 
     def ensure_ui_language(self, actor_id: int, telegram_language: str | None) -> str:
         key = f"ui_language:{self.user_id}"
@@ -1414,10 +1486,38 @@ class SQLitePreferenceStore:
                 "SELECT value FROM preference_meta WHERE name=?", (key,)
             ).fetchone()
             if row is not None:
-                return self._normalize_ui_language(str(row[0]))
+                language = self._normalize_ui_language(str(row[0]))
+                self._connection.execute(
+                    "UPDATE users SET ui_language=?,updated_at=? "
+                    "WHERE id=? AND ? IN ('en','pt-BR')",
+                    (language, self.clock(), self.user_id, language),
+                )
+                self._connection.execute(
+                    "INSERT INTO user_locales(user_id,locale,updated_at) "
+                    "VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                    "locale=excluded.locale,updated_at=excluded.updated_at",
+                    (self.user_id, language, self.clock()),
+                )
+                return language
             language = self._normalize_ui_language(telegram_language)
             self._connection.execute(
                 "INSERT INTO preference_meta(name,value) VALUES(?,?)", (key, language)
+            )
+            self._connection.execute(
+                "UPDATE users SET ui_language=?,updated_at=? "
+                "WHERE id=? AND ? IN ('en','pt-BR')",
+                (
+                    language,
+                    self.clock(),
+                    self.user_id,
+                    language,
+                ),
+            )
+            self._connection.execute(
+                "INSERT INTO user_locales(user_id,locale,updated_at) "
+                "VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "locale=excluded.locale,updated_at=excluded.updated_at",
+                (self.user_id, language, self.clock()),
             )
             return language
 
@@ -1428,6 +1528,22 @@ class SQLitePreferenceStore:
                 "INSERT INTO preference_meta(name,value) VALUES(?,?) "
                 "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
                 (f"ui_language:{self.user_id}", normalized),
+            )
+            self._connection.execute(
+                "UPDATE users SET ui_language=?,updated_at=? "
+                "WHERE id=? AND ? IN ('en','pt-BR')",
+                (
+                    normalized,
+                    self.clock(),
+                    self.user_id,
+                    normalized,
+                ),
+            )
+            self._connection.execute(
+                "INSERT INTO user_locales(user_id,locale,updated_at) "
+                "VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "locale=excluded.locale,updated_at=excluded.updated_at",
+                (self.user_id, normalized, self.clock()),
             )
         return normalized
 
@@ -1483,7 +1599,8 @@ class SQLitePreferenceStore:
     def next_outbox(self, limit: int = 20) -> list[OutboxMessage]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id,chat_id,text,parse_mode,reply_markup_json,callback_query_id,attempts "
+                "SELECT id,chat_id,text,parse_mode,reply_markup_json,"
+                "callback_query_id,attempts,operation,target_message_id "
                 "FROM telegram_reply_outbox WHERE user_id=? ORDER BY id LIMIT ?",
                 (self.user_id, limit),
             ).fetchall()
@@ -1504,6 +1621,12 @@ class SQLitePreferenceStore:
                     else None
                 ),
                 attempts=int(row["attempts"]),
+                operation=str(row["operation"] or "send"),
+                target_message_id=(
+                    int(row["target_message_id"])
+                    if row["target_message_id"] is not None
+                    else None
+                ),
             )
             for row in rows
         ]
@@ -1522,6 +1645,20 @@ class SQLitePreferenceStore:
                 "WHERE id=? AND user_id=?",
                 (error[:500], message_id, self.user_id),
             )
+
+    def convert_outbox_edit_to_send(
+        self, message_id: int, error: str
+    ) -> bool:
+        """Persist the one-way stale-edit fallback so it cannot edit-loop."""
+        with self._lock:
+            cursor = self._connection.execute(
+                "UPDATE telegram_reply_outbox "
+                "SET operation='send',target_message_id=NULL,"
+                "attempts=attempts+1,last_error=? "
+                "WHERE id=? AND user_id=? AND operation='edit'",
+                (error[:500], message_id, self.user_id),
+            )
+            return cursor.rowcount == 1
 
     def history(self, limit: int = 10) -> list[dict[str, Any]]:
         with self._lock:

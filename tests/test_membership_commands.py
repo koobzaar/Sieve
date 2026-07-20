@@ -30,6 +30,28 @@ def update(
     return {"update_id": update_id, "message": message}
 
 
+def callback_update(
+    update_id: int,
+    user_id: int,
+    chat_id: int,
+    data: str,
+    *,
+    message_id: int = 90,
+) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb-{update_id}",
+            "from": {"id": user_id, "language_code": "en"},
+            "message": {
+                "message_id": message_id,
+                "chat": {"id": chat_id, "type": "private"},
+            },
+            "data": data,
+        },
+    }
+
+
 def setup(tmp_path):
     state = SQLiteStateStore(tmp_path / "state.db")
     admin = state.bootstrap_admin(telegram_user_id=101, telegram_chat_id=201)
@@ -141,4 +163,47 @@ async def test_contact_payload_is_ignored_without_phone_or_contact_persistence(t
     assert "99999" not in serialized
     assert "Sensitive" not in serialized
     assert "contact" not in serialized.casefold()
+    state.close()
+
+
+async def test_role_aware_home_and_members_screen_edit_in_place(
+    tmp_path,
+) -> None:
+    state, admin, processor = setup(tmp_path)
+    token = state.create_invitation(admin.id)
+    await processor.process_update(update(1, 102, 202, f"/start {token}"))
+    member = state.user_for_telegram(102)
+    assert member is not None
+
+    await processor.process_update(update(2, 101, 201, "/start"))
+    admin_home = SQLitePreferenceStore(
+        state, user_id=admin.id
+    ).next_outbox()[-1]
+    admin_callbacks = {
+        button["callback_data"]
+        for row in admin_home.reply_markup["inline_keyboard"]
+        for button in row
+    }
+    assert "pref:menu:members" in admin_callbacks
+
+    await processor.process_update(update(3, 102, 202, "/start"))
+    member_home = SQLitePreferenceStore(
+        state, user_id=member.id
+    ).next_outbox()[-1]
+    member_callbacks = {
+        button["callback_data"]
+        for row in member_home.reply_markup["inline_keyboard"]
+        for button in row
+    }
+    assert "pref:menu:members" not in member_callbacks
+
+    await processor.process_update(
+        callback_update(4, 101, 201, "pref:menu:members")
+    )
+    members_screen = SQLitePreferenceStore(
+        state, user_id=admin.id
+    ).next_outbox()[-1]
+    assert members_screen.operation == "edit"
+    assert members_screen.target_message_id == 90
+    assert member.id in members_screen.text
     state.close()

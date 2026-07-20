@@ -186,6 +186,35 @@ async def test_narrow_apply_is_live_once_and_preview_is_a_dry_run(tmp_path) -> N
     state.close()
 
 
+async def test_command_audit_labels_never_store_message_or_callback_payload(
+    tmp_path,
+) -> None:
+    interpreter = FakeInterpreter(PreferenceIntent.QUERY)
+    state, store, processor = setup(tmp_path, interpreter)
+    private_text = "show my secret walnut preferences"
+    await processor.process_update(message(1, private_text))
+    await processor.process_update(
+        callback(
+            2,
+            "pref:member:disable:"
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+    )
+
+    labels = [
+        row["command"]
+        for row in store._connection.execute(
+            "SELECT command FROM preference_command_log ORDER BY id"
+        )
+    ]
+    serialized = " ".join(labels)
+    assert private_text not in serialized
+    assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" not in serialized
+    assert labels[0] == "text"
+    assert labels[1] == "pref:member:disable"
+    state.close()
+
+
 async def test_malformed_multi_interest_response_is_repaired_and_applied_atomically(
     tmp_path,
 ) -> None:
@@ -333,7 +362,7 @@ async def test_two_invalid_interpretations_use_generic_failure_and_persist_nothi
     assert current.revision == 0
     assert current.interests == ()
     reply = store.next_outbox()[0].text
-    assert "Não consegui interpretar a solicitação" in reply
+    assert "Solicitação não compreendida" in reply
     assert "interest name must be nonempty" not in reply
     outcome = store._connection.execute(
         "SELECT outcome FROM telegram_processed_updates WHERE update_id = 1"
@@ -476,7 +505,7 @@ async def test_clarification_questions_are_bounded_and_then_cleared(tmp_path) ->
     assert len(interpreter.calls) == 4
     assert store.pending_clarification(42) is None
     assert store.current_snapshot().revision == 0
-    assert "I still need more detail" in store.next_outbox()[-1].text
+    assert "More detail is still needed" in store.next_outbox()[-1].text
     state.close()
 
 
@@ -530,7 +559,7 @@ async def test_persistent_sliding_limit_blocks_before_another_gemini_call(tmp_pa
     await processor.process_update(message(2, "segundo"))
     assert len(interpreter.calls) == 1
     assert store.current_snapshot().revision == 1
-    assert "AI command limit" in store.next_outbox()[-1].text
+    assert "AI limit reached" in store.next_outbox()[-1].text
     state.close()
 
 
@@ -559,16 +588,15 @@ async def test_onboarding_queries_and_unknown_commands_are_deterministic(tmp_pat
     outbox = store.next_outbox()
     replies = [item.text for item in outbox]
     assert interpreter.calls == []
-    assert "Welcome to Sieve" in replies[0]
-    assert "How to use Sieve" in replies[1]
-    assert "Your preferences" in replies[2]
+    assert "<b>Sieve</b>" in replies[0]
+    assert "<b>Help</b>" in replies[1]
+    assert "<b>Preferences</b>" in replies[2]
     assert "Unknown command" in replies[3]
-    assert "Your preferences" in replies[4]
+    assert "<b>Preferences</b>" in replies[4]
     assert all(item.parse_mode == "HTML" for item in outbox)
     assert outbox[4].callback_query_id == "cb-menu"
-    assert outbox[4].reply_markup["inline_keyboard"][0][0]["callback_data"] == (
-        "pref:menu:preferences"
-    )
+    pagination = outbox[4].reply_markup["inline_keyboard"][0]
+    assert [button["text"] for button in pagination] == ["‹", "1/1", "›"]
     state.close()
 
 
@@ -578,7 +606,7 @@ async def test_gemini_query_renders_authoritative_preferences(tmp_path) -> None:
     await processor.process_update(message(1, "pode me dizer o que voce sabe sobre meus gostos?"))
     reply = store.next_outbox()[0].text
     assert len(interpreter.calls) == 1
-    assert "Your preferences" in reply
+    assert "<b>Preferences</b>" in reply
     assert "resumo sem estado" not in reply
     state.close()
 
@@ -763,21 +791,21 @@ async def test_language_is_detected_selectable_and_persistent(tmp_path) -> None:
     state, store, processor = setup(tmp_path, interpreter)
     await processor.process_update(message(1, "/start", language_code="pt-BR"))
     first = store.next_outbox()[0]
-    assert "Bem-vindo ao Sieve" in first.text
+    assert "<b>Sieve</b>" in first.text
     assert store.ui_language(42) == "pt-BR"
 
     await processor.process_update(
         callback(2, "pref:language:en", callback_id="cb-language")
     )
     changed = store.next_outbox()[-1]
-    assert "Language changed to English" in changed.text
+    assert "Language updated" in changed.text
     assert changed.callback_query_id == "cb-language"
     assert store.ui_language(42) == "en"
 
     reloaded = SQLitePreferenceStore(state)
     assert reloaded.ui_language(42) == "en"
     await processor.process_update(message(3, "/language", language_code="pt"))
-    assert "Choose your language" in store.next_outbox()[-1].text
+    assert "<b>Language</b>" in store.next_outbox()[-1].text
     state.close()
 
 
