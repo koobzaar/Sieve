@@ -18,8 +18,7 @@ def smoke_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     path = tmp_path / "config.yaml"
     path.write_text(
         """
-runtime:
-  mode: shadow
+runtime: {}
 state:
   path: state.db
 pipeline:
@@ -37,7 +36,7 @@ sink:
   settings: {}
 preferences:
   enabled: true
-  owner_id: 42
+  admin_telegram_user_id_env: TEST_ADMIN_ID
   token_env: TEST_BOT_TOKEN
 sources:
   - name: telegram-principal
@@ -54,6 +53,7 @@ sources:
     monkeypatch.setenv("TEST_API_ID", "123")
     monkeypatch.setenv("TEST_API_HASH", "api-hash")
     monkeypatch.setenv("TEST_BOT_TOKEN", "bot-token")
+    monkeypatch.setenv("TEST_ADMIN_ID", "42")
     return load_config(path)
 
 
@@ -90,12 +90,15 @@ class FakeClient:
     ) -> None:
         self.user_id = user_id
         self.conversation_instance = FakeConversation(responses, timeout=timeout)
-        self.start_calls: list[dict[str, object]] = []
+        self.connected = False
         self.conversation_calls: list[tuple[str, dict[str, object]]] = []
         self.disconnected = False
 
-    async def start(self, **kwargs: object) -> None:
-        self.start_calls.append(kwargs)
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def is_user_authorized(self) -> bool:
+        return True
 
     async def get_me(self) -> Any:
         return SimpleNamespace(id=self.user_id)
@@ -153,7 +156,6 @@ async def test_smoke_rejects_owner_mismatch(
             config,
             source_name="telegram-principal",
             session_path=str(tmp_path / "smoke-user"),
-            phone=None,
             timeout_seconds=30,
             client_factory=lambda *_: client,
             bot_api_factory=lambda **_: api,
@@ -173,7 +175,6 @@ async def test_smoke_reports_reply_timeout(
             config,
             source_name="telegram-principal",
             session_path=str(tmp_path / "smoke-user"),
-            phone=None,
             timeout_seconds=30,
             client_factory=lambda *_: client,
             bot_api_factory=FakeBotAPI,
@@ -191,7 +192,6 @@ async def test_smoke_requires_nonce_in_preview_reply(
             config,
             source_name="telegram-principal",
             session_path=str(tmp_path / "smoke-user"),
-            phone=None,
             timeout_seconds=30,
             client_factory=lambda *_: client,
             bot_api_factory=FakeBotAPI,
@@ -217,7 +217,6 @@ async def test_smoke_uses_dedicated_session_and_leaves_preferences_unchanged(
         config,
         source_name="telegram-principal",
         session_path=str(dedicated),
-        phone="+5500000000000",
         timeout_seconds=30,
         client_factory=client_factory,
         bot_api_factory=FakeBotAPI,
@@ -226,7 +225,7 @@ async def test_smoke_uses_dedicated_session_and_leaves_preferences_unchanged(
 
     assert report["success"] is True
     assert factory_calls == [(str(dedicated.resolve()), 123, "api-hash")]
-    assert client.start_calls == [{"phone": "+5500000000000"}]
+    assert client.connected
     assert client.conversation_calls[0][0] == "@configured_bot"
     assert client.conversation_instance.sent[0] == "/preferences"
     assert "sieve-smoke-fixed" in client.conversation_instance.sent[1]
@@ -237,7 +236,6 @@ async def test_smoke_uses_dedicated_session_and_leaves_preferences_unchanged(
             config,
             source_name="telegram-principal",
             session_path="production-user.session",
-            phone=None,
             timeout_seconds=30,
             client_factory=client_factory,
             bot_api_factory=FakeBotAPI,

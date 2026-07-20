@@ -42,9 +42,7 @@ class LLMEvaluator(Protocol):
 
 @runtime_checkable
 class PromotionSink(Protocol):
-    async def send(
-        self, promotion: Promotion, reason: str, *, shadow: bool = False
-    ) -> None: ...
+    async def send(self, promotion: Promotion, reason: str) -> None: ...
 
     async def alert(self, message: str) -> None: ...
 

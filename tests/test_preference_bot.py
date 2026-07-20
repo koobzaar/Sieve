@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,6 +14,7 @@ from promo_bot.preference_bot import (
     BOT_COMMANDS_PT_BR,
     PreferenceCommandProcessor,
     TelegramBotAPI,
+    TelegramBotError,
     TelegramPreferenceBot,
     WebhookConflictError,
 )
@@ -631,6 +635,88 @@ async def test_direct_bot_api_uses_required_long_polling_shape() -> None:
         "timeout": 30,
         "allowed_updates": ["message", "callback_query"],
     }
+
+
+async def test_direct_bot_api_reports_actionable_http_failure_without_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "ok": False,
+                "error_code": 409,
+                "description": "Conflict: terminated by another getUpdates request",
+                "parameters": {"retry_after": 7},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        api = TelegramBotAPI(token="secret-token", api_url="https://telegram.test", client=client)
+        with pytest.raises(TelegramBotError) as raised:
+            await api.get_updates(offset=1)
+
+    error = raised.value
+    assert error.method == "getUpdates"
+    assert error.category == "http_status"
+    assert error.status_code == 409
+    assert error.error_code == 409
+    assert error.retry_after == 7
+    assert "another getUpdates request" in str(error)
+    assert "secret-token" not in str(error)
+
+
+async def test_outbox_worker_logs_unexpected_failure_and_stays_contained(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bot = object.__new__(TelegramPreferenceBot)
+    stop = asyncio.Event()
+
+    async def fail_once() -> int:
+        stop.set()
+        raise RuntimeError("unexpected delivery fault")
+
+    bot.drain_outbox = fail_once  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        await bot._deliver(stop)
+
+    record = next(
+        item for item in caplog.records if item.msg == "preference_outbox_failure"
+    )
+    assert record.event == "preference_outbox_failure"
+    assert record.error_type == "RuntimeError"
+
+
+async def test_poll_failure_log_includes_backoff_and_consecutive_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bot = object.__new__(TelegramPreferenceBot)
+    stop = asyncio.Event()
+
+    class ConflictAPI:
+        async def get_updates(self, **_: object) -> list[dict[str, object]]:
+            stop.set()
+            raise TelegramBotError(
+                "Telegram getUpdates HTTP 409: competing poller",
+                method="getUpdates",
+                category="http_status",
+                status_code=409,
+                error_code=409,
+            )
+
+    bot.api = ConflictAPI()
+    bot.store = SimpleNamespace(telegram_offset=lambda: 0)
+    bot.polling_timeout = 30
+    bot._batch_failed = asyncio.Event()
+    bot.queue = asyncio.Queue()
+
+    with caplog.at_level(logging.ERROR):
+        await bot._poll(stop)
+
+    record = next(
+        item for item in caplog.records if item.msg == "preference_poll_failure"
+    )
+    assert record.http_status == 409
+    assert record.consecutive_failures == 1
+    assert record.retry_in_seconds == 2
 
 
 async def test_direct_bot_api_get_me_returns_bot_identity() -> None:

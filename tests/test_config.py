@@ -10,7 +10,7 @@ from promo_bot.config import ConfigurationError, load_config
 
 def base_config() -> dict:
     return {
-        "runtime": {"mode": "shadow"},
+        "runtime": {},
         "state": {"path": "state.db"},
         "pipeline": {
             "profile": "ssd",
@@ -102,6 +102,9 @@ def test_bm25_routing_defaults_and_validation(tmp_path) -> None:
     assert config.bm25_auto_forward_threshold == 7.0
     assert config.bm25_auto_forward_mode == "shadow"
     assert config.bm25_below_threshold_audit_rate == 0.05
+    assert config.preferences.max_users == 10
+    assert config.preferences.admin_telegram_user_id_env == "TELEGRAM_ADMIN_USER_ID"
+    assert not hasattr(config, "mode")
 
     data["pipeline"]["bm25_auto_forward_threshold"] = 2.0
     write_yaml(path, data)
@@ -129,8 +132,38 @@ def test_gemini_evaluation_toggle_requires_a_boolean(tmp_path) -> None:
         load_config(path)
 
 
-def test_tracked_example_is_complete_safe_and_valid() -> None:
-    path = Path("config/config.example.yaml")
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("runtime", "mode"),
+        ("preferences", "owner_id"),
+        ("preferences", "owner_id_env"),
+        ("preferences", "chat_id"),
+        ("preferences", "chat_id_env"),
+    ],
+)
+def test_removed_owner_chat_and_shadow_keys_have_migration_errors(
+    tmp_path, section, key
+) -> None:
+    data = base_config()
+    data.setdefault(section, {})[key] = "legacy"
+    path = tmp_path / "config.yaml"
+    write_yaml(path, data)
+    with pytest.raises(ConfigurationError, match="removed"):
+        load_config(path)
+
+
+def test_source_promotion_mode_is_rejected(tmp_path) -> None:
+    data = base_config()
+    data["sources"][0]["mode"] = "shadow"
+    path = tmp_path / "config.yaml"
+    write_yaml(path, data)
+    with pytest.raises(ConfigurationError, match="source.*mode.*removed"):
+        load_config(path)
+
+
+def test_tracked_config_is_complete_safe_and_valid() -> None:
+    path = Path("config/config.yaml")
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     example = load_config(path)
 
@@ -141,5 +174,7 @@ def test_tracked_example_is_complete_safe_and_valid() -> None:
     assert all(not source.enabled for source in example.sources)
     telegram = next(source for source in example.sources if source.name == "telegram-principal")
     assert telegram.settings["chat_ids"] == []
-    assert "owner_id" not in raw["preferences"]
-    assert "chat_id" not in raw["preferences"]
+    assert raw["preferences"]["max_users"] == 10
+    assert raw["preferences"]["admin_telegram_user_id_env"] == "TELEGRAM_ADMIN_USER_ID"
+    assert "mode" not in raw["runtime"]
+    assert all("mode" not in source for source in raw["sources"])

@@ -31,11 +31,13 @@ from .preferences import (
 )
 from .protocols import PreferenceInterpreter
 from .telegram_formatter import TelegramFormatter
+from .tenancy import InvitationError, MembershipError, UnauthorizedMembershipError, User
 
 logger = logging.getLogger(__name__)
 
 BOT_COMMANDS_EN: tuple[dict[str, str], ...] = (
     {"command": "start", "description": "Open the welcome screen"},
+    {"command": "account", "description": "Show your private Sieve UUID"},
     {"command": "preferences", "description": "Review your current preferences"},
     {"command": "history", "description": "Review recent changes"},
     {"command": "preview", "description": "Test a change without saving"},
@@ -45,6 +47,7 @@ BOT_COMMANDS_EN: tuple[dict[str, str], ...] = (
 )
 BOT_COMMANDS_PT_BR: tuple[dict[str, str], ...] = (
     {"command": "start", "description": "Abrir a tela de boas-vindas"},
+    {"command": "account", "description": "Mostrar seu UUID privado do Sieve"},
     {"command": "preferences", "description": "Revisar suas preferências atuais"},
     {"command": "history", "description": "Revisar alterações recentes"},
     {"command": "preview", "description": "Testar uma mudança sem salvar"},
@@ -56,7 +59,33 @@ BOT_COMMANDS = BOT_COMMANDS_EN
 
 
 class TelegramBotError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str | None = None,
+        category: str | None = None,
+        status_code: int | None = None,
+        error_code: int | None = None,
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.method = method
+        self.category = category
+        self.status_code = status_code
+        self.error_code = error_code
+        self.retry_after = retry_after
+
+    def log_fields(self) -> dict[str, Any]:
+        return {
+            "error": str(self),
+            "error_type": type(self).__name__,
+            "telegram_method": self.method,
+            "failure_category": self.category,
+            "http_status": self.status_code,
+            "telegram_error_code": self.error_code,
+            "retry_after_seconds": self.retry_after,
+        }
 
 
 class WebhookConflictError(TelegramBotError):
@@ -77,21 +106,66 @@ class TelegramBotAPI:
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds, connect=min(10, timeout_seconds)),
             limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
-            headers={"User-Agent": "sieve/1.0"},
+            headers={"User-Agent": "sieve/1.1.0-beta.1"},
         )
 
     async def _call(self, method: str, payload: Mapping[str, Any]) -> Any:
         try:
             response = await self.client.post(f"{self.base_url}/{method}", json=dict(payload))
-            response.raise_for_status()
-            body = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.RequestError as exc:
             raise TelegramBotError(
-                f"Telegram {method} transport failure: {type(exc).__name__}"
+                f"Telegram {method} network failure: {type(exc).__name__}",
+                method=method,
+                category="network",
             ) from exc
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            category = "http_status" if response.is_error else "invalid_json"
+            raise TelegramBotError(
+                f"Telegram {method} HTTP {response.status_code}: invalid JSON response",
+                method=method,
+                category=category,
+                status_code=response.status_code,
+            ) from exc
+
+        description = "invalid response"
+        error_code: int | None = None
+        retry_after: int | None = None
+        if isinstance(body, dict):
+            description = " ".join(
+                str(body.get("description", "invalid response")).split()
+            )[:300]
+            try:
+                error_code = int(body["error_code"])
+            except (KeyError, TypeError, ValueError):
+                error_code = None
+            parameters = body.get("parameters")
+            if isinstance(parameters, Mapping):
+                try:
+                    retry_after = int(parameters["retry_after"])
+                except (KeyError, TypeError, ValueError):
+                    retry_after = None
+
+        if response.is_error:
+            raise TelegramBotError(
+                f"Telegram {method} HTTP {response.status_code}: {description}",
+                method=method,
+                category="http_status",
+                status_code=response.status_code,
+                error_code=error_code,
+                retry_after=retry_after,
+            )
         if not isinstance(body, dict) or not body.get("ok"):
-            description = body.get("description", "invalid response") if isinstance(body, dict) else "invalid response"
-            raise TelegramBotError(f"Telegram {method} failed: {description}")
+            raise TelegramBotError(
+                f"Telegram {method} API failure: {description}",
+                method=method,
+                category="api_response",
+                status_code=response.status_code,
+                error_code=error_code,
+                retry_after=retry_after,
+            )
         return body.get("result")
 
     async def get_webhook_info(self) -> dict[str, Any]:
@@ -1134,6 +1208,282 @@ class PreferenceCommandProcessor:
         )
 
 
+class MultiUserCommandProcessor:
+    """Authenticate Telegram IDs and route each command to its UUID-scoped store."""
+
+    def __init__(
+        self,
+        *,
+        state: Any,
+        interpreter: PreferenceInterpreter,
+        admin_store: SQLitePreferenceStore,
+        max_users: int = 10,
+        rate_per_minute: int = 5,
+        rate_per_hour: int = 20,
+    ) -> None:
+        self.state = state
+        self.interpreter = interpreter
+        self.admin_store = admin_store
+        self.max_users = max_users
+        self.rate_per_minute = rate_per_minute
+        self.rate_per_hour = rate_per_hour
+        admin = state.user_by_id(admin_store.user_id)
+        if admin is None or admin.role != "admin":
+            raise ValueError("admin_store must belong to the administrator")
+        self.owner_user_id = admin.telegram_user_id
+        self.owner_chat_id = admin.telegram_chat_id
+        self._stores: dict[str, SQLitePreferenceStore] = {admin.id: admin_store}
+        self._processors: dict[str, PreferenceCommandProcessor] = {}
+        self.ephemeral_replies: list[OutboxReply] = []
+
+    @staticmethod
+    def _message_envelope(
+        update: Mapping[str, Any],
+    ) -> tuple[int, int | None, int | None, str, str]:
+        try:
+            update_id = int(update.get("update_id", -1))
+        except (TypeError, ValueError):
+            update_id = -1
+        message = update.get("message")
+        if not isinstance(message, Mapping):
+            callback = update.get("callback_query")
+            message = (
+                callback.get("message")
+                if isinstance(callback, Mapping)
+                and isinstance(callback.get("message"), Mapping)
+                else {}
+            )
+        chat = message.get("chat") if isinstance(message, Mapping) else {}
+        actor = message.get("from") if isinstance(message, Mapping) else {}
+        try:
+            chat_id = int(chat.get("id")) if isinstance(chat, Mapping) else None
+        except (TypeError, ValueError):
+            chat_id = None
+        try:
+            actor_id = int(actor.get("id")) if isinstance(actor, Mapping) else None
+        except (TypeError, ValueError):
+            actor_id = None
+        text = str(message.get("text", "")) if isinstance(message, Mapping) else ""
+        chat_type = str(chat.get("type", "")) if isinstance(chat, Mapping) else ""
+        return update_id, chat_id, actor_id, text, chat_type
+
+    def _store(self, user: User) -> SQLitePreferenceStore:
+        store = self._stores.get(user.id)
+        if store is None:
+            store = SQLitePreferenceStore(self.state, user_id=user.id)
+            try:
+                store.current_snapshot()
+            except Exception:
+                store.initialize(profile="", aliases={}, hard_rules=())
+            self._stores[user.id] = store
+        return store
+
+    def _processor(self, user: User) -> PreferenceCommandProcessor:
+        processor = self._processors.get(user.id)
+        if processor is None:
+            processor = PreferenceCommandProcessor(
+                store=self._store(user),
+                interpreter=self.interpreter,
+                owner_chat_id=user.telegram_chat_id,
+                owner_user_id=user.telegram_user_id,
+                rate_per_minute=self.rate_per_minute,
+                rate_per_hour=self.rate_per_hour,
+            )
+            self._processors[user.id] = processor
+        return processor
+
+    def stores(self) -> list[SQLitePreferenceStore]:
+        for account in self.state.active_users():
+            self._store(account)
+        return list(self._stores.values())
+
+    def _reply(
+        self,
+        store: SQLitePreferenceStore,
+        *,
+        update_id: int,
+        actor_id: int,
+        chat_id: int,
+        command: str,
+        outcome: str,
+        text: str,
+    ) -> None:
+        store.record_update(
+            update_id,
+            outcome=outcome,
+            actor_id=actor_id,
+            command=command,
+            reply=OutboxReply(chat_id=chat_id, text=text),
+        )
+
+    def _mark_unregistered(
+        self,
+        update_id: int,
+        *,
+        chat_id: int | None = None,
+        text: str | None = None,
+    ) -> None:
+        reply = (
+            OutboxReply(chat_id=chat_id, text=text)
+            if chat_id is not None and text
+            else None
+        )
+        self.admin_store.record_update(
+            update_id,
+            outcome="registration_rejected",
+            actor_id=None,
+            command="",
+            reply=reply,
+        )
+
+    async def _register(
+        self,
+        *,
+        update_id: int,
+        chat_id: int | None,
+        actor_id: int | None,
+        token: str,
+        chat_type: str,
+    ) -> None:
+        if chat_id is None or actor_id is None:
+            self._mark_unregistered(update_id)
+            return
+        if chat_type != "private":
+            self._mark_unregistered(update_id)
+            return
+        try:
+            member = self.state.redeem_invitation(
+                token,
+                telegram_user_id=actor_id,
+                telegram_chat_id=chat_id,
+                chat_type=chat_type,
+                max_users=self.max_users,
+            )
+        except (InvitationError, MembershipError):
+            self._mark_unregistered(
+                update_id,
+                chat_id=chat_id,
+                text="This invitation is invalid, expired, used, or unavailable.",
+            )
+            return
+        store = self._store(member)
+        self._reply(
+            store,
+            update_id=update_id,
+            actor_id=actor_id,
+            chat_id=chat_id,
+            command="",
+            outcome="registered",
+            text=(
+                f"Welcome to Sieve. Your private account UUID is {member.id}. "
+                "Your preference profile is empty; tell me which promotions interest you."
+            ),
+        )
+
+    async def process_update(self, update: Mapping[str, Any]) -> None:
+        update_id, chat_id, actor_id, text, chat_type = self._message_envelope(update)
+        if update_id < 0 or self.admin_store.is_update_processed(update_id):
+            return
+        command, argument = _command_name(text)
+        user = self.state.user_for_telegram(actor_id) if actor_id is not None else None
+        if user is None:
+            if command == "/start" and argument:
+                await self._register(
+                    update_id=update_id,
+                    chat_id=chat_id,
+                    actor_id=actor_id,
+                    token=argument,
+                    chat_type=chat_type,
+                )
+            else:
+                self._mark_unregistered(update_id)
+            return
+        if (
+            user.status != "active"
+            or chat_type != "private"
+            or chat_id != user.telegram_chat_id
+            or actor_id != user.telegram_user_id
+        ):
+            self.admin_store.record_update(
+                update_id,
+                outcome="unauthorized",
+                actor_id=None,
+                command="",
+            )
+            return
+        store = self._store(user)
+        assert chat_id is not None and actor_id is not None
+        if command == "/account":
+            self._reply(
+                store,
+                update_id=update_id,
+                actor_id=actor_id,
+                chat_id=chat_id,
+                command="/account",
+                outcome="account",
+                text=f"Your private Sieve account UUID is {user.id}.",
+            )
+            return
+        if command in {"/invite", "/users", "/disable", "/enable"}:
+            if user.role != "admin":
+                self._reply(
+                    store,
+                    update_id=update_id,
+                    actor_id=actor_id,
+                    chat_id=chat_id,
+                    command=command,
+                    outcome="admin_required",
+                    text="An active administrator is required for that command.",
+                )
+                return
+            try:
+                if command == "/invite":
+                    token = self.state.create_invitation(user.id)
+                    self.ephemeral_replies.append(
+                        OutboxReply(
+                            chat_id=chat_id,
+                            text=f"Single-use invitation (expires in 24 hours): {token}",
+                        )
+                    )
+                    store.record_update(
+                        update_id,
+                        outcome="invitation_created",
+                        actor_id=actor_id,
+                        command="/invite",
+                    )
+                    return
+                if command == "/users":
+                    members = self.state.list_users(user.id)
+                    response = "\n".join(
+                        f"{item.id} — {item.role} — {item.status}" for item in members
+                    )
+                    outcome = "users"
+                else:
+                    if not argument:
+                        raise MembershipError("a user UUID is required")
+                    changed = (
+                        self.state.disable_user(user.id, argument)
+                        if command == "/disable"
+                        else self.state.enable_user(user.id, argument)
+                    )
+                    outcome = command.removeprefix("/")
+                    response = f"{changed.id} is now {changed.status}."
+            except (MembershipError, UnauthorizedMembershipError) as exc:
+                outcome = "membership_error"
+                response = str(exc)
+            self._reply(
+                store,
+                update_id=update_id,
+                actor_id=actor_id,
+                chat_id=chat_id,
+                command=command,
+                outcome=outcome,
+                text=response,
+            )
+            return
+        await self._processor(user).process_update(update)
+
+
 class TelegramPreferenceBot:
     def __init__(
         self,
@@ -1179,7 +1529,9 @@ class TelegramPreferenceBot:
     async def drain_outbox(self) -> int:
         async with self._outbox_lock:
             delivered = 0
-            for item in self.store.next_outbox(20):
+            ephemeral = getattr(self.processor, "ephemeral_replies", None)
+            while isinstance(ephemeral, list) and ephemeral:
+                item = ephemeral[0]
                 try:
                     await self.api.send_message(
                         item.chat_id,
@@ -1187,15 +1539,33 @@ class TelegramPreferenceBot:
                         reply_markup=item.reply_markup,
                         parse_mode=item.parse_mode,
                     )
-                except TelegramBotError as exc:
-                    self.store.fail_outbox(item.id, str(exc))
+                except TelegramBotError:
                     break
                 else:
-                    if item.callback_query_id:
-                        with suppress(TelegramBotError):
-                            await self.api.answer_callback_query(item.callback_query_id)
-                    self.store.complete_outbox(item.id)
+                    ephemeral.pop(0)
                     delivered += 1
+            stores_method = getattr(self.processor, "stores", None)
+            stores = stores_method() if callable(stores_method) else [self.store]
+            for current_store in stores:
+                for item in current_store.next_outbox(20):
+                    try:
+                        await self.api.send_message(
+                            item.chat_id,
+                            item.text,
+                            reply_markup=item.reply_markup,
+                            parse_mode=item.parse_mode,
+                        )
+                    except TelegramBotError as exc:
+                        current_store.fail_outbox(item.id, str(exc))
+                        break
+                    else:
+                        if item.callback_query_id:
+                            with suppress(TelegramBotError):
+                                await self.api.answer_callback_query(
+                                    item.callback_query_id
+                                )
+                        current_store.complete_outbox(item.id)
+                        delivered += 1
             return delivered
 
     async def run_once(self) -> int:
@@ -1211,6 +1581,7 @@ class TelegramPreferenceBot:
         return len(updates)
 
     async def _poll(self, stop: asyncio.Event) -> None:
+        failures = 0
         while not stop.is_set():
             try:
                 updates = await self.api.get_updates(
@@ -1218,6 +1589,7 @@ class TelegramPreferenceBot:
                     timeout=self.polling_timeout,
                     limit=20,
                 )
+                failures = 0
                 self._batch_failed.clear()
                 for update in updates:
                     await self.queue.put(update)
@@ -1230,13 +1602,36 @@ class TelegramPreferenceBot:
                         pass
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except TelegramBotError as exc:
+                failures += 1
+                retry_delay = min(300, 2 ** min(failures, 8))
                 logger.error(
                     "preference_poll_failure",
-                    extra={"event": "preference_poll_failure", "error": str(exc)},
+                    extra={
+                        "event": "preference_poll_failure",
+                        "consecutive_failures": failures,
+                        "retry_in_seconds": retry_delay,
+                        **exc.log_fields(),
+                    },
                 )
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=2)
+                    await asyncio.wait_for(stop.wait(), timeout=retry_delay)
+                except TimeoutError:
+                    pass
+            except Exception as exc:
+                failures += 1
+                retry_delay = min(300, 2 ** min(failures, 8))
+                logger.exception(
+                    "preference_poll_unexpected_failure",
+                    extra={
+                        "event": "preference_poll_unexpected_failure",
+                        "error_type": type(exc).__name__,
+                        "consecutive_failures": failures,
+                        "retry_in_seconds": retry_delay,
+                    },
+                )
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=retry_delay)
                 except TimeoutError:
                     pass
 
@@ -1254,16 +1649,30 @@ class TelegramPreferenceBot:
                 raise
             except Exception as exc:
                 self._batch_failed.set()
-                logger.error(
+                logger.exception(
                     "preference_command_failure",
-                    extra={"event": "preference_command_failure", "error": str(exc)},
+                    extra={
+                        "event": "preference_command_failure",
+                        "error_type": type(exc).__name__,
+                    },
                 )
             finally:
                 self.queue.task_done()
 
     async def _deliver(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
-            await self.drain_outbox()
+            try:
+                await self.drain_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "preference_outbox_failure",
+                    extra={
+                        "event": "preference_outbox_failure",
+                        "error_type": type(exc).__name__,
+                    },
+                )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=2)
             except TimeoutError:
@@ -1285,7 +1694,7 @@ class TelegramPreferenceBot:
         except TelegramBotError as exc:
             logger.warning(
                 "preference_command_menu_failure",
-                extra={"event": "preference_command_menu_failure", "error": str(exc)},
+                extra={"event": "preference_command_menu_failure", **exc.log_fields()},
             )
         tasks = [
             asyncio.create_task(self._poll(stop), name="preference-poll"),

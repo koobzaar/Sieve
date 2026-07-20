@@ -32,12 +32,12 @@ class FakeEvaluator:
 
 class FakeSink:
     def __init__(self) -> None:
-        self.sent: list[tuple[Promotion, str, bool]] = []
+        self.sent: list[tuple[Promotion, str]] = []
         self.alerts: list[str] = []
         self.closed = False
 
-    async def send(self, promotion: Promotion, reason: str, *, shadow: bool = False) -> None:
-        self.sent.append((promotion, reason, shadow))
+    async def send(self, promotion: Promotion, reason: str) -> None:
+        self.sent.append((promotion, reason))
 
     async def alert(self, message: str) -> None:
         self.alerts.append(message)

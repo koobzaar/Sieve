@@ -43,15 +43,19 @@ CREATE TABLE IF NOT EXISTS preference_meta (
     value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS preference_entries (
-    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    id TEXT NOT NULL,
     kind TEXT NOT NULL,
     data_json TEXT NOT NULL,
     created_revision INTEGER NOT NULL,
-    updated_revision INTEGER NOT NULL
+    updated_revision INTEGER NOT NULL,
+    PRIMARY KEY (user_id, id)
 );
-CREATE INDEX IF NOT EXISTS idx_preference_entries_kind ON preference_entries(kind, id);
+CREATE INDEX IF NOT EXISTS idx_preference_entries_kind
+    ON preference_entries(user_id, kind, id);
 CREATE TABLE IF NOT EXISTS preference_revisions (
-    revision INTEGER PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    revision INTEGER NOT NULL,
     parent_revision INTEGER,
     created_at REAL NOT NULL,
     original_message TEXT NOT NULL,
@@ -60,12 +64,14 @@ CREATE TABLE IF NOT EXISTS preference_revisions (
     operations_json TEXT NOT NULL,
     summary TEXT NOT NULL,
     snapshot_json TEXT NOT NULL,
-    rollback_target INTEGER
+    rollback_target INTEGER,
+    PRIMARY KEY (user_id, revision)
 );
 CREATE INDEX IF NOT EXISTS idx_preference_revisions_time
-    ON preference_revisions(created_at, revision);
+    ON preference_revisions(user_id, created_at, revision);
 CREATE TABLE IF NOT EXISTS preference_confirmations (
     id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
     base_revision INTEGER NOT NULL,
     actor_id INTEGER NOT NULL,
     chat_id INTEGER NOT NULL,
@@ -76,18 +82,20 @@ CREATE TABLE IF NOT EXISTS preference_confirmations (
     summary TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_preference_confirmations_expiry
-    ON preference_confirmations(expires_at);
+    ON preference_confirmations(user_id, expires_at);
 CREATE TABLE IF NOT EXISTS preference_clarifications (
-    actor_id INTEGER PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    actor_id INTEGER NOT NULL,
     chat_id INTEGER NOT NULL,
     base_revision INTEGER NOT NULL,
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     preview INTEGER NOT NULL,
-    context_json TEXT NOT NULL
+    context_json TEXT NOT NULL,
+    PRIMARY KEY (user_id, actor_id)
 );
 CREATE INDEX IF NOT EXISTS idx_preference_clarifications_expiry
-    ON preference_clarifications(expires_at);
+    ON preference_clarifications(user_id, expires_at);
 CREATE TABLE IF NOT EXISTS telegram_processed_updates (
     update_id INTEGER PRIMARY KEY,
     processed_at REAL NOT NULL,
@@ -95,13 +103,15 @@ CREATE TABLE IF NOT EXISTS telegram_processed_updates (
 );
 CREATE TABLE IF NOT EXISTS preference_rate_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
     actor_id INTEGER NOT NULL,
     occurred_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_preference_rate_actor_time
-    ON preference_rate_events(actor_id, occurred_at);
+    ON preference_rate_events(user_id, actor_id, occurred_at);
 CREATE TABLE IF NOT EXISTS preference_command_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
     update_id INTEGER,
     actor_id INTEGER,
     occurred_at REAL NOT NULL,
@@ -109,9 +119,10 @@ CREATE TABLE IF NOT EXISTS preference_command_log (
     outcome TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_preference_command_log_time
-    ON preference_command_log(occurred_at);
+    ON preference_command_log(user_id, occurred_at);
 CREATE TABLE IF NOT EXISTS telegram_reply_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
     chat_id INTEGER NOT NULL,
     text TEXT NOT NULL,
     parse_mode TEXT,
@@ -122,6 +133,123 @@ CREATE TABLE IF NOT EXISTS telegram_reply_outbox (
     last_error TEXT
 );
 """
+
+
+def _preference_columns(
+    connection: sqlite3.Connection, table: str
+) -> set[str]:
+    return {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+
+
+def _migrate_legacy_preferences(
+    connection: sqlite3.Connection, user_id: str
+) -> None:
+    owned = (
+        "preference_entries",
+        "preference_revisions",
+        "preference_confirmations",
+        "preference_clarifications",
+        "preference_rate_events",
+        "preference_command_log",
+        "telegram_reply_outbox",
+    )
+    legacy = [
+        table
+        for table in owned
+        if _preference_columns(connection, table)
+        and "user_id" not in _preference_columns(connection, table)
+    ]
+    if not legacy:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for table in legacy:
+            connection.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
+        for statement in PREFERENCE_SCHEMA.split(";"):
+            if statement.strip():
+                connection.execute(statement)
+        if "preference_entries" in legacy:
+            connection.execute(
+                "INSERT INTO preference_entries("
+                "user_id,id,kind,data_json,created_revision,updated_revision) "
+                "SELECT ?,id,kind,data_json,created_revision,updated_revision "
+                "FROM preference_entries_legacy",
+                (user_id,),
+            )
+        if "preference_revisions" in legacy:
+            connection.execute(
+                "INSERT INTO preference_revisions("
+                "user_id,revision,parent_revision,created_at,original_message,"
+                "actor_id,update_id,operations_json,summary,snapshot_json,rollback_target) "
+                "SELECT ?,revision,parent_revision,created_at,original_message,"
+                "actor_id,update_id,operations_json,summary,snapshot_json,rollback_target "
+                "FROM preference_revisions_legacy",
+                (user_id,),
+            )
+        if "preference_confirmations" in legacy:
+            connection.execute(
+                "INSERT INTO preference_confirmations("
+                "id,user_id,base_revision,actor_id,chat_id,created_at,expires_at,"
+                "proposal_json,target_revision,summary) "
+                "SELECT id,?,base_revision,actor_id,chat_id,created_at,expires_at,"
+                "proposal_json,target_revision,summary "
+                "FROM preference_confirmations_legacy",
+                (user_id,),
+            )
+        if "preference_clarifications" in legacy:
+            connection.execute(
+                "INSERT INTO preference_clarifications("
+                "user_id,actor_id,chat_id,base_revision,created_at,expires_at,"
+                "preview,context_json) "
+                "SELECT ?,actor_id,chat_id,base_revision,created_at,expires_at,"
+                "preview,context_json FROM preference_clarifications_legacy",
+                (user_id,),
+            )
+        if "preference_rate_events" in legacy:
+            connection.execute(
+                "INSERT INTO preference_rate_events(id,user_id,actor_id,occurred_at) "
+                "SELECT id,?,actor_id,occurred_at FROM preference_rate_events_legacy",
+                (user_id,),
+            )
+        if "preference_command_log" in legacy:
+            connection.execute(
+                "INSERT INTO preference_command_log("
+                "id,user_id,update_id,actor_id,occurred_at,command,outcome) "
+                "SELECT id,?,update_id,actor_id,occurred_at,command,outcome "
+                "FROM preference_command_log_legacy",
+                (user_id,),
+            )
+        if "telegram_reply_outbox" in legacy:
+            old_columns = _preference_columns(
+                connection, "telegram_reply_outbox_legacy"
+            )
+            parse_mode = "parse_mode" if "parse_mode" in old_columns else "NULL"
+            connection.execute(
+                "INSERT INTO telegram_reply_outbox("
+                "id,user_id,chat_id,text,parse_mode,reply_markup_json,"
+                "callback_query_id,created_at,attempts,last_error) "
+                "SELECT id,?,chat_id,text,"
+                f"{parse_mode},reply_markup_json,callback_query_id,created_at,"
+                "attempts,last_error FROM telegram_reply_outbox_legacy",
+                (user_id,),
+            )
+        seed = connection.execute(
+            "SELECT value FROM preference_meta WHERE name='seed_fingerprint'"
+        ).fetchone()
+        if seed is not None:
+            connection.execute(
+                "INSERT OR IGNORE INTO preference_meta(name,value) VALUES(?,?)",
+                (f"seed_fingerprint:{user_id}", str(seed[0])),
+            )
+        for table in legacy:
+            connection.execute(f"DROP TABLE {table}_legacy")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
 
 
 class PreferenceStoreError(RuntimeError):
@@ -298,6 +426,7 @@ class SQLitePreferenceStore:
         self,
         state: Any,
         *,
+        user_id: str | None = None,
         provider: AtomicPreferenceProvider | None = None,
         clock: Callable[[], float] = time.time,
         max_entries: int = 500,
@@ -337,7 +466,23 @@ class SQLitePreferenceStore:
         else:
             self._connection = state._connection
             self._lock = state._lock
+        if user_id is None:
+            if not hasattr(state, "ensure_legacy_admin"):
+                raise PreferenceStoreError(
+                    "user_id is required when no SQLiteStateStore is provided"
+                )
+            user_id = state.ensure_legacy_admin().id
+        self.user_id = str(user_id)
+        user = (
+            state.user_by_id(self.user_id)
+            if hasattr(state, "user_by_id")
+            else None
+        )
+        if user is None:
+            raise PreferenceStoreError("unknown preference user UUID")
+        self.is_admin = user.role == "admin"
         with self._lock:
+            _migrate_legacy_preferences(self._connection, self.user_id)
             self._connection.executescript(PREFERENCE_SCHEMA)
             columns = {
                 str(row["name"])
@@ -360,7 +505,8 @@ class SQLitePreferenceStore:
 
     def _revision_locked(self) -> int | None:
         row = self._connection.execute(
-            "SELECT MAX(revision) FROM preference_revisions"
+            "SELECT MAX(revision) FROM preference_revisions WHERE user_id=?",
+            (self.user_id,),
         ).fetchone()
         return int(row[0]) if row and row[0] is not None else None
 
@@ -375,7 +521,8 @@ class SQLitePreferenceStore:
             )
             for row in self._connection.execute(
                 "SELECT id,kind,data_json,created_revision,updated_revision "
-                "FROM preference_entries ORDER BY kind,id"
+                "FROM preference_entries WHERE user_id=? ORDER BY kind,id",
+                (self.user_id,),
             )
         }
 
@@ -393,24 +540,40 @@ class SQLitePreferenceStore:
             try:
                 revision = self._revision_locked()
                 if revision is None:
-                    entries = seed_entries(profile, aliases, hard_rules)
+                    entries = (
+                        seed_entries(profile, aliases, hard_rules)
+                        if self.is_admin
+                        else ()
+                    )
                     snapshot = build_snapshot(0, entries)
                     self._validate_snapshot(snapshot)
                     self._replace_entries_locked(snapshot.entries)
                     connection.execute(
                         "INSERT INTO preference_revisions("
-                        "revision,parent_revision,created_at,original_message,actor_id,update_id,"
+                        "user_id,revision,parent_revision,created_at,original_message,actor_id,update_id,"
                         "operations_json,summary,snapshot_json,rollback_target) "
-                        "VALUES(0,NULL,?,'YAML seed',NULL,NULL,?,'Initial YAML preference seed',?,NULL)",
+                        "VALUES(?,0,NULL,?,?,NULL,NULL,?,?,?,NULL)",
                         (
+                            self.user_id,
                             self.clock(),
+                            "YAML seed" if self.is_admin else "Empty member profile",
                             _json([{"op": "seed", "entries": len(entries)}]),
+                            (
+                                "Initial YAML preference seed"
+                                if self.is_admin
+                                else "Empty member preference profile"
+                            ),
                             _json(snapshot.to_dict()),
                         ),
                     )
                     connection.execute(
-                        "INSERT INTO preference_meta(name,value) VALUES('seed_fingerprint',?)",
-                        (seed_fingerprint(profile, aliases, hard_rules),),
+                        "INSERT INTO preference_meta(name,value) VALUES(?,?)",
+                        (
+                            f"seed_fingerprint:{self.user_id}",
+                            seed_fingerprint(profile, aliases, hard_rules)
+                            if self.is_admin
+                            else seed_fingerprint("", {}, ()),
+                        ),
                     )
                     created = True
                 else:
@@ -454,7 +617,8 @@ class SQLitePreferenceStore:
     def seed_fingerprint(self) -> str | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT value FROM preference_meta WHERE name='seed_fingerprint'"
+                "SELECT value FROM preference_meta WHERE name=?",
+                (f"seed_fingerprint:{self.user_id}",),
             ).fetchone()
             return str(row[0]) if row else None
 
@@ -497,8 +661,9 @@ class SQLitePreferenceStore:
     def pending_clarification(self, actor_id: int) -> PendingClarification | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT * FROM preference_clarifications WHERE actor_id=?",
-                (actor_id,),
+                "SELECT * FROM preference_clarifications "
+                "WHERE user_id=? AND actor_id=?",
+                (self.user_id, actor_id),
             ).fetchone()
             if row is None:
                 return None
@@ -508,8 +673,9 @@ class SQLitePreferenceStore:
                 or int(row["base_revision"]) != current_revision
             ):
                 self._connection.execute(
-                    "DELETE FROM preference_clarifications WHERE actor_id=?",
-                    (actor_id,),
+                    "DELETE FROM preference_clarifications "
+                    "WHERE user_id=? AND actor_id=?",
+                    (self.user_id, actor_id),
                 )
                 return None
         context_value = json.loads(str(row["context_json"]))
@@ -558,13 +724,14 @@ class SQLitePreferenceStore:
                 self._enqueue_reply_locked(reply)
                 connection.execute(
                     "INSERT INTO preference_clarifications("
-                    "actor_id,chat_id,base_revision,created_at,expires_at,preview,context_json"
-                    ") VALUES(?,?,?,?,?,?,?) "
-                    "ON CONFLICT(actor_id) DO UPDATE SET "
+                    "user_id,actor_id,chat_id,base_revision,created_at,expires_at,preview,context_json"
+                    ") VALUES(?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(user_id,actor_id) DO UPDATE SET "
                     "chat_id=excluded.chat_id,base_revision=excluded.base_revision,"
                     "created_at=excluded.created_at,expires_at=excluded.expires_at,"
                     "preview=excluded.preview,context_json=excluded.context_json",
                     (
+                        self.user_id,
                         actor_id,
                         chat_id,
                         base_revision,
@@ -593,7 +760,9 @@ class SQLitePreferenceStore:
 
     def _delete_clarification_locked(self, actor_id: int) -> bool:
         cursor = self._connection.execute(
-            "DELETE FROM preference_clarifications WHERE actor_id=?", (actor_id,)
+            "DELETE FROM preference_clarifications "
+            "WHERE user_id=? AND actor_id=?",
+            (self.user_id, actor_id),
         )
         return cursor.rowcount == 1
 
@@ -678,12 +847,16 @@ class SQLitePreferenceStore:
         return result
 
     def _replace_entries_locked(self, entries: Sequence[PreferenceEntry]) -> None:
-        self._connection.execute("DELETE FROM preference_entries")
+        self._connection.execute(
+            "DELETE FROM preference_entries WHERE user_id=?", (self.user_id,)
+        )
         self._connection.executemany(
-            "INSERT INTO preference_entries(id,kind,data_json,created_revision,updated_revision) "
-            "VALUES(?,?,?,?,?)",
+            "INSERT INTO preference_entries("
+            "user_id,id,kind,data_json,created_revision,updated_revision) "
+            "VALUES(?,?,?,?,?,?)",
             (
                 (
+                    self.user_id,
                     entry.id,
                     entry.kind.value,
                     _json(entry.data),
@@ -696,7 +869,10 @@ class SQLitePreferenceStore:
 
     def _ensure_outbox_room_locked(self) -> None:
         count = int(
-            self._connection.execute("SELECT COUNT(*) FROM telegram_reply_outbox").fetchone()[0]
+            self._connection.execute(
+                "SELECT COUNT(*) FROM telegram_reply_outbox WHERE user_id=?",
+                (self.user_id,),
+            ).fetchone()[0]
         )
         if count >= self.outbox_capacity:
             raise OutboxFullError("Telegram reply outbox is full")
@@ -710,9 +886,10 @@ class SQLitePreferenceStore:
             raise PreferenceStoreError("outbox reply text cannot be empty")
         self._connection.execute(
             "INSERT INTO telegram_reply_outbox("
-            "chat_id,text,parse_mode,reply_markup_json,callback_query_id,created_at) "
-            "VALUES(?,?,?,?,?,?)",
+            "user_id,chat_id,text,parse_mode,reply_markup_json,callback_query_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
             (
+                self.user_id,
                 reply.chat_id,
                 text[:4096],
                 reply.parse_mode,
@@ -750,19 +927,31 @@ class SQLitePreferenceStore:
         outcome: str,
     ) -> None:
         self._connection.execute(
-            "INSERT INTO preference_command_log(update_id,actor_id,occurred_at,command,outcome) "
-            "VALUES(?,?,?,?,?)",
-            (update_id, actor_id, self.clock(), command[:2_000], outcome[:200]),
+            "INSERT INTO preference_command_log("
+            "user_id,update_id,actor_id,occurred_at,command,outcome) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                self.user_id,
+                update_id,
+                actor_id,
+                self.clock(),
+                command[:2_000],
+                outcome[:200],
+            ),
         )
         count = int(
-            self._connection.execute("SELECT COUNT(*) FROM preference_command_log").fetchone()[0]
+            self._connection.execute(
+                "SELECT COUNT(*) FROM preference_command_log WHERE user_id=?",
+                (self.user_id,),
+            ).fetchone()[0]
         )
         excess = max(0, count - self.command_log_cap)
         if excess:
             self._connection.execute(
                 "DELETE FROM preference_command_log WHERE id IN "
-                "(SELECT id FROM preference_command_log ORDER BY id LIMIT ?)",
-                (excess,),
+                "(SELECT id FROM preference_command_log WHERE user_id=? "
+                "ORDER BY id LIMIT ?)",
+                (self.user_id, excess),
             )
 
     def _commit_snapshot_locked(
@@ -783,9 +972,11 @@ class SQLitePreferenceStore:
         self._replace_entries_locked(snapshot.entries)
         self._connection.execute(
             "INSERT INTO preference_revisions("
-            "revision,parent_revision,created_at,original_message,actor_id,update_id,"
-            "operations_json,summary,snapshot_json,rollback_target) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "user_id,revision,parent_revision,created_at,original_message,actor_id,update_id,"
+            "operations_json,summary,snapshot_json,rollback_target) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
+                self.user_id,
                 snapshot.revision,
                 parent_revision,
                 self.clock(),
@@ -885,7 +1076,9 @@ class SQLitePreferenceStore:
 
     def _revision_snapshot_locked(self, revision: int) -> PreferenceSnapshot:
         row = self._connection.execute(
-            "SELECT snapshot_json FROM preference_revisions WHERE revision=?", (revision,)
+            "SELECT snapshot_json FROM preference_revisions "
+            "WHERE user_id=? AND revision=?",
+            (self.user_id, revision),
         ).fetchone()
         if row is None:
             raise PreferenceError(f"unknown revision: {revision}")
@@ -901,7 +1094,9 @@ class SQLitePreferenceStore:
             if current is None or current == 0:
                 raise PreferenceError("there is no applied change to undo")
             row = self._connection.execute(
-                "SELECT parent_revision FROM preference_revisions WHERE revision=?", (current,)
+                "SELECT parent_revision FROM preference_revisions "
+                "WHERE user_id=? AND revision=?",
+                (self.user_id, current),
             ).fetchone()
             target = int(row[0]) if row and row[0] is not None else 0
             return self._revision_snapshot_locked(target), target
@@ -918,9 +1113,10 @@ class SQLitePreferenceStore:
         cutoff = midnight.astimezone(timezone.utc).timestamp()
         with self._lock:
             row = self._connection.execute(
-                "SELECT revision FROM preference_revisions WHERE created_at<? "
+                "SELECT revision FROM preference_revisions "
+                "WHERE user_id=? AND created_at<? "
                 "ORDER BY created_at DESC,revision DESC LIMIT 1",
-                (cutoff,),
+                (self.user_id, cutoff),
             ).fetchone()
             if row is None:
                 raise PreferenceError("there is no revision before today's local midnight")
@@ -1016,10 +1212,11 @@ class SQLitePreferenceStore:
                 self._enqueue_reply_locked(reply)
                 connection.execute(
                     "INSERT INTO preference_confirmations("
-                    "id,base_revision,actor_id,chat_id,created_at,expires_at,proposal_json,"
-                    "target_revision,summary) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "id,user_id,base_revision,actor_id,chat_id,created_at,expires_at,proposal_json,"
+                    "target_revision,summary) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (
                         pending.id,
+                        self.user_id,
                         pending.base_revision,
                         actor_id,
                         chat_id,
@@ -1047,7 +1244,9 @@ class SQLitePreferenceStore:
     def get_confirmation(self, confirmation_id: str) -> PendingConfirmation:
         with self._lock:
             row = self._connection.execute(
-                "SELECT * FROM preference_confirmations WHERE id=?", (confirmation_id,)
+                "SELECT * FROM preference_confirmations "
+                "WHERE id=? AND user_id=?",
+                (confirmation_id, self.user_id),
             ).fetchone()
         if row is None:
             raise ConfirmationError("unknown confirmation id")
@@ -1109,7 +1308,8 @@ class SQLitePreferenceStore:
     def cancel_confirmation(self, confirmation_id: str) -> bool:
         with self._lock:
             cursor = self._connection.execute(
-                "DELETE FROM preference_confirmations WHERE id=?", (confirmation_id,)
+                "DELETE FROM preference_confirmations WHERE id=? AND user_id=?",
+                (confirmation_id, self.user_id),
             )
             return cursor.rowcount == 1
 
@@ -1126,14 +1326,16 @@ class SQLitePreferenceStore:
             connection = self._begin()
             try:
                 row = connection.execute(
-                    "SELECT actor_id FROM preference_confirmations WHERE id=?",
-                    (confirmation_id,),
+                    "SELECT actor_id FROM preference_confirmations "
+                    "WHERE id=? AND user_id=?",
+                    (confirmation_id, self.user_id),
                 ).fetchone()
                 if row is None or int(row[0]) != actor_id:
                     raise ConfirmationError("unknown confirmation id")
                 self._enqueue_reply_locked(reply)
                 connection.execute(
-                    "DELETE FROM preference_confirmations WHERE id=?", (confirmation_id,)
+                    "DELETE FROM preference_confirmations WHERE id=? AND user_id=?",
+                    (confirmation_id, self.user_id),
                 )
                 self._mark_update_locked(update_id, "confirmation_cancelled")
                 self._log_locked(
@@ -1201,12 +1403,12 @@ class SQLitePreferenceStore:
         with self._lock:
             row = self._connection.execute(
                 "SELECT value FROM preference_meta WHERE name=?",
-                (f"ui_language:{actor_id}",),
+                (f"ui_language:{self.user_id}",),
             ).fetchone()
         return self._normalize_ui_language(str(row[0]) if row else None)
 
     def ensure_ui_language(self, actor_id: int, telegram_language: str | None) -> str:
-        key = f"ui_language:{actor_id}"
+        key = f"ui_language:{self.user_id}"
         with self._lock:
             row = self._connection.execute(
                 "SELECT value FROM preference_meta WHERE name=?", (key,)
@@ -1225,7 +1427,7 @@ class SQLitePreferenceStore:
             self._connection.execute(
                 "INSERT INTO preference_meta(name,value) VALUES(?,?) "
                 "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
-                (f"ui_language:{actor_id}", normalized),
+                (f"ui_language:{self.user_id}", normalized),
             )
         return normalized
 
@@ -1241,15 +1443,15 @@ class SQLitePreferenceStore:
             minute = int(
                 self._connection.execute(
                     "SELECT COUNT(*) FROM preference_rate_events "
-                    "WHERE actor_id=? AND occurred_at>?",
-                    (actor_id, now - 60),
+                    "WHERE user_id=? AND actor_id=? AND occurred_at>?",
+                    (self.user_id, actor_id, now - 60),
                 ).fetchone()[0]
             )
             hour = int(
                 self._connection.execute(
                     "SELECT COUNT(*) FROM preference_rate_events "
-                    "WHERE actor_id=? AND occurred_at>?",
-                    (actor_id, now - 3_600),
+                    "WHERE user_id=? AND actor_id=? AND occurred_at>?",
+                    (self.user_id, actor_id, now - 3_600),
                 ).fetchone()[0]
             )
         if minute >= per_minute:
@@ -1264,11 +1466,14 @@ class SQLitePreferenceStore:
             connection = self._begin()
             try:
                 connection.execute(
-                    "DELETE FROM preference_rate_events WHERE occurred_at<=?", (now - 3_600,)
+                    "DELETE FROM preference_rate_events "
+                    "WHERE user_id=? AND occurred_at<=?",
+                    (self.user_id, now - 3_600),
                 )
                 connection.execute(
-                    "INSERT INTO preference_rate_events(actor_id,occurred_at) VALUES(?,?)",
-                    (actor_id, now),
+                    "INSERT INTO preference_rate_events("
+                    "user_id,actor_id,occurred_at) VALUES(?,?,?)",
+                    (self.user_id, actor_id, now),
                 )
                 connection.execute("COMMIT")
             except Exception:
@@ -1279,8 +1484,8 @@ class SQLitePreferenceStore:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT id,chat_id,text,parse_mode,reply_markup_json,callback_query_id,attempts "
-                "FROM telegram_reply_outbox ORDER BY id LIMIT ?",
-                (limit,),
+                "FROM telegram_reply_outbox WHERE user_id=? ORDER BY id LIMIT ?",
+                (self.user_id, limit),
             ).fetchall()
         return [
             OutboxMessage(
@@ -1306,22 +1511,25 @@ class SQLitePreferenceStore:
     def complete_outbox(self, message_id: int) -> None:
         with self._lock:
             self._connection.execute(
-                "DELETE FROM telegram_reply_outbox WHERE id=?", (message_id,)
+                "DELETE FROM telegram_reply_outbox WHERE id=? AND user_id=?",
+                (message_id, self.user_id),
             )
 
     def fail_outbox(self, message_id: int, error: str) -> None:
         with self._lock:
             self._connection.execute(
-                "UPDATE telegram_reply_outbox SET attempts=attempts+1,last_error=? WHERE id=?",
-                (error[:500], message_id),
+                "UPDATE telegram_reply_outbox SET attempts=attempts+1,last_error=? "
+                "WHERE id=? AND user_id=?",
+                (error[:500], message_id, self.user_id),
             )
 
     def history(self, limit: int = 10) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT revision,parent_revision,created_at,summary,rollback_target "
-                "FROM preference_revisions ORDER BY revision DESC LIMIT ?",
-                (max(1, min(limit, 100)),),
+                "FROM preference_revisions WHERE user_id=? "
+                "ORDER BY revision DESC LIMIT ?",
+                (self.user_id, max(1, min(limit, 100))),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1329,10 +1537,14 @@ class SQLitePreferenceStore:
         now = self.clock()
         with self._lock:
             expired = self._connection.execute(
-                "DELETE FROM preference_confirmations WHERE expires_at<=?", (now,)
+                "DELETE FROM preference_confirmations "
+                "WHERE user_id=? AND expires_at<=?",
+                (self.user_id, now),
             ).rowcount
             rates = self._connection.execute(
-                "DELETE FROM preference_rate_events WHERE occurred_at<=?", (now - 3_600,)
+                "DELETE FROM preference_rate_events "
+                "WHERE user_id=? AND occurred_at<=?",
+                (self.user_id, now - 3_600),
             ).rowcount
         return {"confirmations": max(0, expired), "rate_events": max(0, rates)}
 

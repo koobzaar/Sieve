@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import inspect
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 from .bm25 import okapi_bm25
 from .evaluator import EvaluationError, RetryableEvaluationError
@@ -96,8 +97,6 @@ class PromotionPipeline:
         b: float = 0.75,
         cold_start_documents: int = 500,
         exceptional_temperature: int = 300,
-        default_mode: str = "shadow",
-        source_modes: Mapping[str, str] | None = None,
         preference_provider: PreferenceProvider | None = None,
     ) -> None:
         self.store = store
@@ -120,11 +119,15 @@ class PromotionPipeline:
         self.b = b
         self.cold_start_documents = cold_start_documents
         self.exceptional_temperature = exceptional_temperature
-        self.default_mode = default_mode
-        self.source_modes = dict(source_modes or {})
         self.preference_provider = preference_provider or AtomicPreferenceProvider(
             build_snapshot(0, seed_entries(profile, aliases, hard_rules))
         )
+        initial_snapshot = self.preference_provider.get_snapshot()
+        if hasattr(self.store, "ensure_alias_generation"):
+            self.store.ensure_alias_generation(dict(initial_snapshot.aliases))
+        self.user_id: str | None = None
+        self.delivery_chat_id: int | None = None
+        self.delivery_language = "en"
         try:
             parameters = inspect.signature(self.evaluator.evaluate).parameters.values()
             self._evaluator_accepts_context = (
@@ -134,6 +137,13 @@ class PromotionPipeline:
             )
         except (TypeError, ValueError):
             self._evaluator_accepts_context = True
+
+    def bind_user(
+        self, user_id: str, chat_id: int, *, language: str = "en"
+    ) -> None:
+        self.user_id = str(user_id)
+        self.delivery_chat_id = int(chat_id)
+        self.delivery_language = language
 
     async def _evaluate(
         self, promotion: Promotion, normalized: str, preference_context: str
@@ -145,17 +155,21 @@ class PromotionPipeline:
         return await self.evaluator.evaluate(promotion, normalized)
 
     def _record(self, promotion: Promotion, result: PipelineResult) -> PipelineResult:
-        self.store.add_decision(promotion, result)
+        try:
+            self.store.add_decision(promotion, result, self.user_id)
+        except TypeError:
+            self.store.add_decision(promotion, result)
         logger.info(
             "promotion_decision",
             extra={
                 "event": "promotion_decision",
                 "source": promotion.source,
                 "promotion_id": promotion.id,
+                "user_id": self.user_id,
                 "decision": result.decision.value,
                 "stage": result.stage,
-                "reason": result.reason,
                 "score": result.score,
+                "exceptional": result.exceptional,
                 "shadow_decision": (
                     result.shadow_decision.value if result.shadow_decision else None
                 ),
@@ -207,13 +221,28 @@ class PromotionPipeline:
         )
 
     async def _deliver(self, promotion: Promotion, reason: str) -> bool:
+        if self.user_id is not None and self.delivery_chat_id is not None:
+            return bool(
+                self.store.enqueue_delivery(
+                    self.user_id,
+                    self.delivery_chat_id,
+                    promotion,
+                    reason,
+                    language=self.delivery_language,
+                )
+            )
         if not self.store.claim_delivery(promotion):
             return False
-        mode = self.source_modes.get(promotion.source, self.default_mode)
-        await self.sink.send(promotion, reason, shadow=mode != "live")
+        await self.sink.send(promotion, reason)
         return True
 
-    async def process(self, promotion: Promotion) -> PipelineResult:
+    async def process(
+        self,
+        promotion: Promotion,
+        *,
+        skip_global_dedup: bool = False,
+        corpus_preloaded: bool = False,
+    ) -> PipelineResult:
         snapshot = self.preference_provider.get_snapshot()
         blocked = fixed_filter(promotion)
         if blocked.rejected:
@@ -242,7 +271,9 @@ class PromotionPipeline:
             )
 
         content_hash = promotion_hash(promotion)
-        if self.store.check_and_mark_seen(promotion, content_hash):
+        if not skip_global_dedup and self.store.check_and_mark_seen(
+            promotion, content_hash
+        ):
             return self._record(
                 promotion, PipelineResult(Decision.DISCARD, "deduplication", "duplicate")
             )
@@ -257,7 +288,11 @@ class PromotionPipeline:
             )
 
         raw_tokens = tokenize(normalized)
-        if hasattr(self.store, "add_corpus_document_dynamic"):
+        if corpus_preloaded:
+            document_tokens = canonical_match_tokens(raw_tokens, snapshot.aliases)
+            corpus_size = self.store.corpus_size()
+            bm25_ready = True
+        elif hasattr(self.store, "add_corpus_document_dynamic"):
             corpus_size, bm25_ready = self.store.add_corpus_document_dynamic(  # type: ignore[attr-defined]
                 raw_tokens, dict(snapshot.aliases)
             )
@@ -292,7 +327,18 @@ class PromotionPipeline:
             and not exceptional_uncertain
             and corpus_size > self.cold_start_documents
         ):
-            size, average_length, frequencies = self.store.corpus_stats(query_terms)
+            if self.user_id is not None and hasattr(
+                self.store, "corpus_stats_for_aliases"
+            ):
+                size, average_length, frequencies = (
+                    self.store.corpus_stats_for_aliases(
+                        query_terms, dict(snapshot.aliases)
+                    )
+                )
+            else:
+                size, average_length, frequencies = self.store.corpus_stats(
+                    query_terms
+                )
             score = okapi_bm25(
                 document_tokens,
                 query_terms,
@@ -369,7 +415,12 @@ class PromotionPipeline:
                 promotion, normalized, snapshot.rendered_profile
             )
         except RetryableEvaluationError as exc:
-            queued = self.store.enqueue_retry(promotion, str(exc))
+            try:
+                queued = self.store.enqueue_retry(
+                    promotion, str(exc), self.user_id
+                )
+            except TypeError:
+                queued = self.store.enqueue_retry(promotion, str(exc))
             reason = "llm_retry_queued" if queued else "llm_retry_queue_full"
             decision = Decision.RETRY if queued else Decision.DISCARD
             return self._record(
@@ -429,3 +480,119 @@ class PromotionPipeline:
             PipelineResult(evaluation.decision, "llm_retry", evaluation.reason),
         )
         return evaluation
+
+
+class MultiUserPromotionPipeline:
+    """Ingest once, then evaluate and queue delivery independently per active UUID."""
+
+    def __init__(
+        self,
+        *,
+        store: Any,
+        pipeline_factory: Callable[[Any, AtomicPreferenceProvider], PromotionPipeline],
+        preference_store_factory: Callable[[Any], Any],
+    ) -> None:
+        self.store = store
+        self.pipeline_factory = pipeline_factory
+        self.preference_store_factory = preference_store_factory
+        self._pipelines: dict[str, PromotionPipeline] = {}
+        self._providers: dict[str, AtomicPreferenceProvider] = {}
+
+    def _pipeline(self, account: Any) -> PromotionPipeline:
+        preference_store = self.preference_store_factory(account)
+        snapshot = preference_store.current_snapshot()
+        provider = self._providers.get(account.id)
+        if provider is None:
+            provider = AtomicPreferenceProvider(snapshot)
+            self._providers[account.id] = provider
+        else:
+            provider.swap(snapshot)
+        pipeline = self._pipelines.get(account.id)
+        if pipeline is None:
+            pipeline = self.pipeline_factory(account, provider)
+            pipeline.bind_user(
+                account.id,
+                account.telegram_chat_id,
+                language=account.ui_language,
+            )
+            self._pipelines[account.id] = pipeline
+        return pipeline
+
+    async def process(self, promotion: Promotion) -> dict[str, PipelineResult]:
+        accounts = self.store.active_users()
+        if not accounts:
+            return {}
+        if self.store.check_and_mark_native(promotion):
+            return {
+                account.id: self._record_external(
+                    account.id,
+                    promotion,
+                    PipelineResult(
+                        Decision.DISCARD,
+                        "deduplication",
+                        "native_replay",
+                    ),
+                )
+                for account in accounts
+            }
+        duplicates: dict[str, str] = {}
+        for account in accounts:
+            reason = self.store.check_near_duplicate(account.id, promotion)
+            if reason is not None:
+                duplicates[account.id] = reason
+        if len(duplicates) < len(accounts):
+            raw_tokens = tokenize(promotion_text(promotion))
+            self.store.add_corpus_document(
+                raw_tokens,
+                raw_tokens=raw_tokens,
+            )
+        results: dict[str, PipelineResult] = {}
+        for account in accounts:
+            if account.id in duplicates:
+                results[account.id] = self._record_external(
+                    account.id,
+                    promotion,
+                    PipelineResult(
+                        Decision.DISCARD,
+                        "deduplication",
+                        duplicates[account.id],
+                    ),
+                )
+                continue
+            try:
+                results[account.id] = await self._pipeline(account).process(
+                    promotion,
+                    skip_global_dedup=True,
+                    corpus_preloaded=True,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "user_evaluation_failure",
+                    extra={
+                        "event": "user_evaluation_failure",
+                        "user_id": account.id,
+                        "promotion_id": promotion.id,
+                    },
+                )
+                results[account.id] = self._record_external(
+                    account.id,
+                    promotion,
+                    PipelineResult(
+                        Decision.DISCARD,
+                        "user_error",
+                        f"{type(exc).__name__}:evaluation_failed",
+                    ),
+                )
+        return results
+
+    def _record_external(
+        self, user_id: str, promotion: Promotion, result: PipelineResult
+    ) -> PipelineResult:
+        self.store.add_decision(promotion, result, user_id)
+        return result
+
+    async def process_retry(self, user_id: str, promotion: Promotion) -> Evaluation:
+        account = self.store.user_by_id(user_id)
+        if account is None or account.status != "active":
+            return Evaluation(Decision.DISCARD, "user_inactive")
+        return await self._pipeline(account).process_retry(promotion)

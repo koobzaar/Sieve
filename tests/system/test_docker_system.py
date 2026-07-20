@@ -38,6 +38,8 @@ def command(
         check=check,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
 
@@ -83,8 +85,10 @@ class Stack:
             timeout=timeout,
         )
 
-    def logs(self) -> str:
-        result = self.run("logs", "--no-color", check=False, timeout=30)
+    def logs(self, *services: str) -> str:
+        result = self.run(
+            "logs", "--no-color", *services, check=False, timeout=30
+        )
         return (result.stdout or "") + (result.stderr or "")
 
     def down(self) -> None:
@@ -341,6 +345,11 @@ def test_packaged_service_end_to_end_and_restart_persistence() -> None:
         assert final["entries"] == persisted["entries"]
         assert final["revisions"] == persisted["revisions"]
         assert final["offset"] == 14
+        logs = stack.logs("sieve")
+        assert '"level":"error"' not in logs.casefold()
+        assert "traceback" not in logs.casefold()
+        assert "envio de teste" not in logs.casefold()
+        assert "rx 9070 xt" not in logs.casefold()
     except Exception as exc:
         logs = stack.logs()
         raise AssertionError(f"{exc}\n\nDocker system logs:\n{logs[-20000:]}") from exc

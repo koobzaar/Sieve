@@ -28,7 +28,6 @@ def build_pipeline(tmp_path, evaluator, sink, **overrides):
         ),
         threshold=overrides.pop("threshold", 0.2),
         cold_start_documents=overrides.pop("cold_start_documents", 0),
-        default_mode=overrides.pop("default_mode", "shadow"),
         **overrides,
     )
     return pipeline, store
@@ -76,7 +75,7 @@ async def test_exceptional_bypasses_bm25_and_llm_but_is_shadow_delivered(tmp_pat
     )
     assert result.exceptional and result.decision == Decision.FORWARD
     assert not evaluator.calls
-    assert sink.sent[0][2] is True
+    assert len(sink.sent[0]) == 2
     store.close()
 
 
@@ -155,6 +154,32 @@ async def test_llm_outage_enters_bounded_persistent_retry_queue(tmp_path) -> Non
     assert second.decision == Decision.DISCARD
     assert second.reason == "llm_retry_queue_full"
     assert store._connection.execute("SELECT COUNT(*) FROM retry_jobs").fetchone()[0] == 1
+    store.close()
+
+
+async def test_documents_one_through_500_bypass_bm25_and_501_uses_it(tmp_path) -> None:
+    evaluator = FakeEvaluator([Evaluation(Decision.DISCARD, "warm-up")])
+    sink = FakeSink()
+    pipeline, store = build_pipeline(
+        tmp_path,
+        evaluator,
+        sink,
+        threshold=999,
+        cold_start_documents=500,
+    )
+    for index in range(499):
+        store.add_corpus_document([f"prior-{index}"])
+    document_500 = await pipeline.process(
+        Promotion(id="500", source="x", title="SSD document 500")
+    )
+    document_501 = await pipeline.process(
+        Promotion(id="501", source="x", title="SSD document 501")
+    )
+    assert document_500.stage == "llm"
+    assert document_500.score is None
+    assert document_501.stage == "bm25"
+    assert document_501.score is not None
+    assert len(evaluator.calls) == 1
     store.close()
 
 

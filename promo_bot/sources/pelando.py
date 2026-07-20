@@ -410,7 +410,7 @@ class PelandoSource:
         url: str = "https://www.pelando.com.br/recentes",
         interval_seconds: float = 120,
         timeout_seconds: float = 20,
-        user_agent: str = "sieve/1.0 (+private-use)",
+        user_agent: str = "sieve/1.1.0-beta.1 (+private-use)",
         health_reporter: HealthReporter | None = None,
     ) -> None:
         self.name = name
@@ -481,6 +481,8 @@ def create_pelando_source(
         url=str(settings.get("url", "https://www.pelando.com.br/recentes")),
         interval_seconds=float(settings.get("interval_seconds", 120)),
         timeout_seconds=float(settings.get("timeout_seconds", 20)),
-        user_agent=str(settings.get("user_agent", "sieve/1.0 (+private-use)")),
+        user_agent=str(
+            settings.get("user_agent", "sieve/1.1.0-beta.1 (+private-use)")
+        ),
         health_reporter=health_reporter,
     )

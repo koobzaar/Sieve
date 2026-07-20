@@ -98,7 +98,7 @@ async def test_gemini_reason_is_bounded_to_one_sentence() -> None:
     assert result.reason == "Não combina."
 
 
-async def test_telegram_sink_formats_shadow_and_silences_notification() -> None:
+async def test_telegram_sink_formats_live_audible_notification_without_test_banner() -> None:
     bodies: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -115,12 +115,13 @@ async def test_telegram_sink_formats_shadow_and_silences_notification() -> None:
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         sink = TelegramBotSink(token="token", chat_id="42", client=client)
-        await sink.send(promotion, "Menor preço.", shadow=True)
+        await sink.send(promotion, "Menor preço.")
         await sink.alert("parser alterado")
-    assert "Test delivery" in bodies[0]["text"]
+    assert "Test delivery" not in bodies[0]["text"]
+    assert "Envio de teste" not in bodies[0]["text"]
     assert "R$ 1,299.90" in bodies[0]["text"]
     assert bodies[0]["parse_mode"] == "HTML"
-    assert bodies[0]["disable_notification"] is True
+    assert bodies[0]["disable_notification"] is False
     assert bodies[1]["disable_notification"] is False
     assert "SIEVE ALERT" in bodies[1]["text"]
     assert format_promotion(promotion, "x").startswith("<b>SSD</b>")

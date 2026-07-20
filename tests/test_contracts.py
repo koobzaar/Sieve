@@ -50,7 +50,7 @@ async def assert_evaluator_contract(evaluator: LLMEvaluator) -> None:
 
 async def assert_sink_contract(sink: PromotionSink) -> None:
     promotion = Promotion(id="1", source="x", title="SSD")
-    await sink.send(promotion, "ok", shadow=True)
+    await sink.send(promotion, "ok")
     await sink.alert("test")
     await sink.close()
 
