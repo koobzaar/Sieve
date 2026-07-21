@@ -45,18 +45,18 @@ gemini:
   thinking_level: minimal
   stages:
     extraction:
-      schema_version: promotion-extraction-v1
-      prompt_version: promotion-extraction-prompt-v1
+      schema_version: promotion-extraction-v2
+      prompt_version: promotion-extraction-prompt-v2
       max_input_chars: 12000
       max_output_tokens: 900
     verification:
-      schema_version: promotion-verification-v1
-      prompt_version: promotion-verification-prompt-v1
+      schema_version: promotion-verification-v2
+      prompt_version: promotion-verification-prompt-v2
       max_input_chars: 20000
       max_output_tokens: 700
     localization:
-      schema_version: promotion-localization-v1
-      prompt_version: promotion-localization-prompt-v1
+      schema_version: promotion-localization-v2
+      prompt_version: promotion-localization-prompt-v2
       max_input_chars: 8000
       max_output_tokens: 500
     reason:

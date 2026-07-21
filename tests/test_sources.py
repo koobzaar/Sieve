@@ -478,7 +478,31 @@ def test_synthetic_telethon_text_and_media_caption_events_need_no_download() -> 
     assert promotion.title == "SSD NVMe por R$ 299"
     assert str(promotion.price) == "299"
     assert promotion.url == "https://shop.test/p?x=1"
+    assert promotion.urls == ("https://shop.test/p?x=1",)
     assert promotion.metadata["chat_id"] == -100123
+
+
+def test_telegram_source_preserves_distinct_offer_links_in_source_order() -> None:
+    stamp = datetime(2026, 7, 18, tzinfo=timezone.utc)
+    event = SimpleNamespace(
+        chat_id=-100123,
+        message=SimpleNamespace(
+            id=79,
+            raw_text=(
+                "SSD em duas lojas\n"
+                "https://first.test/deal),\n"
+                "https://second.test/deal"
+            ),
+            date=stamp,
+            media=None,
+        ),
+    )
+    promotion = promotion_from_telethon_event(event, source_name="telegram-principal")
+    assert promotion.url == "https://first.test/deal"
+    assert promotion.urls == (
+        "https://first.test/deal",
+        "https://second.test/deal",
+    )
 
 
 def test_telegram_photo_is_preserved_as_a_deferred_media_reference() -> None:

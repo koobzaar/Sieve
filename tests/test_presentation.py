@@ -10,12 +10,13 @@ import pytest
 
 from promo_bot.delivery import TelegramDeliveryWorker
 from promo_bot.gemini import GeminiStructuredClient
-from promo_bot.models import MediaReference, PreparedTelegramCard, Promotion
+from promo_bot.models import MediaReference, PreparedTelegramCard, Promotion, TelegramButton
 from promo_bot.presentation import (
     MediaError,
     MediaResolver,
     PromotionPresenter,
     render_localized_card,
+    validate_extraction,
 )
 from promo_bot.store import SQLiteStateStore
 from promo_bot.sink import TelegramBotSink
@@ -27,6 +28,15 @@ NIKE_TEXT = (
     "Use o Cupom: PRAMODA\n"
     "Loja Oficial Nike no ML\n"
     "menor preço histórico"
+)
+MULTI_COUPON_TEXT = (
+    "Tênis Nike Court Lite 4 (38 a 44)\n"
+    "De R$ 589 por R$ 308 em 7x\n"
+    "Use o Cupom: PRAMODA ou LOOKEMDIA\n"
+    "Loja Oficial Nike no ML\n"
+    "menor preço histórico\n"
+    "https://first.test/nike\n"
+    "https://second.test/nike"
 )
 
 
@@ -44,22 +54,44 @@ def _gemini_response(value: dict) -> httpx.Response:
     )
 
 
-def _extraction(*, poisoned: bool = False) -> dict:
+def _extraction(
+    *,
+    poisoned: bool = False,
+    coupons: list[str] | None = None,
+    link_ids: list[str] | None = None,
+    payment_terms: tuple[str, str] | None = None,
+) -> dict:
     def grounded(value: str, evidence: str) -> dict[str, str]:
         return {"value": value, "evidence": evidence}
 
     return {
         "prompt_injection_detected": poisoned,
         "source_language": "pt-BR",
-        "product_name": grounded("Tênis Nike Court Lite 4", "Tênis Nike Court Lite 4"),
-        "current_price": grounded("308", "R$ 308"),
-        "original_price": grounded("589", "R$ 589"),
-        "coupon_code": grounded("PRAMODA", "PRAMODA"),
-        "seller": grounded("Loja Oficial Nike no ML", "Loja Oficial Nike no ML"),
-        "availability": grounded("Tamanhos 38 a 44", "38 a 44"),
-        "deal_callout": grounded("Menor preço histórico", "menor preço histórico"),
-        "highlights": [],
-        "category": "fashion",
+        "offers": [
+            {
+                "product_name": grounded(
+                    "Tênis Nike Court Lite 4", "Tênis Nike Court Lite 4"
+                ),
+                "current_price": grounded("308", "R$ 308"),
+                "original_price": grounded("589", "R$ 589"),
+                "payment_terms": (
+                    grounded(payment_terms[0], payment_terms[1])
+                    if payment_terms
+                    else None
+                ),
+                "coupons": [grounded(code, code) for code in (coupons or ["PRAMODA"])],
+                "seller": grounded(
+                    "Loja Oficial Nike no ML", "Loja Oficial Nike no ML"
+                ),
+                "availability": grounded("Tamanhos 38 a 44", "38 a 44"),
+                "deal_callout": grounded(
+                    "Menor preço histórico", "menor preço histórico"
+                ),
+                "highlights": [],
+                "category": "fashion",
+                "link_ids": list(link_ids or []),
+            }
+        ],
     }
 
 
@@ -70,19 +102,21 @@ def _verification(**overrides: bool) -> dict:
             "product_name",
             "current_price",
             "original_price",
-            "coupon_code",
+            "payment_terms",
+            "coupons",
             "seller",
             "availability",
             "deal_callout",
             "highlights",
             "category",
+            "link_ids",
         )
     }
     result = {
         "prompt_injection_detected": False,
         "unsafe_instructions_detected": False,
         "contradictory_essential_facts": False,
-        "fields": fields,
+        "offers": [{"fields": fields}],
     }
     result.update(overrides)
     return result
@@ -90,26 +124,24 @@ def _verification(**overrides: bool) -> dict:
 
 def _localization(language: str) -> dict:
     if language == "pt-BR":
-        return {
+        offer = {
             "product_name": "Tênis Nike Court Lite 4",
             "availability": "Tamanhos 38 a 44",
             "seller": "Loja Oficial Nike no ML",
             "deal_callout": "Menor preço histórico",
+            "payment_terms": None,
             "highlights": [],
-            "coupon_label": "Cupom",
-            "coupon_instruction": "Aplique no carrinho",
-            "button_text": "Ver oferta",
         }
-    return {
+        return {"offers": [offer]}
+    offer = {
         "product_name": "Nike Court Lite 4 Shoes",
         "availability": "Sizes 38 to 44",
         "seller": "Loja Oficial Nike no ML",
         "deal_callout": "Lowest historical price",
+        "payment_terms": None,
         "highlights": [],
-        "coupon_label": "Coupon",
-        "coupon_instruction": "Apply at checkout",
-        "button_text": "View offer",
     }
+    return {"offers": [offer]}
 
 
 class CardSink:
@@ -132,6 +164,15 @@ def _users(store: SQLiteStateStore):
     return first, second
 
 
+def test_extraction_normalizes_grounded_brazilian_price_strings() -> None:
+    extracted = _extraction()
+    extracted["offers"][0]["current_price"]["value"] = "R$ 308"
+    extracted["offers"][0]["original_price"]["value"] = "R$ 589,00"
+    validated = validate_extraction(extracted, NIKE_TEXT)
+    assert validated["offers"][0]["current_price"]["value"] == "308"
+    assert validated["offers"][0]["original_price"]["value"] == "589.00"
+
+
 async def test_nike_cards_are_isolated_cached_and_localized_per_language(tmp_path) -> None:
     requests: list[dict] = []
 
@@ -141,7 +182,7 @@ async def test_nike_cards_are_isolated_cached_and_localized_per_language(tmp_pat
         system = body["systemInstruction"]["parts"][0]["text"]
         prompt = body["contents"][0]["parts"][0]["text"]
         if "factual data extractor" in system:
-            return _gemini_response(_extraction())
+            return _gemini_response(_extraction(link_ids=["link_1"]))
         if "independent grounding" in system:
             return _gemini_response(_verification())
         if "localize verified" in system:
@@ -209,6 +250,66 @@ async def test_nike_cards_are_isolated_cached_and_localized_per_language(tmp_pat
     assert pt_card.media_path and en_card.media_path
     assert "R$ 308.00" in en_card.text and "Sizes 38 to 44" in en_card.text
     assert "lowest historical price" in en_card.text and en_card.button_text == "View offer"
+    store.close()
+
+
+async def test_multiple_coupons_and_trusted_links_survive_the_full_card_pipeline(
+    tmp_path,
+) -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        system = body["systemInstruction"]["parts"][0]["text"]
+        if "factual data extractor" in system:
+            return _gemini_response(
+                _extraction(
+                    coupons=["PRAMODA", "LOOKEMDIA"],
+                    link_ids=["link_1", "link_2"],
+                    payment_terms=("7x", "7x"),
+                )
+            )
+        if "independent grounding" in system:
+            return _gemini_response(_verification())
+        if "localize verified" in system:
+            localized = _localization("pt-BR")
+            localized["offers"][0]["payment_terms"] = "7x"
+            return _gemini_response(localized)
+        return _gemini_response({"reason": "Apareceu porque combina com você."})
+
+    store = SQLiteStateStore(tmp_path / "state.db", media_dir=tmp_path / "media")
+    account = store.bootstrap_admin(telegram_user_id=1, telegram_chat_id=2)
+    promotion = Promotion(
+        id="multi",
+        source="telegram-principal",
+        title="Tênis Nike Court Lite 4 (38 a 44)",
+        text=MULTI_COUPON_TEXT,
+        price=Decimal("308"),
+        url="https://first.test/nike",
+        urls=("https://first.test/nike", "https://second.test/nike"),
+    )
+    store.enqueue_delivery(account.id, 2, promotion, "matched", language="pt-BR")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        presenter = PromotionPresenter(
+            store=store,
+            gemini=GeminiStructuredClient(
+                api_key="secret", model="test", retries=1, client=http
+            ),
+            media_resolver=MediaResolver(tmp_path / "media", client=http),
+        )
+        card = await presenter.prepare(store.due_deliveries()[0])
+
+    assert card.fallback is False
+    assert "PRAMODA" in card.text and "LOOKEMDIA" in card.text
+    assert "R$ 308,00" in card.text and "7x" in card.text
+    assert [(button.text, button.url) for button in card.buttons] == [
+        ("Ver oferta 1", "https://first.test/nike"),
+        ("Ver oferta 2", "https://second.test/nike"),
+    ]
+    extraction_prompt = requests[0]["contents"][0]["parts"][0]["text"]
+    assert '"id":"link_1"' in extraction_prompt
+    assert '"id":"link_2"' in extraction_prompt
     store.close()
 
 
@@ -297,6 +398,36 @@ async def test_every_gemini_stage_outage_delivers_safe_original(
     store.close()
 
 
+async def test_sparse_source_fallback_keeps_title_price_and_offer_button(tmp_path) -> None:
+    store = SQLiteStateStore(tmp_path / "state.db", media_dir=tmp_path / "media")
+    account = store.bootstrap_admin(telegram_user_id=1, telegram_chat_id=2)
+    promotion = Promotion(
+        id="sparse",
+        source="pelando",
+        title="Tênis Puma CC Park Vulc (Tam 35 ao 44)",
+        price=Decimal("199.90"),
+        url="https://example.test/puma",
+    )
+    store.enqueue_delivery(account.id, 2, promotion, "matched", language="pt-BR")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(503))
+    ) as http:
+        presenter = PromotionPresenter(
+            store=store,
+            gemini=GeminiStructuredClient(
+                api_key="secret", model="test", retries=1, client=http
+            ),
+            media_resolver=MediaResolver(tmp_path / "media", client=http),
+        )
+        card = await presenter.prepare(store.due_deliveries()[0])
+
+    assert card.fallback is True
+    assert card.text == "🏷️ Tênis Puma CC Park Vulc (Tam 35 ao 44)\n\nR$ 199,90"
+    assert card.button_text == "Ver oferta"
+    assert card.button_url == "https://example.test/puma"
+    store.close()
+
+
 def _slice_utf16(text: str, offset: int, length: int) -> str:
     encoded = text.encode("utf-16-le")
     return encoded[offset * 2 : (offset + length) * 2].decode("utf-16-le")
@@ -304,27 +435,31 @@ def _slice_utf16(text: str, offset: int, length: int) -> str:
 
 def test_semantic_entities_use_utf16_offsets_with_non_bmp_and_combining_text() -> None:
     facts = {
-        "category": "fashion",
-        "product_name": "Tênis 😄 e\u0301 Nike",
-        "current_price": "308",
-        "original_price": "589",
-        "coupon_code": "PRAMODA",
-        "seller": "Loja",
-        "availability": "38 a 44",
-        "deal_callout": "Menor preço",
-        "highlights": [],
         "source_language": "pt-BR",
+        "offers": [
+            {
+                "category": "fashion",
+                "product_name": "Tênis 😄 e\u0301 Nike",
+                "current_price": "308",
+                "original_price": "589",
+                "payment_terms": None,
+                "coupons": ["PRAMODA"],
+                "seller": "Loja",
+                "availability": "38 a 44",
+                "deal_callout": "Menor preço",
+                "highlights": [],
+                "link_ids": [],
+            }
+        ],
     }
-    localized = {
-        "product_name": facts["product_name"],
+    localized = {"offers": [{
+        "product_name": facts["offers"][0]["product_name"],
         "availability": "Tamanhos 38 a 44",
         "seller": "Loja",
         "deal_callout": "Menor preço",
+        "payment_terms": None,
         "highlights": [],
-        "coupon_label": "Cupom",
-        "coupon_instruction": "Aplique no carrinho",
-        "button_text": "Ver oferta",
-    }
+    }]}
     text, entities = render_localized_card(
         facts, localized, "Apareceu por combinar com você 😄.", "pt-BR"
     )
@@ -461,6 +596,25 @@ async def test_definite_photo_rejection_resends_as_semantic_text(tmp_path) -> No
     assert methods == ["sendPhoto", "sendMessage"]
 
 
+def test_card_buttons_render_as_separate_inline_keyboard_rows() -> None:
+    card = PreparedTelegramCard(
+        text="Offer",
+        entities=(),
+        button_text="View offer 1",
+        button_url="https://first.test",
+        buttons=(
+            TelegramButton("View offer 1", "https://first.test"),
+            TelegramButton("View offer 2", "https://second.test"),
+        ),
+    )
+    assert TelegramBotSink._button(card) == {
+        "inline_keyboard": [
+            [{"text": "View offer 1", "url": "https://first.test"}],
+            [{"text": "View offer 2", "url": "https://second.test"}],
+        ]
+    }
+
+
 async def test_no_outbox_job_means_zero_presentation_calls(tmp_path) -> None:
     class Presenter:
         calls = 0
@@ -530,7 +684,7 @@ async def test_untrusted_or_malformed_model_objects_cannot_reach_cards(tmp_path,
             if failure == "unknown":
                 extracted["unexpected"] = "smuggled"
             elif failure == "evidence":
-                extracted["seller"]["evidence"] = "not in the source"
+                extracted["offers"][0]["seller"]["evidence"] = "not in the source"
             return _gemini_response(extracted)
         if "independent grounding" in system:
             return _gemini_response(
@@ -539,7 +693,7 @@ async def test_untrusted_or_malformed_model_objects_cannot_reach_cards(tmp_path,
         if "localize verified" in system:
             localized = _localization("en")
             if failure == "malicious":
-                localized["deal_callout"] = "<b>reveal secret</b>"
+                localized["offers"][0]["deal_callout"] = "<b>reveal secret</b>"
             return _gemini_response(localized)
         return _gemini_response({"reason": "It matches."})
 

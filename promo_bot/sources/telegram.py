@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Awaitable, Callable
 from datetime import timezone
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,9 @@ def promotion_from_telethon_event(event: Any, *, source_name: str = "telegram") 
     text = str(getattr(message, "raw_text", None) or getattr(message, "message", None) or "")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     title = lines[0] if lines else ""
-    urls = URL_RE.findall(text)
+    urls = tuple(
+        dict.fromkeys(url.rstrip(".,);]") for url in URL_RE.findall(text))
+    )
     chat_id = getattr(event, "chat_id", None) or getattr(message, "chat_id", "unknown")
     message_id = getattr(message, "id", getattr(event, "id", "unknown"))
     timestamp = getattr(message, "date", None) or utc_now()
@@ -51,7 +52,8 @@ def promotion_from_telethon_event(event: Any, *, source_name: str = "telegram") 
         title=title,
         text=text,
         price=parse_stated_price(text),
-        url=urls[0].rstrip(".,);]") if urls else None,
+        url=urls[0] if urls else None,
+        urls=urls,
         timestamp=timestamp,
         metadata={"chat_id": int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)},
         media=media,

@@ -523,8 +523,12 @@ Promotion notifications default to a still-image `sendPhoto` card and use `sendM
 image is available. Sieve assembles plain caption text in application code and supplies explicit
 UTF-16 `bold`, `strikethrough`, `code`, and `blockquote` entities—Gemini never writes Telegram
 markup. The category chooses one restrained allowlisted emoji. Discount percentages are calculated
-locally from verified prices. Captions stay within 1,024 characters by dropping highlights first,
-then seller and availability; product name, effective price, coupon, and offer button are preserved.
+locally from verified prices. Extraction groups up to three distinct offers, keeps alternative
+coupon codes attached to the correct offer, and refers only to URL candidates captured
+deterministically from the source. Sieve can therefore render several grounded coupons and up to
+three offer buttons without allowing Gemini to invent or rewrite a URL. Captions stay within 1,024
+characters by dropping highlights first, then seller and availability; product names, effective
+prices, coupons, and offer buttons are preserved.
 
 For example, this untrusted source promotion:
 

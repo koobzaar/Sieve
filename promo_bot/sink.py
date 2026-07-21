@@ -133,11 +133,16 @@ class TelegramBotSink:
 
     @staticmethod
     def _button(card: PreparedTelegramCard) -> dict[str, Any] | None:
-        if not card.button_text or not card.button_url:
+        buttons = [
+            {"text": button.text, "url": button.url}
+            for button in card.buttons[:3]
+            if button.text and button.url
+        ]
+        if not buttons and card.button_text and card.button_url:
+            buttons = [{"text": card.button_text, "url": card.button_url}]
+        if not buttons:
             return None
-        return {
-            "inline_keyboard": [[{"text": card.button_text, "url": card.button_url}]]
-        }
+        return {"inline_keyboard": [[button] for button in buttons]}
 
     async def _card_request(
         self,

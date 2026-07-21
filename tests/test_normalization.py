@@ -24,6 +24,7 @@ def test_prices_parse_brazilian_and_decimal_formats() -> None:
     assert parse_price("299.90") == Decimal("299.90")
     assert parse_price(None) is None
     assert parse_stated_price("SSD por R$ 299,90 com 55% de desconto") == Decimal("299.90")
+    assert parse_stated_price("De R$ 599 por R$ 339 em 7x") == Decimal("339")
     assert parse_stated_price("SSD com 55% de desconto") is None
 
 
@@ -63,3 +64,21 @@ def test_content_hash_ignores_tracking_links() -> None:
     first = Promotion(id="1", source="a", title="SSD", url="https://x/p?utm_source=a")
     second = Promotion(id="2", source="b", title="ssd", url="https://x/p")
     assert promotion_hash(first) == promotion_hash(second)
+
+
+def test_content_hash_includes_every_trusted_link_candidate() -> None:
+    first = Promotion(
+        id="1",
+        source="a",
+        title="SSD",
+        url="https://x/p",
+        urls=("https://x/p", "https://y/p"),
+    )
+    second = Promotion(
+        id="2",
+        source="a",
+        title="SSD",
+        url="https://x/p",
+        urls=("https://x/p", "https://z/p"),
+    )
+    assert promotion_hash(first) != promotion_hash(second)

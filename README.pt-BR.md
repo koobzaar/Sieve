@@ -119,7 +119,10 @@ comprovadas e candidatos acima do limiar superior do BM25, aprovados por todos o
 auditorias e retries pendentes são descartados sem chamar Gemini.
 
 Depois da aceitação, chamadas stateless separadas fazem extração, verificação independente contra
-envenenamento, localização por `ui_language` e reescrita do motivo por usuário. A mídia nunca é
+envenenamento, localização por `ui_language` e reescrita do motivo por usuário. A extração agrupa
+até três ofertas distintas, preserva cupons alternativos por oferta e só pode selecionar IDs de
+URLs capturadas deterministicamente da mensagem; Gemini nunca cria ou reescreve links. O cartão
+pode exibir vários cupons verificados e até três botões de oferta. A mídia nunca é
 enviada ao modelo: fotos do Telegram e imagens do Pelando são validadas, limitadas a 10 MB,
 armazenadas em `/state/media` e removidas quando todas as entregas terminam.
 

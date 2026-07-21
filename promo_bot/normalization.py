@@ -159,7 +159,13 @@ def parse_price(value: object) -> Decimal | None:
 
 def parse_stated_price(text: str) -> Decimal | None:
     """Extract a price only when the surrounding free text explicitly states one."""
-    match = STATED_PRICE_RE.search(text or "")
+    reduced = text or ""
+    price_pair = re.search(r"\bde\b[^\n]{0,80}?\bpor\b", reduced, re.IGNORECASE)
+    if price_pair is not None:
+        current = parse_price(reduced[price_pair.end() :].split("\n", 1)[0][:80])
+        if current is not None:
+            return current
+    match = STATED_PRICE_RE.search(reduced)
     return parse_price(match.group()) if match else None
 
 
@@ -183,11 +189,12 @@ def promotion_text(promotion: Promotion) -> str:
 
 
 def promotion_hash(promotion: Promotion) -> str:
+    urls = promotion.urls or ((promotion.url,) if promotion.url else ())
     material = "\x1f".join(
         (
             promotion_text(promotion),
             str(promotion.price or ""),
-            canonicalize_url(promotion.url),
+            *(canonicalize_url(url) for url in urls),
         )
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()

@@ -51,6 +51,7 @@ class Promotion:
     text: str = ""
     price: Decimal | None = None
     url: str | None = None
+    urls: tuple[str, ...] = ()
     temperature: int | None = None
     timestamp: datetime = field(default_factory=utc_now)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -74,6 +75,9 @@ class Promotion:
         media = copy.get("media")
         if isinstance(media, dict):
             copy["media"] = MediaReference.from_dict(media)
+        urls = copy.get("urls")
+        if isinstance(urls, list):
+            copy["urls"] = tuple(str(url) for url in urls)
         return cls(**copy)
 
 
@@ -134,6 +138,15 @@ class TelegramEntity:
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramButton:
+    text: str
+    url: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedTelegramCard:
     text: str
     entities: tuple[TelegramEntity, ...]
@@ -143,3 +156,4 @@ class PreparedTelegramCard:
     media_mime_type: str | None = None
     followup_texts: tuple[str, ...] = ()
     fallback: bool = False
+    buttons: tuple[TelegramButton, ...] = ()
