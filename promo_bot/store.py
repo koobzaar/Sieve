@@ -152,6 +152,29 @@ CREATE TABLE IF NOT EXISTS delivery_metrics (
     name TEXT PRIMARY KEY,
     value INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS presentation_cache (
+    stage TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(stage, cache_key)
+);
+CREATE INDEX IF NOT EXISTS idx_presentation_cache_time
+    ON presentation_cache(created_at);
+CREATE TABLE IF NOT EXISTS media_assets (
+    asset_hash TEXT PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    ref_count INTEGER NOT NULL DEFAULT 0 CHECK(ref_count >= 0),
+    created_at REAL NOT NULL,
+    last_used_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS delivery_media (
+    delivery_id INTEGER PRIMARY KEY REFERENCES delivery_outbox(id) ON DELETE CASCADE,
+    asset_hash TEXT NOT NULL REFERENCES media_assets(asset_hash) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_media_asset ON delivery_media(asset_hash);
 CREATE TABLE IF NOT EXISTS corpus_docs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at REAL NOT NULL,
@@ -339,6 +362,7 @@ class SQLiteStateStore:
         corpus_limit: int = 10_000,
         retry_limit: int = 100,
         retry_ttl_seconds: int = 3_600,
+        media_dir: str | Path | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.path = Path(path)
@@ -348,6 +372,8 @@ class SQLiteStateStore:
         self.corpus_limit = corpus_limit
         self.retry_limit = retry_limit
         self.retry_ttl_seconds = retry_ttl_seconds
+        self.media_dir = Path(media_dir or (self.path.parent / "media")).resolve()
+        self.media_dir.mkdir(parents=True, exist_ok=True)
         self.clock = clock
         self._lock = threading.RLock()
         try:
@@ -1356,6 +1382,201 @@ class SQLiteStateStore:
                 ),
             )
 
+    def get_presentation_cache(
+        self, stage: str, cache_key: str
+    ) -> dict[str, object] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload_json FROM presentation_cache WHERE stage=? AND cache_key=?",
+                (stage, cache_key),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(str(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = None
+        if not isinstance(value, dict):
+            with self._lock:
+                self._connection.execute(
+                    "DELETE FROM presentation_cache WHERE stage=? AND cache_key=?",
+                    (stage, cache_key),
+                )
+            return None
+        return value
+
+    def put_presentation_cache(
+        self, stage: str, cache_key: str, payload: dict[str, object]
+    ) -> None:
+        if stage not in {"facts", "localization", "reason"}:
+            raise StoreError("unsupported presentation cache stage")
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            raise StoreError("presentation cache value is oversized")
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO presentation_cache(stage,cache_key,payload_json,created_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(stage,cache_key) DO NOTHING",
+                (stage, cache_key, encoded, self.clock()),
+            )
+
+    def delete_presentation_cache(self, stage: str, cache_key: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                "DELETE FROM presentation_cache WHERE stage=? AND cache_key=?",
+                (stage, cache_key),
+            )
+
+    def _safe_media_path(self, value: str | Path) -> Path:
+        path = Path(value).resolve()
+        if path.parent != self.media_dir:
+            raise StoreError("media asset path is outside configured media storage")
+        return path
+
+    def register_delivery_media(
+        self,
+        delivery_id: int,
+        asset_hash: str,
+        path: str,
+        mime_type: str,
+        size_bytes: int,
+    ) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", asset_hash):
+            raise StoreError("invalid media asset hash")
+        asset_path = self._safe_media_path(path)
+        if not asset_path.is_file() or size_bytes <= 0 or size_bytes > 10 * 1024 * 1024:
+            raise StoreError("invalid media asset")
+        now = self.clock()
+        with self._lock:
+            connection = self._begin()
+            try:
+                delivery = connection.execute(
+                    "SELECT source,native_id FROM delivery_outbox "
+                    "WHERE id=? AND status='pending'",
+                    (int(delivery_id),),
+                ).fetchone()
+                if delivery is None:
+                    connection.execute("ROLLBACK")
+                    return
+                connection.execute(
+                    "INSERT INTO media_assets(asset_hash,path,mime_type,size_bytes,ref_count,created_at,last_used_at) "
+                    "VALUES(?,?,?,?,0,?,?) ON CONFLICT(asset_hash) DO UPDATE SET "
+                    "path=excluded.path,mime_type=excluded.mime_type,size_bytes=excluded.size_bytes,last_used_at=excluded.last_used_at",
+                    (asset_hash, str(asset_path), mime_type, int(size_bytes), now, now),
+                )
+                rows = connection.execute(
+                    "SELECT id FROM delivery_outbox WHERE source=? AND native_id=? AND status='pending'",
+                    (str(delivery["source"]), str(delivery["native_id"])),
+                ).fetchall()
+                added = 0
+                for row in rows:
+                    cursor = connection.execute(
+                        "INSERT OR IGNORE INTO delivery_media(delivery_id,asset_hash) VALUES(?,?)",
+                        (int(row["id"]), asset_hash),
+                    )
+                    added += cursor.rowcount
+                if added:
+                    connection.execute(
+                        "UPDATE media_assets SET ref_count=ref_count+?,last_used_at=? WHERE asset_hash=?",
+                        (added, now, asset_hash),
+                    )
+                connection.execute("COMMIT")
+            except sqlite3.Error as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(f"cannot register delivery media: {exc}") from exc
+
+    def media_for_delivery(self, delivery_id: int) -> dict[str, object] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT a.asset_hash,a.path,a.mime_type,a.size_bytes "
+                "FROM delivery_media d JOIN media_assets a ON a.asset_hash=d.asset_hash "
+                "WHERE d.delivery_id=?",
+                (int(delivery_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "asset_hash": str(row["asset_hash"]),
+            "path": str(row["path"]),
+            "mime_type": str(row["mime_type"]),
+            "size_bytes": int(row["size_bytes"]),
+        }
+
+    def _release_delivery_media_locked(
+        self, connection: sqlite3.Connection, delivery_id: int
+    ) -> Path | None:
+        row = connection.execute(
+            "SELECT d.asset_hash,a.path,a.ref_count FROM delivery_media d "
+            "JOIN media_assets a ON a.asset_hash=d.asset_hash WHERE d.delivery_id=?",
+            (int(delivery_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        connection.execute("DELETE FROM delivery_media WHERE delivery_id=?", (int(delivery_id),))
+        if int(row["ref_count"]) <= 1:
+            connection.execute("DELETE FROM media_assets WHERE asset_hash=?", (str(row["asset_hash"]),))
+            return self._safe_media_path(str(row["path"]))
+        connection.execute(
+            "UPDATE media_assets SET ref_count=ref_count-1,last_used_at=? WHERE asset_hash=?",
+            (self.clock(), str(row["asset_hash"])),
+        )
+        return None
+
+    @staticmethod
+    def _unlink_media(path: Path | None) -> None:
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def sweep_media_orphans(self) -> int:
+        removed = 0
+        keep: set[Path] = set()
+        with self._lock:
+            connection = self._begin()
+            try:
+                for pending in connection.execute(
+                    "SELECT promotion_json FROM delivery_outbox WHERE status='pending'"
+                ):
+                    try:
+                        promotion = json.loads(str(pending["promotion_json"]))
+                        media = promotion.get("media") if isinstance(promotion, dict) else None
+                        if isinstance(media, dict) and media.get("kind") == "local" and media.get("path"):
+                            keep.add(self._safe_media_path(str(media["path"])))
+                    except (TypeError, ValueError, json.JSONDecodeError, StoreError):
+                        continue
+                rows = connection.execute(
+                    "SELECT a.asset_hash,a.path,COUNT(d.delivery_id) AS refs "
+                    "FROM media_assets a LEFT JOIN delivery_media d ON d.asset_hash=a.asset_hash "
+                    "GROUP BY a.asset_hash,a.path"
+                ).fetchall()
+                for row in rows:
+                    path = self._safe_media_path(str(row["path"]))
+                    refs = int(row["refs"])
+                    if refs <= 0 or not path.is_file():
+                        connection.execute(
+                            "DELETE FROM media_assets WHERE asset_hash=?", (str(row["asset_hash"]),)
+                        )
+                        if path.is_file():
+                            path.unlink(missing_ok=True)
+                            removed += 1
+                    else:
+                        keep.add(path)
+                        connection.execute(
+                            "UPDATE media_assets SET ref_count=? WHERE asset_hash=?",
+                            (refs, str(row["asset_hash"])),
+                        )
+                connection.execute("COMMIT")
+            except (sqlite3.Error, OSError) as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(f"cannot sweep media assets: {exc}") from exc
+        for path in self.media_dir.iterdir():
+            if path.is_file() and path not in keep:
+                path.unlink(missing_ok=True)
+                removed += 1
+        return removed
+
     def claim_delivery(
         self, promotion: Promotion, user_id: str | None = None
     ) -> bool:
@@ -1458,6 +1679,7 @@ class SQLiteStateStore:
         ]
 
     def complete_delivery(self, job_id: int) -> bool:
+        release_path: Path | None = None
         with self._lock:
             connection = self._begin()
             try:
@@ -1479,12 +1701,14 @@ class SQLiteStateStore:
                         self.clock(),
                     ),
                 )
+                release_path = self._release_delivery_media_locked(connection, int(job_id))
                 connection.execute("DELETE FROM delivery_outbox WHERE id=?", (int(job_id),))
                 connection.execute("COMMIT")
-                return True
             except sqlite3.Error as exc:
                 connection.execute("ROLLBACK")
                 raise StoreError(f"cannot complete delivery: {exc}") from exc
+        self._unlink_media(release_path)
+        return True
 
     def reschedule_delivery(
         self,
@@ -1535,14 +1759,24 @@ class SQLiteStateStore:
     def fail_delivery(
         self, job_id: int, error: str, *, http_status: int | None = None
     ) -> bool:
+        release_path: Path | None = None
         with self._lock:
-            cursor = self._connection.execute(
-                "UPDATE delivery_outbox SET status='failed',attempts=attempts+1,"
-                "last_attempt_at=?,last_error=?,http_status=? "
-                "WHERE id=? AND status='pending'",
-                (self.clock(), error[:500], http_status, int(job_id)),
-            )
-            return cursor.rowcount == 1
+            connection = self._begin()
+            try:
+                cursor = connection.execute(
+                    "UPDATE delivery_outbox SET status='failed',attempts=attempts+1,"
+                    "last_attempt_at=?,last_error=?,http_status=? "
+                    "WHERE id=? AND status='pending'",
+                    (self.clock(), error[:500], http_status, int(job_id)),
+                )
+                if cursor.rowcount:
+                    release_path = self._release_delivery_media_locked(connection, int(job_id))
+                connection.execute("COMMIT")
+            except sqlite3.Error as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(f"cannot fail delivery: {exc}") from exc
+        self._unlink_media(release_path)
+        return cursor.rowcount == 1
 
     def next_delivery_attempt_at(self) -> float | None:
         with self._lock:
@@ -1750,6 +1984,13 @@ class SQLiteStateStore:
                         (cutoff,),
                     )
                     removed[table] = max(0, cursor.rowcount)
+                cursor = connection.execute(
+                    "DELETE FROM presentation_cache WHERE rowid IN "
+                    "(SELECT rowid FROM presentation_cache WHERE created_at<? "
+                    "ORDER BY created_at LIMIT 500)",
+                    (cutoff,),
+                )
+                removed["presentation_cache"] = max(0, cursor.rowcount)
                 for table, column in (
                     ("seen_ids", "seen_at"),
                     ("seen_content", "seen_at"),
@@ -1765,6 +2006,17 @@ class SQLiteStateStore:
                             (excess,),
                         )
                         removed[table] += max(0, cursor.rowcount)
+                cache_count = int(
+                    connection.execute("SELECT COUNT(*) FROM presentation_cache").fetchone()[0]
+                )
+                cache_excess = min(500, max(0, cache_count - self.retention_cap))
+                if cache_excess:
+                    cursor = connection.execute(
+                        "DELETE FROM presentation_cache WHERE rowid IN "
+                        "(SELECT rowid FROM presentation_cache ORDER BY created_at LIMIT ?)",
+                        (cache_excess,),
+                    )
+                    removed["presentation_cache"] += max(0, cursor.rowcount)
                 connection.execute("COMMIT")
             except sqlite3.Error as exc:
                 connection.execute("ROLLBACK")

@@ -14,7 +14,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from ..models import Promotion, utc_now
+from ..models import MediaReference, Promotion, utc_now
 from ..normalization import canonicalize_url, parse_price
 from ..protocols import PromotionEmitter
 
@@ -190,6 +190,18 @@ def _normalized_deal_url(value: str) -> str:
     return canonicalize_url(urljoin(_PELANDO_ORIGIN, value.strip()))
 
 
+def _image_url(product: dict[str, Any]) -> str | None:
+    value: Any = product.get("image")
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if isinstance(value, dict):
+        value = value.get("contentUrl") or value.get("url") or value.get("@id")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = urljoin(_PELANDO_ORIGIN, value.strip())
+    return candidate if candidate.startswith(("https://", "http://")) else None
+
+
 def _consolidate_rendered_cards(
     cards: list[dict[str, str]],
 ) -> tuple[dict[str, dict[str, str]], set[str]]:
@@ -274,6 +286,11 @@ def _parse_rendered_collection(
                 temperature=int(card["temperature"]),
                 timestamp=utc_now(),
                 metadata={"position": index + 1, "currency": "BRL"},
+                media=(
+                    MediaReference(kind="pelando", source=source_name, url=_image_url(part))
+                    if _image_url(part)
+                    else None
+                ),
             )
         )
     return _finish_item_parse(
@@ -390,6 +407,11 @@ def parse_feed_schema(html: str, *, source_name: str = "pelando") -> list[Promot
                 temperature=temperature,
                 timestamp=timestamp,
                 metadata={"position": raw_entry.get("position"), "currency": offers.get("priceCurrency")},
+                media=(
+                    MediaReference(kind="pelando", source=source_name, url=_image_url(product))
+                    if _image_url(product)
+                    else None
+                ),
             )
         )
     return _finish_item_parse(

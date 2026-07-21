@@ -19,22 +19,28 @@ class TelegramDeliveryWorker:
         store: Any,
         sink: Any,
         *,
+        presenter: Any | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.store = store
         self.sink = sink
+        self.presenter = presenter
         self.clock = clock
 
     async def drain_once(self, limit: int = 20) -> int:
         completed = 0
         for job in self.store.due_deliveries(limit=limit):
             try:
-                await self.sink.send_to(
-                    job.chat_id,
-                    job.promotion,
-                    job.reason,
-                    language=job.language,
-                )
+                if self.presenter is not None:
+                    card = await self.presenter.prepare(job)
+                    await self.sink.send_card(job.chat_id, card)
+                else:
+                    await self.sink.send_to(
+                        job.chat_id,
+                        job.promotion,
+                        job.reason,
+                        language=job.language,
+                    )
             except DeliveryError as exc:
                 if exc.retryable:
                     scheduled = self.store.reschedule_delivery(

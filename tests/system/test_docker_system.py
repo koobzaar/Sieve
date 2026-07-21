@@ -199,7 +199,9 @@ def test_packaged_service_end_to_end_and_restart_persistence() -> None:
 
         inject(base_url, 10, "/start")
         wait_for(
-            lambda: sent_message_with(base_url, "Welcome to Sieve"),
+            lambda: sent_message_with(
+                base_url, "Promotions filtered around what matters to you"
+            ),
             "the rendered /start reply",
         )
 

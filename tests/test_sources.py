@@ -446,3 +446,31 @@ def test_synthetic_telethon_text_and_media_caption_events_need_no_download() -> 
     assert str(promotion.price) == "299"
     assert promotion.url == "https://shop.test/p?x=1"
     assert promotion.metadata["chat_id"] == -100123
+
+
+def test_telegram_photo_is_preserved_as_a_deferred_media_reference() -> None:
+    event = SimpleNamespace(
+        chat_id=-100123,
+        message=SimpleNamespace(
+            id=78,
+            raw_text="Nike shoe",
+            date=datetime(2026, 7, 18, tzinfo=timezone.utc),
+            photo=object(),
+            document=None,
+        ),
+    )
+    promotion = promotion_from_telethon_event(event, source_name="telegram-principal")
+    assert promotion.media is not None
+    assert promotion.media.kind == "telegram"
+    assert promotion.media.source == "telegram-principal"
+    assert promotion.media.chat_id == -100123
+    assert promotion.media.message_id == 78
+
+
+def test_pelando_supported_image_schema_becomes_a_deferred_url_reference() -> None:
+    entry = _valid_legacy_entry(identifier="with-image")
+    entry["item"]["image"] = {"contentUrl": "https://img.test/deal.webp"}
+    promotion = parse_feed_schema(_feed_schema({"itemListElement": [entry]}))[0]
+    assert promotion.media is not None
+    assert promotion.media.kind == "pelando"
+    assert promotion.media.url == "https://img.test/deal.webp"

@@ -53,6 +53,7 @@ class PreferenceConfig:
 class AppConfig:
     queue_capacity: int
     state_path: str
+    state_media_path: str
     retention_days: int
     retention_cap: int
     corpus_limit: int
@@ -74,6 +75,7 @@ class AppConfig:
     sources: tuple[SourceConfig, ...]
     evaluator_factory: str
     evaluator: dict[str, Any]
+    gemini: dict[str, Any]
     sink_factory: str
     sink: dict[str, Any]
     preferences: PreferenceConfig = field(default_factory=PreferenceConfig)
@@ -168,6 +170,7 @@ def load_config(path: str | Path) -> AppConfig:
     state = _mapping(root.get("state", {}), "state")
     pipeline = _mapping(root.get("pipeline", {}), "pipeline")
     llm = _mapping(root.get("evaluator", {}), "evaluator")
+    gemini_raw = _mapping(root.get("gemini", {}), "gemini")
     sink = _mapping(root.get("sink", {}), "sink")
     preference_raw = _mapping(root.get("preferences", {}), "preferences")
     sources_raw = root.get("sources", [])
@@ -214,8 +217,82 @@ def load_config(path: str | Path) -> AppConfig:
     sources = tuple(source_items)
     aliases = _mapping(pipeline.get("aliases", {}), "pipeline.aliases")
     evaluator_settings = _mapping(llm.get("settings", {}), "evaluator.settings")
-    if not str(evaluator_settings.get("model", "")).strip():
+    if not str(gemini_raw.get("model") or evaluator_settings.get("model", "")).strip():
         raise ConfigurationError("evaluator.settings.model must be explicitly configured")
+    gemini_settings = {
+        "api_key_env": evaluator_settings.get("api_key_env", "GEMINI_API_KEY"),
+        "model": evaluator_settings.get("model"),
+        "provider_url": evaluator_settings.get(
+            "provider_url",
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        ),
+        "timeout_seconds": evaluator_settings.get("timeout_seconds", 20),
+        "retries": evaluator_settings.get("retries", 3),
+        "thinking_level": "minimal",
+        "stages": {},
+        **gemini_raw,
+    }
+    if not str(gemini_settings.get("api_key_env", "")).strip():
+        raise ConfigurationError("gemini.api_key_env must be nonempty")
+    if not str(gemini_settings.get("model", "")).strip():
+        raise ConfigurationError("gemini.model must be explicitly configured")
+    if not 1 <= int(gemini_settings.get("retries", 3)) <= 5:
+        raise ConfigurationError("gemini.retries must be between 1 and 5")
+    if not 1 <= float(gemini_settings.get("timeout_seconds", 20)) <= 120:
+        raise ConfigurationError("gemini.timeout_seconds must be between 1 and 120")
+    if str(gemini_settings.get("thinking_level", "minimal")) not in {
+        "minimal",
+        "low",
+    }:
+        raise ConfigurationError("gemini.thinking_level must be minimal or low")
+    stage_defaults = {
+        "extraction": (12_000, 900),
+        "verification": (20_000, 700),
+        "localization": (8_000, 500),
+        "reason": (1_000, 120),
+    }
+    raw_stages = _mapping(gemini_settings.get("stages", {}), "gemini.stages")
+    unknown_stages = set(raw_stages) - set(stage_defaults)
+    if unknown_stages:
+        raise ConfigurationError(f"unknown gemini stages: {sorted(unknown_stages)}")
+    stages: dict[str, dict[str, Any]] = {}
+    for stage_name, (default_input, default_output) in stage_defaults.items():
+        stage = _mapping(raw_stages.get(stage_name, {}), f"gemini.stages.{stage_name}")
+        configured = {
+            "schema_version": str(stage.get("schema_version", f"promotion-{stage_name}-v1")),
+            "prompt_version": str(stage.get("prompt_version", f"promotion-{stage_name}-prompt-v1")),
+            "max_input_chars": int(stage.get("max_input_chars", default_input)),
+            "max_output_tokens": int(stage.get("max_output_tokens", default_output)),
+        }
+        if any(
+            not configured[key]
+            or len(configured[key]) > 80
+            or not all(character.isalnum() or character in "._-" for character in configured[key])
+            for key in ("schema_version", "prompt_version")
+        ):
+            raise ConfigurationError(
+                f"gemini.stages.{stage_name} versions must be 1-80 safe characters"
+            )
+        if not 256 <= configured["max_input_chars"] <= 100_000:
+            raise ConfigurationError(
+                f"gemini.stages.{stage_name}.max_input_chars must be between 256 and 100000"
+            )
+        if not 32 <= configured["max_output_tokens"] <= 4096:
+            raise ConfigurationError(
+                f"gemini.stages.{stage_name}.max_output_tokens must be between 32 and 4096"
+            )
+        stages[stage_name] = configured
+    gemini_settings["stages"] = stages
+    effective_evaluator_settings = dict(evaluator_settings)
+    for shared_key in (
+        "api_key_env",
+        "model",
+        "provider_url",
+        "timeout_seconds",
+        "retries",
+        "thinking_level",
+    ):
+        effective_evaluator_settings[shared_key] = gemini_settings[shared_key]
     preference_parser = _mapping(
         preference_raw.get("parser", {}), "preferences.parser"
     )
@@ -300,6 +377,7 @@ def load_config(path: str | Path) -> AppConfig:
     return AppConfig(
         queue_capacity=int(runtime.get("queue_capacity", 256)),
         state_path=str(state.get("path", "/state/sieve.db")),
+        state_media_path=str(state.get("media_path", "/state/media")),
         retention_days=int(state.get("retention_days", 30)),
         retention_cap=int(state.get("retention_cap", 50_000)),
         corpus_limit=int(state.get("corpus_limit", 10_000)),
@@ -320,7 +398,8 @@ def load_config(path: str | Path) -> AppConfig:
         exceptional_temperature=int(pipeline.get("exceptional_temperature", 300)),
         sources=sources,
         evaluator_factory=str(llm.get("factory", "promo_bot.evaluator:create_gemini_evaluator")),
-        evaluator=evaluator_settings,
+        evaluator=effective_evaluator_settings,
+        gemini=gemini_settings,
         sink_factory=str(sink.get("factory", "promo_bot.sink:create_telegram_sink")),
         sink=_mapping(sink.get("settings", {}), "sink.settings"),
         preferences=preference_config,
