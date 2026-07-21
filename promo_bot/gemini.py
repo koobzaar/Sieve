@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import re
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -60,19 +61,26 @@ class GeminiStructuredClient:
         max_output_tokens: int,
         temperature: float = 0.1,
         thinking_level: str | None = "minimal",
+        system_instruction: str | None = None,
+        strict_json_schema: bool = False,
     ) -> dict[str, Any]:
         generation: dict[str, Any] = {
             "temperature": temperature,
             "maxOutputTokens": max_output_tokens,
             "responseMimeType": "application/json",
-            "responseSchema": dict(schema),
         }
+        generation[
+            "responseJsonSchema" if strict_json_schema else "responseSchema"
+        ] = dict(schema)
         if thinking_level:
             generation["thinkingConfig"] = {"thinkingLevel": thinking_level}
-        return {
+        body: dict[str, Any] = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": generation,
         }
+        if system_instruction is not None:
+            body["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        return body
 
     @staticmethod
     def parse_response(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -206,9 +214,11 @@ class GeminiStructuredClient:
         body: Mapping[str, Any],
         *,
         event_name: str = "gemini_structured_request",
+        schema_version: str | None = None,
     ) -> dict[str, Any]:
         last_error = "Gemini request failed"
         for attempt in range(self.retries):
+            started = time.monotonic()
             try:
                 response = await self.client.post(
                     self.url,
@@ -225,7 +235,29 @@ class GeminiStructuredClient:
                         attempt=attempt + 1,
                     )
                 else:
-                    return self.parse_response(response.json())
+                    response_payload = response.json()
+                    parsed = self.parse_response(response_payload)
+                    usage = (
+                        response_payload.get("usageMetadata", {})
+                        if isinstance(response_payload, Mapping)
+                        else {}
+                    )
+                    logger.info(
+                        "gemini_stage_succeeded",
+                        extra={
+                            "event": "gemini_stage_succeeded",
+                            "stage": event_name,
+                            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                            "attempt": attempt + 1,
+                            "model": self.model,
+                            "schema_version": schema_version,
+                            "prompt_tokens": usage.get("promptTokenCount"),
+                            "output_tokens": usage.get("candidatesTokenCount"),
+                            "thinking_tokens": usage.get("thoughtsTokenCount"),
+                            "total_tokens": usage.get("totalTokenCount"),
+                        },
+                    )
+                    return parsed
             except GeminiError as exc:
                 if not isinstance(exc, RetryableGeminiError):
                     raise
@@ -246,6 +278,9 @@ class GeminiStructuredClient:
         temperature: float = 0.1,
         thinking_level: str | None = "minimal",
         event_name: str = "gemini_structured_request",
+        system_instruction: str | None = None,
+        schema_version: str | None = None,
+        strict_json_schema: bool = False,
     ) -> dict[str, Any]:
         return await self.request_json(
             self.request_body(
@@ -254,8 +289,11 @@ class GeminiStructuredClient:
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
                 thinking_level=thinking_level,
+                system_instruction=system_instruction,
+                strict_json_schema=strict_json_schema,
             ),
             event_name=event_name,
+            schema_version=schema_version,
         )
 
     async def close(self) -> None:

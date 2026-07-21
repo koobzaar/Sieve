@@ -6,6 +6,7 @@ runtime:
 
 state:
   path: /state/sieve.db
+  media_path: /state/media
   retention_days: 30
   retention_cap: 50000
   corpus_limit: 10000
@@ -33,12 +34,36 @@ pipeline:
 evaluator:
   factory: promo_bot.evaluator:create_gemini_evaluator
   settings:
-    api_key_env: GEMINI_API_KEY
-    model: gemini-3.1-flash-lite
-    provider_url: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
-    timeout_seconds: 20
     max_output_tokens: 160
-    retries: 3
+
+gemini:
+  api_key_env: GEMINI_API_KEY
+  model: gemini-3.1-flash-lite
+  provider_url: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+  timeout_seconds: 20
+  retries: 3
+  thinking_level: minimal
+  stages:
+    extraction:
+      schema_version: promotion-extraction-v1
+      prompt_version: promotion-extraction-prompt-v1
+      max_input_chars: 12000
+      max_output_tokens: 900
+    verification:
+      schema_version: promotion-verification-v1
+      prompt_version: promotion-verification-prompt-v1
+      max_input_chars: 20000
+      max_output_tokens: 700
+    localization:
+      schema_version: promotion-localization-v1
+      prompt_version: promotion-localization-prompt-v1
+      max_input_chars: 8000
+      max_output_tokens: 500
+    reason:
+      schema_version: promotion-reason-v1
+      prompt_version: promotion-reason-prompt-v1
+      max_input_chars: 1000
+      max_output_tokens: 120
 
 preferences:
   enabled: false
@@ -62,6 +87,8 @@ sink:
     token_env: TELEGRAM_BOT_TOKEN
     api_url: https://api.telegram.org
     timeout_seconds: 15
+    media_timeout_seconds: 15
+    media_max_bytes: 10485760
 
 sources:
   - name: telegram-principal

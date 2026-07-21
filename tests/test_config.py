@@ -104,6 +104,10 @@ def test_bm25_routing_defaults_and_validation(tmp_path) -> None:
     assert config.bm25_below_threshold_audit_rate == 0.05
     assert config.preferences.max_users == 10
     assert config.preferences.admin_telegram_user_id_env == "TELEGRAM_ADMIN_USER_ID"
+    assert config.gemini["api_key_env"] == "GEMINI_API_KEY"
+    assert set(config.gemini["stages"]) == {
+        "extraction", "verification", "localization", "reason"
+    }
     assert not hasattr(config, "mode")
 
     data["pipeline"]["bm25_auto_forward_threshold"] = 2.0
@@ -176,5 +180,13 @@ def test_tracked_config_is_complete_safe_and_valid() -> None:
     assert telegram.settings["chat_ids"] == []
     assert raw["preferences"]["max_users"] == 10
     assert raw["preferences"]["admin_telegram_user_id_env"] == "TELEGRAM_ADMIN_USER_ID"
+    assert example.state_media_path == "/state/media"
+    assert raw["gemini"]["api_key_env"] == "GEMINI_API_KEY"
+    assert raw["gemini"]["thinking_level"] == "minimal"
+    assert all(
+        raw["gemini"]["stages"][stage]["schema_version"]
+        and raw["gemini"]["stages"][stage]["prompt_version"]
+        for stage in ("extraction", "verification", "localization", "reason")
+    )
     assert "mode" not in raw["runtime"]
     assert all("mode" not in source for source in raw["sources"])

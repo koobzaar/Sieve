@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import env_secret
-from ..models import Promotion, utc_now
+from ..models import MediaReference, Promotion, utc_now
 from ..normalization import parse_stated_price
 from ..protocols import PromotionEmitter
 from .pelando import HealthReporter
@@ -27,6 +27,24 @@ def promotion_from_telethon_event(event: Any, *, source_name: str = "telegram") 
     timestamp = getattr(message, "date", None) or utc_now()
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
+    document = getattr(message, "document", None)
+    document_mime = str(getattr(document, "mime_type", ""))
+    has_still_candidate = getattr(message, "photo", None) is not None or document_mime.casefold() in {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+    media = (
+        MediaReference(
+            kind="telegram",
+            source=source_name,
+            chat_id=int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id),
+            message_id=int(message_id),
+            mime_type="image/jpeg" if getattr(message, "photo", None) is not None else document_mime,
+        )
+        if has_still_candidate and str(message_id).isdigit()
+        else None
+    )
     return Promotion(
         id=f"{chat_id}:{message_id}",
         source=source_name,
@@ -36,6 +54,7 @@ def promotion_from_telethon_event(event: Any, *, source_name: str = "telegram") 
         url=urls[0].rstrip(".,);]") if urls else None,
         timestamp=timestamp,
         metadata={"chat_id": int(chat_id) if str(chat_id).lstrip("-").isdigit() else str(chat_id)},
+        media=media,
     )
 
 

@@ -510,12 +510,12 @@ class MultiUserPromotionPipeline:
         pipeline = self._pipelines.get(account.id)
         if pipeline is None:
             pipeline = self.pipeline_factory(account, provider)
-            pipeline.bind_user(
-                account.id,
-                account.telegram_chat_id,
-                language=account.ui_language,
-            )
             self._pipelines[account.id] = pipeline
+        pipeline.bind_user(
+            account.id,
+            account.telegram_chat_id,
+            language=account.ui_language,
+        )
         return pipeline
 
     async def process(self, promotion: Promotion) -> dict[str, PipelineResult]:

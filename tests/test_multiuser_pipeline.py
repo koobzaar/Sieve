@@ -108,6 +108,19 @@ async def test_each_active_user_is_evaluated_and_approved_delivery_is_per_uuid(
     state.close()
 
 
+async def test_each_delivery_captures_the_users_current_persisted_language(tmp_path) -> None:
+    state, admin, member, stores, _, multi = setup(tmp_path)
+    add_interest(stores[admin.id], admin.telegram_user_id, "ssd")
+    state.disable_user(admin.id, member.id)
+    await multi.process(Promotion(id="lang-1", source="telegram", title="SSD Alpha"))
+    assert state.due_deliveries()[0].language == "en"
+    stores[admin.id].set_ui_language(admin.telegram_user_id, "pt-BR")
+    await multi.process(Promotion(id="lang-2", source="telegram", title="SSD Beta"))
+    languages = {job.promotion.id: job.language for job in state.due_deliveries()}
+    assert languages == {"lang-1": "en", "lang-2": "pt-BR"}
+    state.close()
+
+
 async def test_one_user_evaluation_failure_does_not_prevent_other_users(tmp_path) -> None:
     state, admin, member, stores, _, multi = setup(tmp_path, broken_term="BROKEN")
     add_interest(stores[admin.id], admin.telegram_user_id, "BROKEN")
@@ -182,4 +195,3 @@ async def test_disabled_user_is_not_evaluated_or_delivered(tmp_path) -> None:
     assert len(evaluator.calls) == 1
     assert [job.user_id for job in state.due_deliveries()] == [admin.id]
     state.close()
-

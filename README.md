@@ -7,7 +7,7 @@
 
 # Sieve
 
-**A bounded, source-pluggable promotion tracker with natural-language preferences, BM25 filtering, and optional artificial intelligence.**
+**A bounded, source-pluggable promotion tracker with natural-language preferences, BM25 filtering, and poisoning-resistant Gemini presentation.**
 
 <p>
   <a href="#how-it-works">How it works</a> •
@@ -54,10 +54,11 @@ Treat “graphics card” and “GPU” as the same thing
 Stop showing me perfume deals
 ```
 
-The point is cost and noise control. Most promotions never reach the LLM: fixed spam checks and
+The point is cost and noise control. Most promotions never reach a Gemini presentation call: fixed spam checks and
 prioritized, declarative hard rules reject unwanted categories; deduplication kills reposts; a
 rolling Okapi BM25 score against the profile kills weak lexical matches. Only what's left is sent
-to Gemini, which returns a structured `forward` / `discard` decision.
+to the configured evaluator, which returns a structured `forward` / `discard` decision. Every
+accepted promotion is then interpreted and rendered through the isolated Gemini card pipeline.
 
 It's designed to sit on a Raspberry Pi 4B (2 GB) indefinitely: one process, a bounded queue, a
 256 MB container cap, a 220 MB in-app tripwire that restarts before the OOM killer does, and a
@@ -113,7 +114,20 @@ flowchart TD
     RQ --> LLM
 
     DEL --> OBOX[Persistent per-user outbox]
-    OBOX --> OUT[Private Telegram chats<br/><i>audible, localized delivery</i>]
+    OBOX --> EXT[Untrusted-source extraction<br/><i>once per promotion</i>]
+    EXT --> VER[Independent grounding +<br/>poisoning verification]
+    VER --> LOC[Localization<br/><i>once per selected language</i>]
+    VER --> RR[Match-reason rewrite<br/><i>once per distinct reason/language</i>]
+    OBOX --> MEDIA[Media resolver<br/><i>never sent to Gemini</i>]
+    LOC --> CARD[Plain text + UTF-16 entities]
+    RR --> CARD
+    MEDIA --> CARD
+    EXT -. unsafe / unavailable .-> SAFE[Original-content fallback]
+    VER -. unsafe / ungrounded .-> SAFE
+    LOC -. unavailable .-> SAFE
+    RR -. unavailable .-> SAFE
+    CARD --> OUT[sendPhoto or sendMessage<br/><i>audible, localized delivery</i>]
+    SAFE --> OUT
 ```
 
 ### Stage notes
@@ -125,11 +139,13 @@ flowchart TD
 | **Constraints**        | Reliably matched interest price violations and excluded attributes are discarded before any exceptional bypass. Missing required attributes remain undecided. |
 | **Exceptional bypass** | Normally skips BM25 and the LLM. If a promotion may match an interest but its required attributes cannot be proven, it skips BM25 and goes to Gemini instead. |
 | **BM25**               | Weighted Okapi BM25 (`k1=1.2`, `b=0.75`) with lower `2.0` and experimental upper `7.0` routing thresholds. Importance `0–100` maps to `0.5×–1.5×`. BM25 fails open to Gemini during cold start and alias rebuilds. |
-| **Gemini**             | Structured JSON decision, minimal thinking budget, ≤160 output tokens, no conversation history, 3 retries on transient failure.                                                                                                                                                                                                        |
-| **Delivery**           | Per-user persistent outbox with restart recovery, bounded retries, and visible permanent failures. Delivery is at least once, so an ambiguous timeout may rarely duplicate a notification rather than lose it. |
+| **Gemini evaluation**  | Optional structured decision before acceptance, minimal thinking, no conversation history, and bounded transient retries. |
+| **Gemini presentation** | Required after acceptance: separate stateless extraction, verification, per-language localization, and per-reason rewrite calls. Every call has its own static system instruction, strict schema, input/output bound, and independently versioned cache key. |
+| **Delivery**           | Per-user persistent outbox with restart recovery, still-image cards, bounded retries, visible permanent failures, and safe original-content fallback. Delivery is at least once, so an ambiguous timeout may rarely duplicate a notification rather than lose it. |
 
-Gemini promotion evaluation is optional. When `pipeline.gemini_evaluation_enabled` is `false`,
-natural-language preference messages still use Gemini, but promotion decisions are deterministic.
+Gemini promotion *evaluation* is optional; Gemini promotion *presentation* is mandatory for every
+accepted item. When `pipeline.gemini_evaluation_enabled` is `false`, natural-language preference
+messages can still use Gemini, but promotion decisions are deterministic.
 Only proven exceptional deals and candidates above the configured BM25 auto-forward threshold
 that pass every gate in `live` mode can be delivered. Intermediate or uncertain candidates, cold
 corpus items, alias-rebuild items, audits, and pending evaluation retries are discarded without a
@@ -144,12 +160,53 @@ Gemini request.
   hour TTL, corpus 10,000 docs, preference state 500 entries / 128 KB, incremental pruning.
 - **Live revisioned preferences.** YAML seeds revision zero once. SQLite is authoritative after
   that, every mutation is audited, and each promotion keeps one immutable snapshot for its full run.
-- **No media downloads.** Telegram ingestion reads text and media captions only.
+- **Source-agnostic still images.** Telegram photo/image-document identifiers and Pelando image
+  URLs are carried as serializable references, resolved only after acceptance, validated and stored
+  under `/state/media`, and deleted after every referencing delivery succeeds or permanently fails.
 - **Locked-down container.** Non-root user, read-only root filesystem, all capabilities dropped,
   `no-new-privileges`, 64 PIDs, 16 MB tmpfs, 10 MB × 3 log rotation.
 - **Observable.** JSON logs to stdout; Telegram alerts for transport and other source failures,
   database errors, LLM outages and memory pressure. Pelando schema drift stays visible in structured
   logs and the persisted health snapshot without sending Telegram alerts.
+
+### Poisoning-resistant card pipeline
+
+Gemini runs only after at least one user accepts a promotion. Presentation uses fresh
+`generateContent` requests with no chat history or accumulated promotions:
+
+1. **Extraction, once per accepted promotion.** Only bounded, control-character-stripped source
+   title, description, stated price, and offer URL are marked as untrusted data. No user profile,
+   user/chat identifier, token, secret, Telegram markup, filesystem path, or prior promotion is
+   included. Every non-null fact carries exact source evidence.
+2. **Verification, once per accepted promotion.** A new request receives only that untrusted source
+   object and candidate extraction. It decides support and evidence validity field by field, detects
+   conflicting prices, and produces an independent injection/unsafe-instruction verdict.
+3. **Localization, once per selected language.** A new request receives verified canonical values
+   without source text or evidence. `ui_language` is normalized to `en` or `pt-BR` by the
+   application; source content cannot override it. Users sharing a language reuse the same validated
+   cache entry, while English and Brazilian Portuguese always use separate entries.
+4. **Reason rewrite, once per distinct reason and language.** A final bounded request receives only
+   the validated internal reason, selected language, and short verified product name. It returns one
+   plain sentence without internal terminology.
+
+All four stages use separate strict schemas, static `systemInstruction` values, temperature zero,
+minimal thinking, per-stage input/output limits, and bounded retries. Unknown JSON keys, unsupported
+evidence, generated URLs/markup/commands/entities, unsafe control characters, and invalid enums are
+rejected in application code. Only validated typed objects are cached; keys include exact content or
+reason hashes, model, language where applicable, and independently configured prompt/schema
+versions. Failures and poisoning verdicts are never cached.
+
+Operational logs contain stage, latency, model, schema version, safe failure category, poisoning
+verdict, and provider token counts (`prompt`, visible output, thinking, and total) when returned.
+They never contain raw source text, prompts, responses, profiles, API keys, bot tokens, or user/chat
+identifiers.
+
+If extraction, verification, localization, reason rewriting, or media resolution fails, the accepted
+promotion is not discarded. Sieve sends the validated original still image when available, plain
+original source text with no parsing mode, and the source-provided HTTP(S) offer button. An oversized
+image caption becomes a minimal caption followed by one or more plain text messages. A definite
+Telegram media rejection is retried immediately as text; ambiguous transport and rate-limit failures
+retain the normal durable retry behavior.
 
 ### The math
 
@@ -234,7 +291,7 @@ avoids treating missing information as evidence either way.
   the groups
 - A separate Telegram **bot** that already has an open private conversation with your account —
   this is what delivers
-- A Gemini API key if you enable natural-language preference messages or promotion evaluation
+- A Gemini API key — mandatory because every accepted promotion uses isolated Gemini presentation
 
 ### 1. Configure secrets
 
@@ -244,7 +301,8 @@ cd Sieve
 cp .env.example .env
 ```
 
-Fill in `.env` with the credentials required by the integrations you plan to enable:
+Fill in `.env`. `GEMINI_API_KEY` is always required at runtime; the Telegram credentials are
+required by the corresponding enabled source/bot integrations:
 
 ```dotenv
 TELEGRAM_API_ID=
@@ -362,9 +420,10 @@ owner/chat keys, or sink chat destinations cause a clear validation error and mu
 | Block       | Notable keys                                                                                                                |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `runtime`   | `queue_capacity`, `memory_limit_mb`, `failure_alert_threshold`, `llm_outage_alert_seconds`                            |
-| `state`     | `path`, `retention_days`, `retention_cap`, `corpus_limit`, `retry_limit`, `retry_ttl_seconds`                               |
+| `state`     | `path`, `media_path` (`/state/media`), retention/corpus limits, and retry bounds                                             |
 | `pipeline`  | `gemini_evaluation_enabled`, BM25 thresholds/mode/audit parameters, profile, aliases and rules                         |
-| `evaluator` | `factory`, model name, provider URL, timeout, `max_output_tokens`, `retries`                                                |
+| `evaluator` | Decision-evaluator factory and its decision-specific `max_output_tokens` override                                           |
+| `gemini`    | Shared required key env, model, provider URL, timeout, retries, thinking level, plus per-stage prompt/schema versions and input/output token bounds |
 | `preferences` | enablement, admin Telegram user-ID env var, `max_users`, polling/queue limits, confirmation TTL, state caps, parser overrides |
 | `sink`      | `factory`, token env var, API URL, timeout                                                                                  |
 | `sources`   | list of `{name, factory, enabled, settings}`                                                                                |
@@ -397,7 +456,8 @@ pipeline:
 
 Disabling evaluation changes the fallback from Gemini to discard. BM25 has no universal score
 scale, so collect replay and shadow evidence and tune `bm25_auto_forward_threshold` manually before
-using `live`. `GEMINI_API_KEY` is still required while natural-language preferences are enabled.
+using `live`. Disabling decision evaluation does not disable accepted-promotion presentation, so
+`GEMINI_API_KEY` remains mandatory.
 
 ### Live preference commands
 
@@ -459,9 +519,64 @@ an edit/fallback loop. The processed-update offset makes update handling restart
 Gemini-backed mutations are limited persistently to five per minute and twenty per hour; previews
 consume the limit, while queries and confirmations do not.
 
-Promotion notifications are audible compact cards with an escaped title and price, concise
-source/temperature metadata, a short blockquoted match reason, disabled link previews, and a
-localized URL button. Missing values are omitted instead of rendered as placeholders.
+Promotion notifications default to a still-image `sendPhoto` card and use `sendMessage` when no
+image is available. Sieve assembles plain caption text in application code and supplies explicit
+UTF-16 `bold`, `strikethrough`, `code`, and `blockquote` entities—Gemini never writes Telegram
+markup. The category chooses one restrained allowlisted emoji. Discount percentages are calculated
+locally from verified prices. Captions stay within 1,024 characters by dropping highlights first,
+then seller and availability; product name, effective price, coupon, and offer button are preserved.
+
+For example, this untrusted source promotion:
+
+```text
+Tênis Nike Court Lite 4 (38 a 44)
+De R$ 589 por R$ 308
+Use o Cupom: PRAMODA
+Loja Oficial Nike no ML
+menor preço histórico
+```
+
+becomes this image card for a user whose selected language is Brazilian Portuguese:
+
+```text
+👟 Tênis Nike Court Lite 4
+Tamanhos 38 a 44
+
+R$ 308,00   R$ 589,00
+48% OFF · Menor preço histórico
+
+🎟️ Cupom
+PRAMODA
+Aplique no carrinho
+
+🏪 Loja Oficial Nike no ML
+
+▎Apareceu porque está no menor preço histórico.
+[Ver oferta]
+```
+
+The same accepted promotion for an English user reuses extraction and verification, but receives
+separate localized copy and reason:
+
+```text
+👟 Nike Court Lite 4 Shoes
+Sizes 38 to 44
+
+R$ 308.00   R$ 589.00
+48% OFF · Lowest historical price
+
+🎟️ Coupon
+PRAMODA
+Apply at checkout
+
+🏪 Loja Oficial Nike no ML
+
+▎It appeared because it is at its lowest historical price.
+[View offer]
+```
+
+Cards never expose source names, raw/internal match reasons, stages, poisoning verdicts, or Gemini
+metadata. Brands, model identifiers, coupon codes, seller names, and source offer URLs are preserved.
 
 ---
 
@@ -516,7 +631,8 @@ On Windows PowerShell, use `.venv\Scripts\pip` and `.venv\Scripts\python`.
 The default suite never touches live services; the `contract` and Docker `system` gates are
 skipped unless explicitly enabled. Tests run against saved HTML/JSON-LD fixtures, synthetic events,
 mocked HTTP transports, deterministic clocks and temporary SQLite files. The suite covers BM25,
-normalization, filters and exceptional detection, revisioned preference CRUD, Gemini parsing,
+normalization, filters and exceptional detection, revisioned preference CRUD, Gemini parsing and
+poisoning controls, bilingual card/cache isolation, UTF-16 entities, media validation and cleanup,
 Telegram authorization and outbox recovery, restart-safe alias generations, pipeline integration,
 replay, and `soak`-marked promotion, 500-entry, 10,000-document rebuild and command-flood runs.
 
@@ -576,6 +692,7 @@ promo_bot/
 ├── preference_bot.py # authorized Telegram Bot API long polling and commands
 ├── telegram_smoke.py # dedicated-session, non-mutating live Telegram gate
 ├── gemini.py         # shared structured-output REST client
+├── presentation.py   # isolated extraction/verification/localization/reason + media/cards
 ├── protocols.py      # Source / Stage / Evaluator / Sink / Store interfaces
 ├── config.py         # YAML loading, factory resolution, env secrets
 ├── filters.py        # fixed spam checks and prioritized token-aware hard rules
@@ -584,7 +701,7 @@ promo_bot/
 ├── normalization.py  # tokenization, alias expansion, content hashing
 ├── store.py          # SQLite WAL: corpus generations, dedup, retries, audit, health
 ├── evaluator.py      # Gemini structured-decision client
-├── sink.py           # Telegram bot delivery + alerts
+├── sink.py           # Telegram Bot API sendPhoto/sendMessage delivery + alerts
 ├── replay.py         # offline calibration metrics
 ├── logging.py        # JSON stdout logging
 └── sources/

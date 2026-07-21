@@ -13,6 +13,7 @@ import httpx
 from .config import AppConfig, env_secret, load_factory
 from .delivery import TelegramDeliveryWorker
 from .evaluator import RetryableEvaluationError
+from .gemini import GeminiStructuredClient
 from .models import Decision, Promotion
 from .pipeline import MultiUserPromotionPipeline, PromotionPipeline
 from .preference_bot import (
@@ -22,6 +23,7 @@ from .preference_bot import (
 )
 from .preference_interpreter import create_gemini_preference_interpreter
 from .preference_store import SQLitePreferenceStore
+from .presentation import MediaResolver, PromotionPresenter
 from .preferences import AtomicPreferenceProvider, PreferenceSnapshot
 from .sources.pelando import PelandoSchemaError
 from .store import SQLiteStateStore, StoreError
@@ -60,7 +62,9 @@ class Service:
             corpus_limit=config.corpus_limit,
             retry_limit=config.retry_limit,
             retry_ttl_seconds=config.retry_ttl_seconds,
+            media_dir=config.state_media_path,
         )
+        self.store.sweep_media_orphans()
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(20, connect=10),
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
@@ -104,6 +108,26 @@ class Service:
         sink_factory = load_factory(config.sink_factory)
         self.evaluator = evaluator_factory(config.evaluator, profile=config.profile, client=self.http)
         self.sink = sink_factory(config.sink, client=self.http)
+        gemini_key = env_secret(str(config.gemini.get("api_key_env", "GEMINI_API_KEY")))
+        self.presentation_gemini = GeminiStructuredClient(
+            api_key=gemini_key,
+            model=str(config.gemini["model"]),
+            provider_url=str(config.gemini["provider_url"]),
+            timeout_seconds=float(config.gemini["timeout_seconds"]),
+            retries=int(config.gemini["retries"]),
+            client=self.http,
+        )
+        self.media_resolver = MediaResolver(
+            config.state_media_path,
+            timeout_seconds=float(config.sink.get("media_timeout_seconds", 15)),
+            max_bytes=int(config.sink.get("media_max_bytes", 10 * 1024 * 1024)),
+        )
+        self.presenter = PromotionPresenter(
+            store=self.store,
+            gemini=self.presentation_gemini,
+            media_resolver=self.media_resolver,
+            settings=config.gemini,
+        )
         alert_destination = getattr(self.sink, "set_alert_destination", None)
         if callable(alert_destination):
             alert_destination(administrator.telegram_chat_id)
@@ -156,7 +180,9 @@ class Service:
             pipeline_factory=pipeline_for,
             preference_store_factory=preference_store_for,
         )
-        self.delivery_worker = TelegramDeliveryWorker(self.store, self.sink)
+        self.delivery_worker = TelegramDeliveryWorker(
+            self.store, self.sink, presenter=self.presenter
+        )
         self.preference_interpreter = None
         self.preference_bot = None
         self.preference_owner_id: int | None = administrator.telegram_user_id
@@ -209,6 +235,9 @@ class Service:
             for item in config.sources
             if item.enabled
         ]
+        self.media_resolver.set_telegram_sources(
+            {source.name: source for source in self.sources if hasattr(source, "name")}
+        )
 
     def _preference_snapshot_changed(
         self,
@@ -363,6 +392,7 @@ class Service:
         while not self.stop.is_set():
             try:
                 removed = self.store.prune()
+                removed["media_orphans"] = self.store.sweep_media_orphans()
                 for user_id, preference_store in self.preference_stores.items():
                     removed.update(
                         {
@@ -482,6 +512,8 @@ class Service:
                 await self.evaluator.close()
             with suppress(Exception):
                 await self.sink.close()
+            with suppress(Exception):
+                await self.presenter.close()
             if self.preference_interpreter is not None:
                 with suppress(Exception):
                     await self.preference_interpreter.close()
