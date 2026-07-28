@@ -72,7 +72,7 @@ class Service:
             timeout=httpx.Timeout(20, connect=10),
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
             follow_redirects=True,
-            headers={"User-Agent": "sieve/1.1.0-beta.1"},
+            headers={"User-Agent": "sieve/1.1.0-beta.2"},
         )
         preference_settings = config.preferences
         if preference_settings.enabled:

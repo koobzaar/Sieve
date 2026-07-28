@@ -776,7 +776,7 @@ class PelandoSource:
         url: str = "https://www.pelando.com.br/recentes",
         interval_seconds: float = 120,
         timeout_seconds: float = 20,
-        user_agent: str = "sieve/1.1.0-beta.1 (+private-use)",
+        user_agent: str = "sieve/1.1.0-beta.2 (+private-use)",
         health_reporter: HealthReporter | None = None,
         detail_concurrency: int = 4,
         detail_cache_size: int = 500,
@@ -1010,7 +1010,7 @@ def create_pelando_source(
         interval_seconds=float(settings.get("interval_seconds", 120)),
         timeout_seconds=float(settings.get("timeout_seconds", 20)),
         user_agent=str(
-            settings.get("user_agent", "sieve/1.1.0-beta.1 (+private-use)")
+            settings.get("user_agent", "sieve/1.1.0-beta.2 (+private-use)")
         ),
         health_reporter=health_reporter,
         detail_concurrency=int(settings.get("detail_concurrency", 4)),

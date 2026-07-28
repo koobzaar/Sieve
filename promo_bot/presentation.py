@@ -675,7 +675,7 @@ class MediaResolver:
             timeout=httpx.Timeout(timeout_seconds, connect=min(10, timeout_seconds)),
             follow_redirects=True,
             max_redirects=3,
-            headers={"User-Agent": "sieve/1.1.0-beta.1"},
+            headers={"User-Agent": "sieve/1.1.0-beta.2"},
         )
 
     def set_telegram_sources(self, sources: dict[str, Any]) -> None:

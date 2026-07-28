@@ -110,7 +110,7 @@ class TelegramBotAPI:
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds, connect=min(10, timeout_seconds)),
             limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
-            headers={"User-Agent": "sieve/1.1.0-beta.1"},
+            headers={"User-Agent": "sieve/1.1.0-beta.2"},
         )
 
     async def _call(self, method: str, payload: Mapping[str, Any]) -> Any:

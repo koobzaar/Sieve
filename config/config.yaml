@@ -113,4 +113,4 @@ sources:
       url: https://www.pelando.com.br/recentes
       interval_seconds: 120
       timeout_seconds: 20
-      user_agent: sieve/1.1.0-beta.1 (+private-use)
+      user_agent: sieve/1.1.0-beta.2 (+private-use)

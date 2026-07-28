@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sieve-promotion-bot"
-version = "1.1.0b1"
+version = "1.1.0b2"
 description = "Sieve: bounded asynchronous promotion filter for Telegram and Pelando"
 readme = "README.md"
 requires-python = ">=3.12"

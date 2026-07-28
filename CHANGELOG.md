@@ -4,6 +4,8 @@ All notable changes to Sieve are documented here.
 
 ## Unreleased
 
+## 1.1.0-beta.2 - 2026-07-28
+
 ### Added
 
 - A persisted Gemini request ledger and circuit breaker with Pacific-day budgets, per-stage caps,
