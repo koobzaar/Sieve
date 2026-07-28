@@ -28,6 +28,15 @@ def test_prices_parse_brazilian_and_decimal_formats() -> None:
     assert parse_stated_price("SSD com 55% de desconto") is None
 
 
+def test_prices_parse_br_thousands_without_cents() -> None:
+    assert parse_price("R$2.645") == Decimal("2645")
+    assert parse_price("R$ 2.645") == Decimal("2645")
+    assert parse_price("R$1.000") == Decimal("1000")
+    assert parse_price("R$ 1.234.567") == Decimal("1234567")
+    assert parse_price("R$119") == Decimal("119")
+    assert parse_price("$12.34") == Decimal("12.34")
+
+
 def test_urls_drop_tracking_but_keep_semantic_query() -> None:
     assert canonicalize_url("HTTPS://Shop.Example/p/?utm_source=x&id=7#buy") == (
         "https://shop.example/p?id=7"

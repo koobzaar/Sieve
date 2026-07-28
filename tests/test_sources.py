@@ -34,6 +34,8 @@ def _card(
     deal_id: str | None,
     temperature: int | None,
     price: str | None = "R$ 10,00",
+    image: str | None = None,
+    store: str | None = None,
 ) -> str:
     id_attribute = f' data-deal-id="{deal_id}"' if deal_id is not None else ""
     temperature_html = (
@@ -46,7 +48,25 @@ def _card(
         if price is not None
         else ""
     )
-    return f'<a href="{url}"{id_attribute}>{title}</a>' + price_html + temperature_html
+    image_anchor_html = (
+        f'<a href="{url}" aria-label="{title}">'
+        f'<img srcset="{image} 100w" src="{image}" class="_deal-card-image_4d9he_31"/></a>'
+        if image is not None
+        else ""
+    )
+    store_html = (
+        f'<div class="_default-deal-card-store_1906q_87">'
+        f"<span>| Vendido por </span><a href=\"/cupons-de-descontos/{store}\">{store}</a></div>"
+        if store is not None
+        else ""
+    )
+    return (
+        image_anchor_html
+        + f'<a href="{url}"{id_attribute}>{title}</a>'
+        + price_html
+        + store_html
+        + temperature_html
+    )
 
 
 def _collection_html(parts: list[object], cards: str) -> str:
@@ -135,6 +155,75 @@ def test_current_feed_uses_id_card_and_skips_non_deal_entries(caplog) -> None:
         if getattr(record, "event", None) == "pelando_items_skipped"
     )
     assert warning.reason_counts == {"non_deal_item": 1}
+
+
+def test_current_feed_extracts_image_and_store_from_rendered_card() -> None:
+    html = _collection_html(
+        [{"name": "Valid deal", "url": VALID_URL}],
+        _card(
+            VALID_URL,
+            title="Valid deal",
+            deal_id="valid-id",
+            temperature=100,
+            price="R$2.645",
+            image="https://media.pelando.com.br/deal-image.jpg",
+            store="Magalu",
+        ),
+    )
+
+    promotions = parse_feed_schema(html)
+
+    assert len(promotions) == 1
+    assert str(promotions[0].price) == "2645"
+    assert promotions[0].media is not None
+    assert promotions[0].media.kind == "pelando"
+    assert promotions[0].media.url == "https://media.pelando.com.br/deal-image.jpg"
+    assert promotions[0].text == "Vendido por Magalu"
+
+
+def test_current_feed_without_image_or_store_leaves_media_and_text_empty() -> None:
+    html = _collection_html(
+        [{"name": "Valid deal", "url": VALID_URL}],
+        _card(VALID_URL, title="Valid deal", deal_id="valid-id", temperature=100),
+    )
+
+    promotions = parse_feed_schema(html)
+
+    assert promotions[0].media is None
+    assert promotions[0].text == ""
+
+
+def test_current_feed_does_not_leak_image_between_adjacent_cards() -> None:
+    first_url = "https://www.pelando.com.br/d/first-deal"
+    second_url = "https://www.pelando.com.br/d/second-deal"
+    avatar_html = '<img src="https://media.pelando.com.br/avatar.jpg" class="_avatar-image_ih8tl_10"/>'
+    html = _collection_html(
+        [
+            {"name": "First deal", "url": first_url},
+            {"name": "Second deal", "url": second_url},
+        ],
+        _card(
+            first_url,
+            title="First deal",
+            deal_id="first-id",
+            temperature=10,
+            image="https://media.pelando.com.br/first.jpg",
+        )
+        + avatar_html
+        + _card(
+            second_url,
+            title="Second deal",
+            deal_id="second-id",
+            temperature=20,
+            image="https://media.pelando.com.br/second.jpg",
+        ),
+    )
+
+    promotions = parse_feed_schema(html)
+
+    assert [promotion.id for promotion in promotions] == ["first-id", "second-id"]
+    assert promotions[0].media.url == "https://media.pelando.com.br/first.jpg"
+    assert promotions[1].media.url == "https://media.pelando.com.br/second.jpg"
 
 
 def test_saved_current_three_anchor_fixture_merges_compatible_partial_cards() -> None:

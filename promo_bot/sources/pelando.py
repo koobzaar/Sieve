@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 
 _SKIP_EXAMPLE_LIMIT = 3
 _PELANDO_ORIGIN = "https://www.pelando.com.br"
+_STORE_HREF_PREFIX = "/cupons-de-descontos/"
+_SRCSET_CANDIDATE_RE = re.compile(r"(\S+)\s+(\d+)w")
+
+
+def _best_srcset_candidate(srcset: str) -> str | None:
+    """Return the largest-width candidate URL from an <img srcset> value."""
+    candidates = _SRCSET_CANDIDATE_RE.findall(srcset or "")
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pair: int(pair[1]))[0]
 
 
 class PelandoSchemaError(ValueError):
@@ -63,9 +73,11 @@ class _RenderedCardParser(HTMLParser):
         self._title_depth = 0
         self._price_depth = 0
         self._temperature_depth = 0
+        self._store_depth = 0
         self._title_chunks: list[str] = []
         self._price_chunks: list[str] = []
         self._temperature_chunks: list[str] = []
+        self._store_chunks: list[str] = []
 
     def _finish_current(self) -> None:
         if self._current is None:
@@ -85,6 +97,8 @@ class _RenderedCardParser(HTMLParser):
             self._price_depth += 1
         if self._temperature_depth:
             self._temperature_depth += 1
+        if self._store_depth:
+            self._store_depth += 1
 
         href = attributes.get("href", "") or ""
         deal_id = attributes.get("data-deal-id")
@@ -93,10 +107,13 @@ class _RenderedCardParser(HTMLParser):
             self._current = {
                 "id": (deal_id or "").strip(),
                 "url": href.strip(),
+                "image": "",
+                "store": "",
             }
             self._title_chunks = []
             self._price_chunks = []
             self._temperature_chunks = []
+            self._store_chunks = []
             self._title_depth = 1
             return
 
@@ -110,6 +127,27 @@ class _RenderedCardParser(HTMLParser):
         if self._current is not None and attributes.get("data-temperature-level") is not None:
             self._temperature_depth = 1
 
+        if (
+            self._current is not None
+            and tag.casefold() == "img"
+            and "deal-card-image" in classes
+            and not self._current["image"]
+        ):
+            candidate = _best_srcset_candidate(attributes.get("srcset", "") or "") or (
+                attributes.get("src", "") or ""
+            )
+            if candidate.strip():
+                self._current["image"] = candidate.strip()
+
+        if (
+            self._current is not None
+            and tag.casefold() == "a"
+            and href.startswith(_STORE_HREF_PREFIX)
+            and not self._current["store"]
+        ):
+            self._store_depth = 1
+            self._store_chunks = []
+
     def handle_data(self, data: str) -> None:
         if self._title_depth:
             self._title_chunks.append(data)
@@ -117,6 +155,8 @@ class _RenderedCardParser(HTMLParser):
             self._price_chunks.append(data)
         if self._temperature_depth:
             self._temperature_chunks.append(data)
+        if self._store_depth:
+            self._store_chunks.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         if self._title_depth:
@@ -125,6 +165,16 @@ class _RenderedCardParser(HTMLParser):
             self._price_depth -= 1
         if self._temperature_depth:
             self._temperature_depth -= 1
+        if self._store_depth:
+            self._store_depth -= 1
+            if (
+                self._store_depth == 0
+                and self._current is not None
+                and not self._current["store"]
+            ):
+                store_text = " ".join("".join(self._store_chunks).split())
+                if store_text:
+                    self._current["store"] = store_text
 
     def close(self) -> None:
         super().close()
@@ -190,16 +240,20 @@ def _normalized_deal_url(value: str) -> str:
     return canonicalize_url(urljoin(_PELANDO_ORIGIN, value.strip()))
 
 
+def _absolute_media_url(value: str | None) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = urljoin(_PELANDO_ORIGIN, value.strip())
+    return candidate if candidate.startswith(("https://", "http://")) else None
+
+
 def _image_url(product: dict[str, Any]) -> str | None:
     value: Any = product.get("image")
     if isinstance(value, list):
         value = value[0] if value else None
     if isinstance(value, dict):
         value = value.get("contentUrl") or value.get("url") or value.get("@id")
-    if not isinstance(value, str) or not value.strip():
-        return None
-    candidate = urljoin(_PELANDO_ORIGIN, value.strip())
-    return candidate if candidate.startswith(("https://", "http://")) else None
+    return _absolute_media_url(value if isinstance(value, str) else None)
 
 
 def _consolidate_rendered_cards(
@@ -231,7 +285,7 @@ def _consolidate_rendered_cards(
             else siblings
         )
         ancillary = [card for card in siblings if card not in authoritative]
-        for field in ("title", "price", "temperature"):
+        for field in ("title", "price", "temperature", "image", "store"):
             values = {
                 str(card.get(field, "")).strip()
                 for card in authoritative
@@ -306,19 +360,22 @@ def _parse_rendered_collection(
         if rendered_title and rendered_title != title:
             skipped.append((index, "title_mismatch"))
             continue
+        store = card.get("store", "")
+        image_url = _absolute_media_url(card.get("image"))
         promotions.append(
             Promotion(
                 id=card["id"],
                 source=source_name,
                 title=title,
+                text=f"Vendido por {store}" if store else "",
                 price=parse_price(card.get("price")),
                 url=url,
                 temperature=int(card["temperature"]),
                 timestamp=utc_now(),
                 metadata={"position": index + 1, "currency": "BRL"},
                 media=(
-                    MediaReference(kind="pelando", source=source_name, url=_image_url(part))
-                    if _image_url(part)
+                    MediaReference(kind="pelando", source=source_name, url=image_url)
+                    if image_url
                     else None
                 ),
             )

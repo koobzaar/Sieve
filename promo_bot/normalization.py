@@ -11,7 +11,8 @@ from .models import Promotion
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 PRICE_RE = re.compile(
-    r"(?:(?:r\$|brl|us\$|usd|\$)\s*)?(\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})|\d+(?:[.,]\d{1,2})?)",
+    r"(?:(?:r\$|brl|us\$|usd|\$)\s*)?"
+    r"(\d{1,3}(?:[.\s]\d{3})+(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)",
     re.IGNORECASE,
 )
 STATED_PRICE_RE = re.compile(
@@ -151,6 +152,12 @@ def parse_price(value: object) -> Decimal | None:
         raw = raw.replace(".", "").replace(",", ".")
     elif raw.count(".") > 1:
         raw = raw.replace(".", "")
+    elif raw.count(".") == 1:
+        integer_part, _, fractional_part = raw.partition(".")
+        if len(fractional_part) == 3:
+            # A lone "." followed by exactly 3 digits is a BR thousands
+            # separator (e.g. "2.645" == 2645), not a decimal point.
+            raw = integer_part + fractional_part
     try:
         return Decimal(raw)
     except InvalidOperation:
