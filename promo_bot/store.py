@@ -1810,7 +1810,11 @@ class SQLiteStateStore:
         }
 
     def enqueue_retry(
-        self, promotion: Promotion, error: str, user_id: str | None = None
+        self,
+        promotion: Promotion,
+        error: str,
+        user_id: str | None = None,
+        retry_after_seconds: float | None = None,
     ) -> bool:
         owner_id = user_id or self.ensure_legacy_admin().id
         with self._lock:
@@ -1819,6 +1823,9 @@ class SQLiteStateStore:
             count = int(self._connection.execute("SELECT COUNT(*) FROM retry_jobs").fetchone()[0])
             if count >= self.retry_limit:
                 return False
+            delay = 5.0
+            if retry_after_seconds is not None:
+                delay = max(delay, min(self.retry_ttl_seconds, float(retry_after_seconds)))
             self._connection.execute(
                 "INSERT INTO retry_jobs("
                 "user_id,promotion_json,due_at,expires_at,attempts,last_error,created_at) "
@@ -1826,7 +1833,7 @@ class SQLiteStateStore:
                 (
                     owner_id,
                     json.dumps(promotion.to_dict(), ensure_ascii=False, separators=(",", ":")),
-                    now + 5,
+                    now + delay,
                     now + self.retry_ttl_seconds,
                     0,
                     error[:500],
@@ -1883,7 +1890,12 @@ class SQLiteStateStore:
         with self._lock:
             self._connection.execute("DELETE FROM retry_jobs WHERE id=?", (job_id,))
 
-    def reschedule_retry(self, job_id: int, error: str) -> bool:
+    def reschedule_retry(
+        self,
+        job_id: int,
+        error: str,
+        retry_after_seconds: float | None = None,
+    ) -> bool:
         with self._lock:
             now = self.clock()
             self._expire_retries_locked(now)
@@ -1894,6 +1906,11 @@ class SQLiteStateStore:
                 return False
             attempts = int(row["attempts"]) + 1
             delay = min(300, 5 * (2 ** min(attempts, 6)))
+            if retry_after_seconds is not None:
+                delay = max(
+                    delay,
+                    min(self.retry_ttl_seconds, float(retry_after_seconds)),
+                )
             self._connection.execute(
                 "UPDATE retry_jobs SET attempts=?,due_at=?,last_error=? WHERE id=?",
                 (attempts, now + delay, error[:500], job_id),

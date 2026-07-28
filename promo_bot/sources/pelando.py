@@ -5,9 +5,13 @@ import hashlib
 import json
 import logging
 import re
-from collections import Counter
+import time
+from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
+from html import unescape as html_unescape
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -26,6 +30,8 @@ _SKIP_EXAMPLE_LIMIT = 3
 _PELANDO_ORIGIN = "https://www.pelando.com.br"
 _STORE_HREF_PREFIX = "/cupons-de-descontos/"
 _SRCSET_CANDIDATE_RE = re.compile(r"(\S+)\s+(\d+)w")
+_DETAIL_PATH_PREFIX = "/d/"
+_DETAIL_COMMENT_LIMIT = 500
 
 
 def _best_srcset_candidate(srcset: str) -> str | None:
@@ -38,6 +44,22 @@ def _best_srcset_candidate(srcset: str) -> str | None:
 
 class PelandoSchemaError(ValueError):
     pass
+
+
+class PelandoDetailSchemaError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PelandoDetail:
+    price: Decimal | None
+    publication_comment: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DetailCacheEntry:
+    detail: PelandoDetail | None
+    retry_at: float | None
 
 
 class _FeedScriptParser(HTMLParser):
@@ -179,6 +201,236 @@ class _RenderedCardParser(HTMLParser):
     def close(self) -> None:
         super().close()
         self._finish_current()
+
+
+class _DetailPageParser(HTMLParser):
+    """Collect semantic detail fields without depending on CSS hash suffixes."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.json_ld: list[str] = []
+        self.price_candidates: list[str] = []
+        self.comment_candidates: list[str] = []
+        self._json_depth = 0
+        self._json_chunks: list[str] = []
+        self._price_depth = 0
+        self._price_chunks: list[str] = []
+        self._comment_depth = 0
+        self._comment_chunks: list[str] = []
+
+    @staticmethod
+    def _semantic_marker(attributes: dict[str, str | None]) -> str:
+        return " ".join(
+            str(attributes.get(name) or "")
+            for name in ("class", "id", "data-testid", "data-test")
+        ).casefold()
+
+    @classmethod
+    def _is_price_element(cls, attributes: dict[str, str | None]) -> bool:
+        if str(attributes.get("itemprop") or "").casefold() == "price":
+            return True
+        marker = cls._semantic_marker(attributes)
+        return any(
+            name in marker
+            for name in (
+                "deal-price",
+                "promotion-price",
+                "publication-price",
+                "current-price",
+            )
+        )
+
+    @classmethod
+    def _is_comment_element(cls, attributes: dict[str, str | None]) -> bool:
+        if str(attributes.get("itemprop") or "").casefold() == "description":
+            return True
+        marker = cls._semantic_marker(attributes)
+        return any(
+            name in marker
+            for name in (
+                "deal-description",
+                "promotion-description",
+                "publication-description",
+                "publication-comment",
+                "deal-comment",
+            )
+        )
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        attributes = dict(attrs)
+        if self._json_depth:
+            self._json_depth += 1
+        if self._price_depth:
+            self._price_depth += 1
+        if self._comment_depth:
+            self._comment_depth += 1
+
+        if (
+            tag.casefold() == "script"
+            and str(attributes.get("type") or "").casefold()
+            == "application/ld+json"
+        ):
+            self._json_depth = 1
+            self._json_chunks = []
+            return
+        if not self._price_depth and self._is_price_element(attributes):
+            content = str(attributes.get("content") or "").strip()
+            if content:
+                self.price_candidates.append(content)
+            else:
+                self._price_depth = 1
+                self._price_chunks = []
+        if not self._comment_depth and self._is_comment_element(attributes):
+            content = str(attributes.get("content") or "").strip()
+            if content:
+                self.comment_candidates.append(content)
+            else:
+                self._comment_depth = 1
+                self._comment_chunks = []
+
+    def handle_data(self, data: str) -> None:
+        if self._json_depth:
+            self._json_chunks.append(data)
+        if self._price_depth:
+            self._price_chunks.append(data)
+        if self._comment_depth:
+            self._comment_chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._json_depth:
+            self._json_depth -= 1
+            if self._json_depth == 0:
+                payload = "".join(self._json_chunks).strip()
+                if payload:
+                    self.json_ld.append(payload)
+        if self._price_depth:
+            self._price_depth -= 1
+            if self._price_depth == 0:
+                value = " ".join("".join(self._price_chunks).split())
+                if value:
+                    self.price_candidates.append(value)
+        if self._comment_depth:
+            self._comment_depth -= 1
+            if self._comment_depth == 0:
+                value = " ".join("".join(self._comment_chunks).split())
+                if value:
+                    self.comment_candidates.append(value)
+
+
+def _parse_offer_price(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, (Decimal, int, float)):
+        return parse_price(value)
+    text = " ".join(html_unescape(str(value)).split())
+    if not text or re.search(r"\b(gr[aá]tis|free)\b", text, re.IGNORECASE):
+        return None
+    numeric = r"\d[\d.]*(?:,\d{1,2})?"
+    if re.fullmatch(numeric, text):
+        return parse_price(text)
+    match = re.search(rf"(?:R\$|BRL)\s*({numeric})", text, re.IGNORECASE)
+    if match is None:
+        return None
+    suffix = text[match.end() :]
+    if suffix and suffix[0].isalpha():
+        return None
+    return parse_price(match.group(1))
+
+
+def _clean_publication_comment(value: Any) -> str:
+    text = html_unescape(str(value or ""))
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = " ".join(text.split())
+    return text[:_DETAIL_COMMENT_LIMIT].rstrip()
+
+
+def _json_ld_detail(
+    payload: Any,
+) -> tuple[list[Any], list[str], bool]:
+    prices: list[Any] = []
+    comments: list[str] = []
+    price_field_found = False
+
+    def walk(value: Any) -> None:
+        nonlocal price_field_found
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if not isinstance(value, dict):
+            return
+        raw_types = value.get("@type", "")
+        types = (
+            {str(item).casefold() for item in raw_types}
+            if isinstance(raw_types, list)
+            else {str(raw_types).casefold()}
+        )
+        if "product" in types:
+            description = _clean_publication_comment(value.get("description"))
+            if description:
+                comments.append(description)
+            offers = value.get("offers")
+            offer_values = offers if isinstance(offers, list) else [offers]
+            for offer in offer_values:
+                if isinstance(offer, dict) and "price" in offer:
+                    price_field_found = True
+                    prices.append(offer.get("price"))
+        if "offer" in types and "price" in value:
+            price_field_found = True
+            prices.append(value.get("price"))
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                walk(child)
+
+    walk(payload)
+    return prices, comments, price_field_found
+
+
+def parse_detail_page(html: str) -> PelandoDetail:
+    parser = _DetailPageParser()
+    parser.feed(html)
+    parser.close()
+
+    prices: list[Any] = []
+    comments: list[str] = []
+    price_field_found = False
+    for raw_payload in parser.json_ld:
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            continue
+        found_prices, found_comments, found_price_field = _json_ld_detail(payload)
+        prices.extend(found_prices)
+        comments.extend(found_comments)
+        price_field_found = price_field_found or found_price_field
+    if parser.price_candidates:
+        price_field_found = True
+        prices.extend(parser.price_candidates)
+    comments.extend(
+        comment
+        for comment in (
+            _clean_publication_comment(value)
+            for value in parser.comment_candidates
+        )
+        if comment
+    )
+    if not price_field_found and not comments:
+        raise PelandoDetailSchemaError(
+            "detail page contains no supported price or publication description"
+        )
+    return PelandoDetail(
+        price=next(
+            (
+                parsed
+                for parsed in (_parse_offer_price(value) for value in prices)
+                if parsed is not None
+            ),
+            None,
+        ),
+        publication_comment=next(iter(comments), ""),
+    )
 
 
 def _item_list(root: Any) -> list[Any]:
@@ -368,7 +620,7 @@ def _parse_rendered_collection(
                 source=source_name,
                 title=title,
                 text=f"Vendido por {store}" if store else "",
-                price=parse_price(card.get("price")),
+                price=_parse_offer_price(card.get("price")),
                 url=url,
                 temperature=int(card["temperature"]),
                 timestamp=utc_now(),
@@ -461,7 +713,7 @@ def parse_feed_schema(html: str, *, source_name: str = "pelando") -> list[Promot
             continue
         title = str(product.get("name") or "").strip()
         url = str(product.get("url") or offers.get("url") or "").strip()
-        price = parse_price(offers.get("price"))
+        price = _parse_offer_price(offers.get("price"))
         temperature = _temperature(product, raw_entry)
         native_id = product.get("productID") or product.get("sku") or product.get("@id")
         if not title:
@@ -469,9 +721,6 @@ def parse_feed_schema(html: str, *, source_name: str = "pelando") -> list[Promot
             continue
         if not url:
             skipped.append((index, "missing_url"))
-            continue
-        if price is None:
-            skipped.append((index, "missing_price"))
             continue
         if temperature is None:
             skipped.append((index, "missing_temperature"))
@@ -521,6 +770,10 @@ class PelandoSource:
         timeout_seconds: float = 20,
         user_agent: str = "sieve/1.1.0-beta.1 (+private-use)",
         health_reporter: HealthReporter | None = None,
+        detail_concurrency: int = 4,
+        detail_cache_size: int = 500,
+        detail_failure_ttl_seconds: float = 300,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.name = name
         self.client = client
@@ -529,9 +782,167 @@ class PelandoSource:
         self.timeout_seconds = timeout_seconds
         self.user_agent = user_agent
         self.health_reporter = health_reporter
+        self.detail_concurrency = max(1, detail_concurrency)
+        self.detail_cache_size = max(1, detail_cache_size)
+        self.detail_failure_ttl_seconds = max(1.0, detail_failure_ttl_seconds)
+        self.clock = clock
         self.etag: str | None = None
         self.last_modified: str | None = None
+        self._detail_cache: OrderedDict[str, _DetailCacheEntry] = OrderedDict()
+        self._detail_semaphore = asyncio.Semaphore(self.detail_concurrency)
         self._closed = False
+
+    @staticmethod
+    def _canonical_detail_url(value: str | None) -> str | None:
+        if not value:
+            return None
+        candidate = canonicalize_url(value)
+        parsed = urlparse(candidate)
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "www.pelando.com.br"
+            or port not in {None, 443}
+            or parsed.username is not None
+            or parsed.password is not None
+            or not parsed.path.startswith(_DETAIL_PATH_PREFIX)
+            or parsed.path == _DETAIL_PATH_PREFIX
+        ):
+            return None
+        return candidate
+
+    def _cached_detail(self, url: str) -> tuple[bool, PelandoDetail | None]:
+        entry = self._detail_cache.get(url)
+        if entry is None:
+            return False, None
+        if (
+            entry.detail is None
+            and entry.retry_at is not None
+            and self.clock() >= entry.retry_at
+        ):
+            del self._detail_cache[url]
+            return False, None
+        self._detail_cache.move_to_end(url)
+        return True, entry.detail
+
+    def _cache_detail(self, url: str, detail: PelandoDetail | None) -> None:
+        retry_at = (
+            self.clock() + self.detail_failure_ttl_seconds
+            if detail is None
+            else None
+        )
+        self._detail_cache[url] = _DetailCacheEntry(
+            detail=detail,
+            retry_at=retry_at,
+        )
+        self._detail_cache.move_to_end(url)
+        while len(self._detail_cache) > self.detail_cache_size:
+            self._detail_cache.popitem(last=False)
+
+    @staticmethod
+    def _apply_detail(promotion: Promotion, detail: PelandoDetail) -> None:
+        if promotion.price is None and detail.price is not None:
+            promotion.price = detail.price
+        comment = detail.publication_comment
+        if comment and comment not in promotion.text:
+            promotion.text = (
+                f"{promotion.text}\n\n{comment}"
+                if promotion.text
+                else comment
+            )
+
+    @staticmethod
+    def _warn_detail_failure(
+        *,
+        detail_url: str | None,
+        reason: str,
+        error: Exception | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        logger.warning(
+            "pelando_detail_enrichment_failed",
+            extra={
+                "event": "pelando_detail_enrichment_failed",
+                "detail_url": detail_url,
+                "reason": reason,
+                "error_type": type(error).__name__ if error is not None else None,
+                "status_code": status_code,
+            },
+        )
+
+    async def _fetch_detail(self, url: str) -> PelandoDetail | None:
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        async with self._detail_semaphore:
+            try:
+                response = await self.client.get(
+                    url,
+                    headers=headers,
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                detail = parse_detail_page(response.text)
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPStatusError as exc:
+                self._warn_detail_failure(
+                    detail_url=url,
+                    reason="http_error",
+                    error=exc,
+                    status_code=exc.response.status_code,
+                )
+                detail = None
+            except httpx.RequestError as exc:
+                self._warn_detail_failure(
+                    detail_url=url,
+                    reason="request_error",
+                    error=exc,
+                )
+                detail = None
+            except PelandoDetailSchemaError as exc:
+                self._warn_detail_failure(
+                    detail_url=url,
+                    reason="schema_error",
+                    error=exc,
+                )
+                detail = None
+        self._cache_detail(url, detail)
+        return detail
+
+    async def _enrich_details(
+        self, promotions: list[Promotion]
+    ) -> list[Promotion]:
+        pending: dict[str, list[Promotion]] = {}
+        for promotion in promotions:
+            url = self._canonical_detail_url(promotion.url)
+            if url is None:
+                self._warn_detail_failure(
+                    detail_url=None,
+                    reason="invalid_detail_url",
+                )
+                continue
+            cached, detail = self._cached_detail(url)
+            if cached:
+                if detail is not None:
+                    self._apply_detail(promotion, detail)
+                continue
+            pending.setdefault(url, []).append(promotion)
+
+        async def enrich(url: str, items: list[Promotion]) -> None:
+            detail = await self._fetch_detail(url)
+            if detail is not None:
+                for promotion in items:
+                    self._apply_detail(promotion, detail)
+
+        await asyncio.gather(
+            *(enrich(url, items) for url, items in pending.items())
+        )
+        return promotions
 
     async def poll_once(self) -> list[Promotion]:
         headers = {"User-Agent": self.user_agent, "Accept": "text/html,application/xhtml+xml"}
@@ -546,7 +957,7 @@ class PelandoSource:
         promotions = parse_feed_schema(response.text, source_name=self.name)
         self.etag = response.headers.get("etag", self.etag)
         self.last_modified = response.headers.get("last-modified", self.last_modified)
-        return promotions
+        return await self._enrich_details(promotions)
 
     async def _health(self, error: Exception | None) -> None:
         if self.health_reporter:
@@ -594,4 +1005,9 @@ def create_pelando_source(
             settings.get("user_agent", "sieve/1.1.0-beta.1 (+private-use)")
         ),
         health_reporter=health_reporter,
+        detail_concurrency=int(settings.get("detail_concurrency", 4)),
+        detail_cache_size=int(settings.get("detail_cache_size", 500)),
+        detail_failure_ttl_seconds=float(
+            settings.get("detail_failure_ttl_seconds", 300)
+        ),
     )

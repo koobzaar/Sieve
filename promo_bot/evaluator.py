@@ -18,7 +18,14 @@ class EvaluationError(RuntimeError):
 
 
 class RetryableEvaluationError(EvaluationError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GeminiEvaluator:
@@ -136,7 +143,10 @@ class GeminiEvaluator:
             )
             return self._parse(payload)
         except RetryableGeminiError as exc:
-            raise RetryableEvaluationError(str(exc)) from exc
+            raise RetryableEvaluationError(
+                str(exc),
+                retry_after_seconds=exc.retry_after_seconds,
+            ) from exc
         except GeminiError as exc:
             raise EvaluationError(str(exc)) from exc
 

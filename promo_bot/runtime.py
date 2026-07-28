@@ -359,7 +359,13 @@ class Service:
                 try:
                     await self.pipeline.process_retry(job.user_id, job.promotion)
                 except RetryableEvaluationError as exc:
-                    alive = self.store.reschedule_retry(job.id, str(exc))
+                    alive = self.store.reschedule_retry(
+                        job.id,
+                        str(exc),
+                        retry_after_seconds=getattr(
+                            exc, "retry_after_seconds", None
+                        ),
+                    )
                     await self.report_health("llm", exc)
                     if not alive:
                         logger.error(

@@ -415,9 +415,13 @@ class PromotionPipeline:
                 promotion, normalized, snapshot.rendered_profile
             )
         except RetryableEvaluationError as exc:
+            retry_after_seconds = getattr(exc, "retry_after_seconds", None)
             try:
                 queued = self.store.enqueue_retry(
-                    promotion, str(exc), self.user_id
+                    promotion,
+                    str(exc),
+                    self.user_id,
+                    retry_after_seconds=retry_after_seconds,
                 )
             except TypeError:
                 queued = self.store.enqueue_retry(promotion, str(exc))

@@ -63,6 +63,47 @@ def test_retry_queue_is_bounded_expires_and_survives_restart(tmp_path) -> None:
     reopened.close()
 
 
+def test_retry_jobs_respect_provider_cooldown_and_exponential_floor(
+    tmp_path,
+) -> None:
+    clock = Clock()
+    store = SQLiteStateStore(
+        tmp_path / "state.db",
+        retry_ttl_seconds=3_600,
+        clock=clock,
+    )
+    promotion = Promotion(id="cooldown", source="pelando", title="SSD")
+
+    assert store.enqueue_retry(
+        promotion,
+        "quota",
+        retry_after_seconds=90,
+    )
+    clock.value += 89
+    assert store.due_retries() == []
+    clock.value += 1
+    job = store.due_retries()[0]
+
+    assert store.reschedule_retry(
+        job.id,
+        "quota again",
+        retry_after_seconds=120,
+    )
+    clock.value += 119
+    assert store.due_retries() == []
+    clock.value += 1
+    assert [item.id for item in store.due_retries()] == [job.id]
+
+    assert store.reschedule_retry(job.id, "transport")
+    row = store._connection.execute(
+        "SELECT attempts,due_at FROM retry_jobs WHERE id=?",
+        (job.id,),
+    ).fetchone()
+    assert int(row["attempts"]) == 2
+    assert float(row["due_at"]) == clock.value + 20
+    store.close()
+
+
 def test_decisions_delivery_claims_health_and_incremental_retention(tmp_path) -> None:
     clock = Clock()
     store = SQLiteStateStore(

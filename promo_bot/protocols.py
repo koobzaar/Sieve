@@ -61,13 +61,24 @@ class StateStore(Protocol):
 
     def claim_delivery(self, promotion: Promotion) -> bool: ...
 
-    def enqueue_retry(self, promotion: Promotion, error: str) -> bool: ...
+    def enqueue_retry(
+        self,
+        promotion: Promotion,
+        error: str,
+        user_id: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> bool: ...
 
     def due_retries(self, limit: int = 10) -> list[RetryJob]: ...
 
     def complete_retry(self, job_id: int) -> None: ...
 
-    def reschedule_retry(self, job_id: int, error: str) -> bool: ...
+    def reschedule_retry(
+        self,
+        job_id: int,
+        error: str,
+        retry_after_seconds: float | None = None,
+    ) -> bool: ...
 
     def prune(self) -> dict[str, int]: ...
 

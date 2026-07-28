@@ -173,7 +173,7 @@ def test_tracked_config_is_complete_safe_and_valid() -> None:
 
     assert "extends" not in raw
     assert example.profile == ""
-    assert not example.gemini_evaluation_enabled
+    assert example.gemini_evaluation_enabled
     assert not example.preferences.enabled
     assert all(not source.enabled for source in example.sources)
     telegram = next(source for source in example.sources if source.name == "telegram-principal")

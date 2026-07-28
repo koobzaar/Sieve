@@ -9,13 +9,25 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from promo_bot.sources.pelando import PelandoSchemaError, PelandoSource, parse_feed_schema
+from promo_bot.sources.pelando import (
+    PelandoSchemaError,
+    PelandoSource,
+    parse_detail_page,
+    parse_feed_schema,
+)
 from promo_bot.sources.telegram import promotion_from_telethon_event
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 VALID_URL = "https://www.pelando.com.br/d/valid"
 BAD_URL = "https://www.pelando.com.br/d/bad"
+CAMERA_URL = (
+    "https://www.pelando.com.br/d/"
+    "camera-seguranca-panoramica-e27-wifi-com-deteccao-de-movimento-6bbb"
+)
+DETAIL_FIXTURE = (FIXTURES / "pelando_camera_detail.html").read_text(
+    encoding="utf-8"
+)
 
 
 def _feed_schema(payload: object, cards: str = "") -> str:
@@ -193,6 +205,24 @@ def test_current_feed_without_image_or_store_leaves_media_and_text_empty() -> No
     assert promotions[0].text == ""
 
 
+@pytest.mark.parametrize("offer", ["Grátis", "R$500OFF", "Cupom 20% OFF"])
+def test_current_feed_keeps_free_and_non_numeric_offers_priceless(
+    offer: str,
+) -> None:
+    html = _collection_html(
+        [{"name": "Valid deal", "url": VALID_URL}],
+        _card(
+            VALID_URL,
+            title="Valid deal",
+            deal_id="valid-id",
+            temperature=100,
+            price=offer,
+        ),
+    )
+
+    assert parse_feed_schema(html)[0].price is None
+
+
 def test_current_feed_does_not_leak_image_between_adjacent_cards() -> None:
     first_url = "https://www.pelando.com.br/d/first-deal"
     second_url = "https://www.pelando.com.br/d/second-deal"
@@ -243,6 +273,48 @@ def test_saved_current_three_anchor_fixture_merges_compatible_partial_cards() ->
         "https://www.pelando.com.br/d/ssd-current",
         "https://www.pelando.com.br/d/gpu-current",
     ]
+
+
+def test_saved_camera_feed_and_detail_fixtures_preserve_price_and_comment() -> None:
+    promotions = parse_feed_schema(
+        (FIXTURES / "pelando_current_camera_card.html").read_text(
+            encoding="utf-8"
+        )
+    )
+    detail = parse_detail_page(DETAIL_FIXTURE)
+
+    assert len(promotions) == 1
+    assert promotions[0].price is None
+    assert promotions[0].text == "Vendido por Magalu"
+    assert promotions[0].media is not None
+    assert promotions[0].media.url == (
+        "https://media.pelando.com.br/camera-large.jpg"
+    )
+    assert str(detail.price) == "39.00"
+    assert detail.publication_comment == "Oferta do dia magalu"
+
+
+@pytest.mark.parametrize(
+    ("offer", "expected"),
+    [
+        ("R$39,00", "39.00"),
+        ("R$2.599", "2599"),
+        ("Grátis", None),
+        ("R$500OFF", None),
+        ("Cupom de 20% OFF", None),
+    ],
+)
+def test_detail_prices_accept_brazilian_values_and_reject_non_prices(
+    offer: str,
+    expected: str | None,
+) -> None:
+    detail = parse_detail_page(
+        f'<span class="_deal-price_changinghash_42">{offer}</span>'
+    )
+
+    assert (
+        str(detail.price) if detail.price is not None else None
+    ) == expected
 
 
 def test_mixed_collection_page_skips_malformed_trailing_item(caplog) -> None:
@@ -446,7 +518,12 @@ async def test_pelando_uses_conditional_headers_and_handles_not_modified() -> No
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if len(requests) == 1:
+        if request.url.path.startswith("/d/"):
+            return httpx.Response(200, text=DETAIL_FIXTURE)
+        feed_requests = [
+            item for item in requests if item.url.path == "/recentes"
+        ]
+        if len(feed_requests) == 1:
             return httpx.Response(
                 200,
                 text=fixture,
@@ -458,9 +535,12 @@ async def test_pelando_uses_conditional_headers_and_handles_not_modified() -> No
         source = PelandoSource(client=client, interval_seconds=120)
         assert len(await source.poll_once()) == 1
         assert await source.poll_once() == []
-    assert requests[1].headers["if-none-match"] == '"abc"'
-    assert "if-modified-since" in requests[1].headers
-    assert requests[0].headers["user-agent"].startswith("sieve/")
+    feed_requests = [
+        request for request in requests if request.url.path == "/recentes"
+    ]
+    assert feed_requests[1].headers["if-none-match"] == '"abc"'
+    assert "if-modified-since" in feed_requests[1].headers
+    assert feed_requests[0].headers["user-agent"].startswith("sieve/")
 
 
 async def test_partial_success_records_health_and_updates_conditional_headers() -> None:
@@ -475,7 +555,12 @@ async def test_partial_success_records_health_and_updates_conditional_headers() 
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if len(requests) == 1:
+        if request.url.path.startswith("/d/"):
+            return httpx.Response(200, text=DETAIL_FIXTURE)
+        feed_requests = [
+            item for item in requests if item.url.path == "/recentes"
+        ]
+        if len(feed_requests) == 1:
             return httpx.Response(
                 200,
                 text=html,
@@ -508,8 +593,282 @@ async def test_partial_success_records_health_and_updates_conditional_headers() 
 
     assert [promotion.id for promotion in emitted] == ["valid-id"]
     assert health == [("pelando", None)]
-    assert requests[1].headers["if-none-match"] == '"partial"'
-    assert requests[1].headers["if-modified-since"] == "Sun, 19 Jul 2026 10:00:00 GMT"
+    feed_requests = [
+        request for request in requests if request.url.path == "/recentes"
+    ]
+    assert feed_requests[1].headers["if-none-match"] == '"partial"'
+    assert feed_requests[1].headers["if-modified-since"] == "Sun, 19 Jul 2026 10:00:00 GMT"
+
+
+async def test_detail_enrichment_fills_missing_price_and_formats_publication_comment() -> None:
+    feed = (FIXTURES / "pelando_current_camera_card.html").read_text(
+        encoding="utf-8"
+    )
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path == "/recentes":
+            return httpx.Response(200, text=feed)
+        if str(request.url) == CAMERA_URL:
+            return httpx.Response(200, text=DETAIL_FIXTURE)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        promotion = (
+            await PelandoSource(client=client).poll_once()
+        )[0]
+
+    assert requested_paths == [
+        "/recentes",
+        (
+            "/d/camera-seguranca-panoramica-e27-wifi-com-"
+            "deteccao-de-movimento-6bbb"
+        ),
+    ]
+    assert str(promotion.price) == "39.00"
+    assert promotion.text == (
+        "Vendido por Magalu\n\nOferta do dia magalu"
+    )
+
+
+async def test_feed_price_remains_authoritative_over_detail_price() -> None:
+    feed = _collection_html(
+        [{"name": "Valid deal", "url": VALID_URL}],
+        _card(
+            VALID_URL,
+            title="Valid deal",
+            deal_id="valid-id",
+            temperature=100,
+            price="R$ 99,90",
+            store="Magalu",
+        ),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return (
+            httpx.Response(200, text=feed)
+            if request.url.path == "/recentes"
+            else httpx.Response(200, text=DETAIL_FIXTURE)
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        promotion = (
+            await PelandoSource(client=client).poll_once()
+        )[0]
+
+    assert str(promotion.price) == "99.90"
+    assert promotion.text == (
+        "Vendido por Magalu\n\nOferta do dia magalu"
+    )
+
+
+async def test_successful_detail_is_cached_across_feed_polls() -> None:
+    feed = (FIXTURES / "pelando_current_camera_card.html").read_text(
+        encoding="utf-8"
+    )
+    detail_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detail_requests
+        if request.url.path == "/recentes":
+            return httpx.Response(200, text=feed)
+        detail_requests += 1
+        return httpx.Response(200, text=DETAIL_FIXTURE)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        source = PelandoSource(client=client)
+        first = await source.poll_once()
+        second = await source.poll_once()
+
+    assert detail_requests == 1
+    assert str(first[0].price) == "39.00"
+    assert str(second[0].price) == "39.00"
+    assert len(source._detail_cache) == 1
+    assert source.detail_cache_size == 500
+
+
+async def test_detail_failures_are_negatively_cached_then_retried(
+    caplog,
+) -> None:
+    feed = _collection_html(
+        [{"name": "Valid deal", "url": VALID_URL}],
+        _card(
+            VALID_URL,
+            title="Valid deal",
+            deal_id="valid-id",
+            temperature=100,
+            price=None,
+            store="Magalu",
+        ),
+    )
+    now = 100.0
+    detail_requests = 0
+
+    def clock() -> float:
+        return now
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal detail_requests
+        if request.url.path == "/recentes":
+            return httpx.Response(200, text=feed)
+        detail_requests += 1
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        source = PelandoSource(client=client, clock=clock)
+        with caplog.at_level("WARNING"):
+            first = await source.poll_once()
+            second = await source.poll_once()
+            now += 301
+            third = await source.poll_once()
+
+    assert detail_requests == 2
+    assert [batch[0].price for batch in (first, second, third)] == [
+        None,
+        None,
+        None,
+    ]
+    assert all(
+        batch[0].text == "Vendido por Magalu"
+        for batch in (first, second, third)
+    )
+    warnings = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None)
+        == "pelando_detail_enrichment_failed"
+    ]
+    assert len(warnings) == 2
+    assert all(record.reason == "http_error" for record in warnings)
+    assert all(record.status_code == 503 for record in warnings)
+
+
+async def test_detail_enrichment_has_bounded_concurrency() -> None:
+    urls = [
+        f"https://www.pelando.com.br/d/deal-{index}"
+        for index in range(8)
+    ]
+    feed = _collection_html(
+        [
+            {"name": f"Deal {index}", "url": url}
+            for index, url in enumerate(urls)
+        ],
+        "".join(
+            _card(
+                url,
+                title=f"Deal {index}",
+                deal_id=f"deal-{index}",
+                temperature=index + 1,
+                price=None,
+            )
+            for index, url in enumerate(urls)
+        ),
+    )
+    active = 0
+    maximum_active = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        if request.url.path == "/recentes":
+            return httpx.Response(200, text=feed)
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return httpx.Response(200, text=DETAIL_FIXTURE)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        promotions = await PelandoSource(client=client).poll_once()
+
+    assert len(promotions) == 8
+    assert maximum_active == 4
+
+
+async def test_off_origin_detail_url_is_never_requested_and_feed_stays_usable(
+    caplog,
+) -> None:
+    external = "https://evil.example/d/deal"
+    feed = _collection_html(
+        [{"name": "External deal", "url": external}],
+        _card(
+            external,
+            title="External deal",
+            deal_id="external-id",
+            temperature=10,
+            price="R$ 12,00",
+        ),
+    )
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(200, text=feed)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        with caplog.at_level("WARNING"):
+            promotions = await PelandoSource(client=client).poll_once()
+
+    assert requests == ["https://www.pelando.com.br/recentes"]
+    assert [promotion.id for promotion in promotions] == ["external-id"]
+    assert str(promotions[0].price) == "12.00"
+    warning = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None)
+        == "pelando_detail_enrichment_failed"
+    )
+    assert warning.reason == "invalid_detail_url"
+
+
+async def test_detail_schema_change_warns_without_failing_source_health(
+    caplog,
+) -> None:
+    feed = _collection_html(
+        [{"name": "Valid deal", "url": VALID_URL}],
+        _card(
+            VALID_URL,
+            title="Valid deal",
+            deal_id="valid-id",
+            temperature=100,
+            price="R$ 10,00",
+        ),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return (
+            httpx.Response(200, text=feed)
+            if request.url.path == "/recentes"
+            else httpx.Response(200, text="<html>changed</html>")
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        with caplog.at_level("WARNING"):
+            promotions = await PelandoSource(client=client).poll_once()
+
+    assert len(promotions) == 1
+    assert str(promotions[0].price) == "10.00"
+    warning = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None)
+        == "pelando_detail_enrichment_failed"
+    )
+    assert warning.reason == "schema_error"
 
 
 async def test_repeated_schema_failures_keep_exponential_backoff(monkeypatch) -> None:

@@ -67,6 +67,37 @@ async def test_gemini_marks_transient_and_malformed_responses_retryable() -> Non
                 await evaluator.evaluate(Promotion(id="1", source="x", title="SSD"), "ssd")
 
 
+async def test_gemini_evaluator_propagates_provider_retry_delay() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                429,
+                headers={"retry-after": "75"},
+                json={
+                    "error": {
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "quota exhausted",
+                    }
+                },
+            )
+        )
+    ) as client:
+        evaluator = GeminiEvaluator(
+            api_key="x",
+            model="gemini-test",
+            profile="p",
+            client=client,
+            retries=3,
+        )
+        with pytest.raises(RetryableEvaluationError) as raised:
+            await evaluator.evaluate(
+                Promotion(id="1", source="x", title="SSD"),
+                "ssd",
+            )
+
+    assert raised.value.retry_after_seconds == 75
+
+
 async def test_gemini_reason_is_bounded_to_one_sentence() -> None:
     response = httpx.Response(
         200,
