@@ -230,6 +230,8 @@ class _DetailPageParser(HTMLParser):
         if str(attributes.get("itemprop") or "").casefold() == "price":
             return True
         marker = cls._semantic_marker(attributes)
+        if "price" in marker.split():
+            return True
         return any(
             name in marker
             for name in (
@@ -245,6 +247,12 @@ class _DetailPageParser(HTMLParser):
         if str(attributes.get("itemprop") or "").casefold() == "description":
             return True
         marker = cls._semantic_marker(attributes)
+        if any(
+            token == "shortdescription"
+            or re.fullmatch(r"_?shortdescription_[^\s]+", token)
+            for token in marker.split()
+        ):
+            return True
         return any(
             name in marker
             for name in (
