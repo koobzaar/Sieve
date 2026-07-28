@@ -127,7 +127,7 @@ async def test_one_user_evaluation_failure_does_not_prevent_other_users(tmp_path
     add_interest(stores[member.id], member.telegram_user_id, "ssd")
 
     results = await multi.process(
-        Promotion(id="1", source="telegram", title="SSD NVMe 1TB")
+        Promotion(id="1", source="telegram", title="SSD BROKEN NVMe 1TB")
     )
 
     assert results[admin.id].stage == "user_error"

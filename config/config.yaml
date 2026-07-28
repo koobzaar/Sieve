@@ -41,8 +41,14 @@ gemini:
   model: gemini-3.1-flash-lite
   provider_url: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
   timeout_seconds: 20
-  retries: 3
+  retries: 2
   thinking_level: minimal
+  presentation_enabled: false
+  daily_cap: 400
+  evaluation_cap: 350
+  preference_cap: 25
+  rpm_cap: 5
+  ledger_retention_days: 35
   stages:
     extraction:
       schema_version: promotion-extraction-v2

@@ -8,9 +8,10 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -40,6 +41,250 @@ class RetryableGeminiError(GeminiError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class TemporaryGeminiThrottle(RetryableGeminiError):
+    """A local or provider throttle that may be retried after its persisted reset."""
+
+
+class DailyGeminiBudgetExhausted(GeminiError):
+    """The project or one reserved stage has no requests left this Pacific day."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reset_at: float,
+        scope: str,
+        **details: Any,
+    ) -> None:
+        super().__init__(
+            message,
+            reset_at=reset_at,
+            scope=scope,
+            **details,
+        )
+        self.reset_at = reset_at
+        self.scope = scope
+
+
+# Explicit aliases keep the public names discoverable for callers using either order.
+GeminiTemporaryThrottle = TemporaryGeminiThrottle
+GeminiDailyBudgetExhausted = DailyGeminiBudgetExhausted
+
+
+PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def pacific_quota_window(timestamp: float) -> tuple[str, float, float]:
+    """Return the provider quota day and its DST-safe Pacific boundaries."""
+    local = datetime.fromtimestamp(timestamp, timezone.utc).astimezone(PACIFIC)
+    start_date = local.date()
+    start = datetime.combine(start_date, datetime_time.min, PACIFIC)
+    end = datetime.combine(start_date + timedelta(days=1), datetime_time.min, PACIFIC)
+    return start_date.isoformat(), start.timestamp(), end.timestamp()
+
+
+def next_pacific_midnight(timestamp: float) -> float:
+    return pacific_quota_window(timestamp)[2]
+
+
+def _quota_text(value: Any) -> str:
+    fragments: list[str] = []
+
+    def collect(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                if str(key).casefold() in {
+                    "quotaid",
+                    "quotametric",
+                    "description",
+                    "subject",
+                    "message",
+                }:
+                    fragments.append(str(child))
+                collect(child)
+        elif isinstance(item, list):
+            for child in item:
+                collect(child)
+
+    collect(value)
+    return " ".join(fragments).casefold()
+
+
+def classify_quota_failure(
+    details: Mapping[str, Any],
+    *,
+    structured_details: Any = None,
+) -> str:
+    """Classify a 429 as a Pacific daily/project limit or a temporary throttle."""
+    text = " ".join(
+        (
+            str(details.get("provider_status", "")),
+            str(details.get("provider_message", "")),
+            _quota_text(structured_details),
+        )
+    ).casefold()
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    daily_markers = (
+        "requestsperday",
+        "perdayperproject",
+        "perprojectperday",
+        "generatedrequestsperday",
+        "requestperday",
+        "dailyquota",
+        "dailylimit",
+        "quotaexhaustedfortheday",
+    )
+    if any(marker in compact for marker in daily_markers):
+        return "daily"
+    if re.search(
+        r"\b(?:requests?\s+per\s+day|per[- ]day|daily|rpd)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return "daily"
+    return "temporary"
+
+
+@dataclass(frozen=True, slots=True)
+class GeminiReservation:
+    id: int
+    half_open_probe: bool = False
+
+
+class GeminiRequestBroker:
+    """Shared persisted admission, accounting, and circuit breaker for Gemini."""
+
+    def __init__(
+        self,
+        store: Any,
+        settings: Mapping[str, Any] | None = None,
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        values = settings or {}
+        self.store = store
+        self.clock = clock
+        self.daily_cap = int(values.get("daily_cap", 400))
+        self.evaluation_cap = int(values.get("evaluation_cap", 350))
+        self.preference_cap = int(values.get("preference_cap", 25))
+        self.rpm_cap = int(values.get("rpm_cap", 5))
+        self.lock = asyncio.Lock()
+
+    @staticmethod
+    def quota_stage(event_name: str) -> str:
+        if event_name.startswith("preference_"):
+            return "preference"
+        if event_name == "promotion_evaluation_request":
+            return "evaluation"
+        return "presentation"
+
+    def reserve(self, model: str, event_name: str) -> GeminiReservation:
+        now = self.clock()
+        quota_day, _, reset_at = pacific_quota_window(now)
+        quota_stage = self.quota_stage(event_name)
+        stage_cap = (
+            self.evaluation_cap
+            if quota_stage == "evaluation"
+            else self.preference_cap
+            if quota_stage == "preference"
+            else None
+        )
+        result = self.store.reserve_gemini_attempt(
+            quota_day=quota_day,
+            reset_at=reset_at,
+            model=model,
+            stage=event_name,
+            quota_stage=quota_stage,
+            daily_cap=self.daily_cap,
+            stage_cap=stage_cap,
+            rpm_cap=self.rpm_cap,
+            now=now,
+        )
+        if bool(result.get("allowed")):
+            return GeminiReservation(
+                int(result["reservation_id"]),
+                bool(result.get("half_open_probe")),
+            )
+        delay = float(result.get("retry_after_seconds", 0.0))
+        scope = str(result.get("scope", "unknown"))
+        reason = str(result.get("reason", "request_not_admitted"))
+        if result.get("kind") == "daily":
+            raise DailyGeminiBudgetExhausted(
+                "Gemini daily request budget exhausted",
+                reset_at=float(result.get("reset_at", reset_at)),
+                scope=scope,
+                reason=reason,
+            )
+        raise TemporaryGeminiThrottle(
+            "Gemini request temporarily throttled locally",
+            retry_after_seconds=max(0.001, delay),
+            scope=scope,
+            reason=reason,
+        )
+
+    def complete(
+        self,
+        reservation: GeminiReservation,
+        *,
+        outcome: str,
+        http_status: int | None = None,
+        usage: Mapping[str, Any] | None = None,
+    ) -> None:
+        metadata = usage or {}
+        self.store.complete_gemini_attempt(
+            reservation.id,
+            outcome=outcome,
+            http_status=http_status,
+            prompt_tokens=_optional_int(metadata.get("promptTokenCount")),
+            output_tokens=_optional_int(metadata.get("candidatesTokenCount")),
+            thinking_tokens=_optional_int(metadata.get("thoughtsTokenCount")),
+            total_tokens=_optional_int(metadata.get("totalTokenCount")),
+            now=self.clock(),
+        )
+
+    def open_temporary(self, delay: float, reason: str) -> None:
+        now = self.clock()
+        self.store.open_gemini_circuit(
+            "temporary:project",
+            open_until=now + max(0.001, delay),
+            reason=reason,
+            now=now,
+        )
+
+    def open_daily(self, reason: str) -> float:
+        now = self.clock()
+        reset_at = next_pacific_midnight(now)
+        self.store.open_gemini_circuit(
+            "daily:project",
+            open_until=reset_at,
+            reason=reason,
+            now=now,
+        )
+        return reset_at
+
+    def success(self) -> None:
+        # A successful provider response resets only the temporary circuit.
+        self.store.close_gemini_circuit("temporary:project")
+
+    def status(self) -> dict[str, object]:
+        now = self.clock()
+        quota_day, _, _ = pacific_quota_window(now)
+        return self.store.gemini_budget_status(
+            quota_day=quota_day,
+            daily_cap=self.daily_cap,
+            evaluation_cap=self.evaluation_cap,
+            preference_cap=self.preference_cap,
+            now=now,
+        )
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(slots=True)
 class _GeminiRequestCoordinator:
     """Serialize calls sharing one HTTP client and retain provider cooldown state."""
@@ -66,6 +311,7 @@ class GeminiStructuredClient:
         timeout_seconds: float = 20,
         retries: int = 3,
         client: httpx.AsyncClient | None = None,
+        broker: GeminiRequestBroker | None = None,
         random_source: random.Random | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -75,6 +321,7 @@ class GeminiStructuredClient:
         self.model = model
         self.url = provider_url.format(model=model)
         self.retries = max(1, retries)
+        self.broker = broker
         self.random = random_source or random.Random()
         self.monotonic = monotonic
         self.wall_clock = wall_clock
@@ -296,7 +543,7 @@ class GeminiStructuredClient:
         )
         retry_after_header_seconds = self._retry_after_header_seconds(response)
         retry_delay_metadata_seconds = self._retry_delay_metadata_seconds(error_details)
-        return {
+        details = {
             "status_code": response.status_code,
             "provider_status": provider_status,
             "provider_message": self._sanitize_provider_message(provider_message, body),
@@ -306,6 +553,23 @@ class GeminiStructuredClient:
             "retry_after_header_seconds": retry_after_header_seconds,
             "retry_delay_metadata_seconds": retry_delay_metadata_seconds,
         }
+        if response.status_code == 429:
+            details["quota_scope"] = classify_quota_failure(
+                details,
+                structured_details=error_details,
+            )
+        return details
+
+    @staticmethod
+    def _response_usage(response: httpx.Response) -> Mapping[str, Any]:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        usage = payload.get("usageMetadata", {})
+        return usage if isinstance(usage, Mapping) else {}
 
     @staticmethod
     def _log_http_error(details: Mapping[str, Any], *, attempt: int) -> None:
@@ -340,7 +604,7 @@ class GeminiStructuredClient:
         if delay > 0:
             await self.sleeper(delay)
 
-    async def request_json(
+    async def _request_json_legacy(
         self,
         body: Mapping[str, Any],
         *,
@@ -447,6 +711,218 @@ class GeminiStructuredClient:
                     )
                     await self.sleeper(delay)
             raise RetryableGeminiError(last_error, **last_details)
+
+    async def _request_json_brokered(
+        self,
+        body: Mapping[str, Any],
+        *,
+        event_name: str,
+        schema_version: str | None,
+    ) -> dict[str, Any]:
+        assert self.broker is not None
+        last_error = "Gemini request failed"
+        last_details: dict[str, Any] = {}
+        maximum_attempts = min(2, self.retries)
+        async with self.broker.lock:
+            for attempt in range(maximum_attempts):
+                reservation = self.broker.reserve(self.model, event_name)
+                started = self.monotonic()
+                try:
+                    response = await self.client.post(
+                        self.url,
+                        headers={"x-goog-api-key": self.api_key},
+                        json=dict(body),
+                    )
+                except (
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                ) as exc:
+                    self.broker.complete(
+                        reservation,
+                        outcome="transport_error",
+                    )
+                    last_error = (
+                        f"transient Gemini transport failure: {type(exc).__name__}"
+                    )
+                    last_details = {}
+                    if reservation.half_open_probe:
+                        self.broker.open_temporary(30.0, "half_open_transport_error")
+                        raise TemporaryGeminiThrottle(
+                            last_error,
+                            retry_after_seconds=30.0,
+                        ) from exc
+                    if attempt + 1 < maximum_attempts:
+                        await self.sleeper(
+                            0.5 + self.random.uniform(0, 0.25)
+                        )
+                        continue
+                    raise RetryableGeminiError(last_error) from exc
+
+                if response.is_error:
+                    details = self._http_error_details(
+                        response,
+                        body,
+                        request_event=event_name,
+                    )
+                    usage = self._response_usage(response)
+                    if response.status_code == 429:
+                        quota_scope = str(
+                            details.get("quota_scope", "temporary")
+                        )
+                        if quota_scope == "daily":
+                            self._log_http_error(details, attempt=attempt + 1)
+                            self.broker.complete(
+                                reservation,
+                                outcome="daily_quota_exhausted",
+                                http_status=429,
+                                usage=usage,
+                            )
+                            reset_at = self.broker.open_daily(
+                                "provider_daily_project_quota"
+                            )
+                            raise DailyGeminiBudgetExhausted(
+                                "Gemini daily project quota exhausted",
+                                reset_at=reset_at,
+                                scope="daily:project",
+                                **details,
+                            )
+                        retry_after_seconds = self._rate_limit_delay(details)
+                        self._coordinator.rate_limit_failures += 1
+                        details["retry_after_seconds"] = retry_after_seconds
+                        self._log_http_error(details, attempt=attempt + 1)
+                        self.broker.complete(
+                            reservation,
+                            outcome="temporary_throttle",
+                            http_status=429,
+                            usage=usage,
+                        )
+                        self.broker.open_temporary(
+                            retry_after_seconds,
+                            "provider_temporary_throttle",
+                        )
+                        raise TemporaryGeminiThrottle(
+                            "transient Gemini HTTP 429",
+                            retry_after_seconds=retry_after_seconds,
+                            **{
+                                key: value
+                                for key, value in details.items()
+                                if key != "retry_after_seconds"
+                            },
+                        )
+                    self._log_http_error(details, attempt=attempt + 1)
+                    if response.status_code >= 500:
+                        self.broker.complete(
+                            reservation,
+                            outcome="server_error",
+                            http_status=response.status_code,
+                            usage=usage,
+                        )
+                        last_error = (
+                            f"transient Gemini HTTP {response.status_code}"
+                        )
+                        last_details = details
+                        if reservation.half_open_probe:
+                            self.broker.open_temporary(
+                                30.0, "half_open_server_error"
+                            )
+                            raise TemporaryGeminiThrottle(
+                                last_error,
+                                retry_after_seconds=30.0,
+                                **details,
+                            )
+                        if attempt + 1 < maximum_attempts:
+                            await self.sleeper(
+                                0.5 + self.random.uniform(0, 0.25)
+                            )
+                            continue
+                        raise RetryableGeminiError(
+                            last_error, **last_details
+                        )
+                    self.broker.complete(
+                        reservation,
+                        outcome="http_error",
+                        http_status=response.status_code,
+                        usage=usage,
+                    )
+                    raise GeminiError(
+                        f"Gemini HTTP {response.status_code}",
+                        **details,
+                    )
+
+                try:
+                    response_payload = response.json()
+                except json.JSONDecodeError as exc:
+                    self.broker.complete(
+                        reservation,
+                        outcome="invalid_response",
+                        http_status=response.status_code,
+                    )
+                    raise RetryableGeminiError(
+                        "invalid structured Gemini response"
+                    ) from exc
+                raw_usage = (
+                    response_payload.get("usageMetadata", {})
+                    if isinstance(response_payload, Mapping)
+                    else {}
+                )
+                usage = raw_usage if isinstance(raw_usage, Mapping) else {}
+                try:
+                    parsed = self.parse_response(response_payload)
+                except RetryableGeminiError:
+                    self.broker.complete(
+                        reservation,
+                        outcome="invalid_response",
+                        http_status=response.status_code,
+                        usage=usage,
+                    )
+                    raise
+                self.broker.complete(
+                    reservation,
+                    outcome="success",
+                    http_status=response.status_code,
+                    usage=usage,
+                )
+                self.broker.success()
+                self._coordinator.cooldown_until = 0.0
+                self._coordinator.rate_limit_failures = 0
+                logger.info(
+                    "gemini_stage_succeeded",
+                    extra={
+                        "event": "gemini_stage_succeeded",
+                        "stage": event_name,
+                        "latency_ms": round(
+                            (self.monotonic() - started) * 1000, 1
+                        ),
+                        "attempt": attempt + 1,
+                        "model": self.model,
+                        "schema_version": schema_version,
+                        "prompt_tokens": usage.get("promptTokenCount"),
+                        "output_tokens": usage.get("candidatesTokenCount"),
+                        "thinking_tokens": usage.get("thoughtsTokenCount"),
+                        "total_tokens": usage.get("totalTokenCount"),
+                    },
+                )
+                return parsed
+        raise RetryableGeminiError(last_error, **last_details)
+
+    async def request_json(
+        self,
+        body: Mapping[str, Any],
+        *,
+        event_name: str = "gemini_structured_request",
+        schema_version: str | None = None,
+    ) -> dict[str, Any]:
+        if self.broker is None:
+            return await self._request_json_legacy(
+                body,
+                event_name=event_name,
+                schema_version=schema_version,
+            )
+        return await self._request_json_brokered(
+            body,
+            event_name=event_name,
+            schema_version=schema_version,
+        )
 
     async def generate_json(
         self,

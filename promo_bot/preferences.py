@@ -701,6 +701,7 @@ class ConstraintMatch:
     violation: str | None = None
     may_match_interest: bool = False
     all_proven: bool = True
+    matched_interest_ids: tuple[str, ...] = ()
 
 
 def _matches_any_text(
@@ -720,12 +721,13 @@ def evaluate_constraints(
     price = promotion.price if promotion.price is not None else parse_stated_price(
         f"{promotion.title} {promotion.text}"
     )
-    matched = False
+    matched_ids: list[str] = []
     all_proven = True
     for constraint in constraints:
         if not _matches_any_text(normalized, constraint.match_terms, aliases):
             continue
-        matched = True
+        if constraint.interest_id not in matched_ids:
+            matched_ids.append(constraint.interest_id)
         if price is None and (
             constraint.minimum_price is not None or constraint.maximum_price is not None
         ):
@@ -733,23 +735,136 @@ def evaluate_constraints(
         if price is not None:
             if constraint.minimum_price is not None and price < constraint.minimum_price:
                 return ConstraintMatch(
-                    f"price_below_minimum:{constraint.interest_id}", True, True
+                    violation=f"price_below_minimum:{constraint.interest_id}",
+                    may_match_interest=True,
+                    all_proven=True,
+                    matched_interest_ids=tuple(matched_ids),
                 )
             if constraint.maximum_price is not None and price > constraint.maximum_price:
                 return ConstraintMatch(
-                    f"price_above_maximum:{constraint.interest_id}", True, True
+                    violation=f"price_above_maximum:{constraint.interest_id}",
+                    may_match_interest=True,
+                    all_proven=True,
+                    matched_interest_ids=tuple(matched_ids),
                 )
         for value in constraint.excluded_attributes:
             if _matches_any_text(normalized, (value,), aliases):
                 return ConstraintMatch(
-                    f"excluded_attribute:{constraint.interest_id}:{normalize_text(value)}",
-                    True,
-                    True,
+                    violation=(
+                        f"excluded_attribute:{constraint.interest_id}:"
+                        f"{normalize_text(value)}"
+                    ),
+                    may_match_interest=True,
+                    all_proven=True,
+                    matched_interest_ids=tuple(matched_ids),
                 )
         for _, options in constraint.required_attributes:
             if not _matches_any_text(normalized, options, aliases):
                 all_proven = False
-    return ConstraintMatch(None, matched, all_proven)
+    return ConstraintMatch(
+        may_match_interest=bool(matched_ids),
+        all_proven=all_proven,
+        matched_interest_ids=tuple(matched_ids),
+    )
+
+
+def evaluation_preference_context(
+    snapshot: PreferenceSnapshot,
+    normalized: str,
+    matched_interest_ids: Sequence[str],
+    *,
+    maximum_chars: int = 2_500,
+    maximum_interests: int = 5,
+) -> str:
+    """Render only matching structured preferences for one evaluation request."""
+    selected_ids = set(matched_interest_ids)
+
+    def specificity(entry: PreferenceEntry) -> int:
+        matching = [
+            len(significant_tokens(str(term)))
+            for term in entry.data.get(
+                "search_terms", (entry.data.get("name", ""),)
+            )
+            if matches_alternative(normalized, str(term), snapshot.aliases)
+        ]
+        return max(matching, default=0)
+
+    interests = sorted(
+        (
+            entry
+            for entry in snapshot.interests
+            if entry.id in selected_ids
+        ),
+        key=lambda entry: (
+            -int(entry.data.get("importance", 50)),
+            -specificity(entry),
+            entry.id,
+        ),
+    )[:maximum_interests]
+
+    lines = ["MATCHED INTERESTS:"]
+    selected_terms: list[str] = []
+    for entry in interests:
+        terms = [
+            str(value)[:120]
+            for value in entry.data.get(
+                "search_terms", (entry.data.get("name", ""),)
+            )
+        ][:8]
+        selected_terms.extend(terms)
+        constraints = json.dumps(
+            thaw(entry.data.get("constraints", {})),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )[:300]
+        item = {
+            "id": entry.id,
+            "name": str(entry.data.get("name", ""))[:180],
+            "importance": int(entry.data.get("importance", 50)),
+            "search_terms": terms,
+            "constraints": constraints,
+        }
+        lines.append(
+            "- "
+            + json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )[:600]
+        )
+
+    if snapshot.context:
+        lines.append("APPLICABLE CONTEXT:")
+        lines.extend(f"- {str(value)[:300]}" for value in snapshot.context[:8])
+
+    related_aliases: list[str] = []
+    normalized_terms = {
+        normalize_text(term) for term in selected_terms if normalize_text(term)
+    }
+    for canonical, synonyms in snapshot.aliases.items():
+        alternatives = (canonical, *synonyms)
+        alternative_text = {normalize_text(value) for value in alternatives}
+        if (
+            normalized_terms & alternative_text
+            or any(
+                term in alternative
+                or alternative in term
+                for term in normalized_terms
+                for alternative in alternative_text
+            )
+            or matches_alternative(normalized, canonical, snapshot.aliases)
+        ):
+            related_aliases.append(
+                f"- {canonical}: {', '.join(str(value) for value in synonyms)}"
+            )
+    if related_aliases:
+        lines.append("APPLICABLE ALIASES:")
+        lines.extend(related_aliases[:12])
+
+    rendered = "\n".join(lines)
+    return rendered[: max(0, maximum_chars)]
 
 
 def changed_entry_count(first: PreferenceSnapshot, second: PreferenceSnapshot) -> int:

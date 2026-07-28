@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 from .config import env_secret
-from .gemini import GeminiError, GeminiStructuredClient
+from .gemini import GeminiError, GeminiRequestBroker, GeminiStructuredClient
 from .normalization import normalize_text
 from .preferences import (
     OperationAction,
@@ -102,6 +102,7 @@ class GeminiPreferenceInterpreter:
         thinking_level: str = "minimal",
         max_operations: int = 25,
         client: httpx.AsyncClient | None = None,
+        broker: GeminiRequestBroker | None = None,
     ) -> None:
         if structured_client is None:
             if not api_key or not model:
@@ -113,6 +114,7 @@ class GeminiPreferenceInterpreter:
                 timeout_seconds=timeout_seconds,
                 retries=retries,
                 client=client,
+                broker=broker,
             )
         self.client = structured_client
         self.max_output_tokens = max_output_tokens
@@ -416,6 +418,7 @@ def create_gemini_preference_interpreter(
     settings: Mapping[str, Any],
     *,
     client: httpx.AsyncClient | None = None,
+    broker: GeminiRequestBroker | None = None,
 ) -> GeminiPreferenceInterpreter:
     secret_name = str(settings.get("api_key_env", "GEMINI_API_KEY"))
     model = str(settings.get("parser_model", settings.get("model", ""))).strip()
@@ -439,4 +442,5 @@ def create_gemini_preference_interpreter(
         thinking_level=str(settings.get("thinking_level", "minimal")),
         max_operations=int(settings.get("max_operations", 25)),
         client=client,
+        broker=broker,
     )

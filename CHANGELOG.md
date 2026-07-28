@@ -4,7 +4,20 @@ All notable changes to Sieve are documented here.
 
 ## Unreleased
 
-- No changes yet.
+### Added
+
+- A persisted Gemini request ledger and circuit breaker with Pacific-day budgets, per-stage caps,
+  a five-request-per-minute serialized admission limit, token accounting, and maintenance
+  telemetry.
+
+### Changed
+
+- Gemini evaluation now requires an alias-aware structured-interest match and receives at most five
+  matching interests in a 2,500-character context instead of the complete preference profile.
+- Daily quota exhaustion fails locally until the Pacific reset, does not create new retry jobs, and
+  clears existing retry jobs without provider probes.
+- Promotion cards are rendered deterministically by default; optional Gemini presentation no
+  longer multiplies validation retries.
 
 ## 1.1.0-beta.1 - 2026-07-20
 

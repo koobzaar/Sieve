@@ -13,7 +13,7 @@ import httpx
 from .config import AppConfig, env_secret, load_factory
 from .delivery import TelegramDeliveryWorker
 from .evaluator import RetryableEvaluationError
-from .gemini import GeminiStructuredClient
+from .gemini import GeminiRequestBroker, GeminiStructuredClient
 from .models import Decision, Promotion
 from .pipeline import MultiUserPromotionPipeline, PromotionPipeline
 from .preference_bot import (
@@ -62,6 +62,9 @@ class Service:
             corpus_limit=config.corpus_limit,
             retry_limit=config.retry_limit,
             retry_ttl_seconds=config.retry_ttl_seconds,
+            gemini_ledger_retention_days=int(
+                config.gemini["ledger_retention_days"]
+            ),
             media_dir=config.state_media_path,
         )
         self.store.sweep_media_orphans()
@@ -104,9 +107,15 @@ class Service:
         self.preference_stores: dict[str, SQLitePreferenceStore] = {
             administrator.id: self.preference_store
         }
+        self.gemini_broker = GeminiRequestBroker(self.store, config.gemini)
         evaluator_factory = load_factory(config.evaluator_factory)
         sink_factory = load_factory(config.sink_factory)
-        self.evaluator = evaluator_factory(config.evaluator, profile=config.profile, client=self.http)
+        self.evaluator = evaluator_factory(
+            config.evaluator,
+            profile=config.profile,
+            client=self.http,
+            broker=self.gemini_broker,
+        )
         self.sink = sink_factory(config.sink, client=self.http)
         gemini_key = env_secret(str(config.gemini.get("api_key_env", "GEMINI_API_KEY")))
         self.presentation_gemini = GeminiStructuredClient(
@@ -116,6 +125,7 @@ class Service:
             timeout_seconds=float(config.gemini["timeout_seconds"]),
             retries=int(config.gemini["retries"]),
             client=self.http,
+            broker=self.gemini_broker,
         )
         self.media_resolver = MediaResolver(
             config.state_media_path,
@@ -202,7 +212,9 @@ class Service:
             parser_settings.update(preference_settings.parser)
             parser_settings["max_operations"] = preference_settings.max_operations
             self.preference_interpreter = create_gemini_preference_interpreter(
-                parser_settings, client=self.http
+                parser_settings,
+                client=self.http,
+                broker=self.gemini_broker,
             )
             bot_api = TelegramBotAPI(
                 token=env_secret(preference_settings.token_env),
@@ -416,6 +428,8 @@ class Service:
                     ),
                     cold_start_documents=self.config.cold_start_documents,
                 )
+                operational["gemini"] = self.gemini_broker.status()
+                operational["retry_depth"] = self.store.retry_depth()
                 logger.info(
                     "maintenance",
                     extra={

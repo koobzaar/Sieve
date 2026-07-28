@@ -6,7 +6,11 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .bm25 import okapi_bm25
-from .evaluator import EvaluationError, RetryableEvaluationError
+from .evaluator import (
+    DailyBudgetEvaluationError,
+    EvaluationError,
+    RetryableEvaluationError,
+)
 from .exceptional import detect_exceptional
 from .filters import fixed_filter, hard_rules_filter
 from .models import Decision, Evaluation, PipelineResult, Promotion
@@ -23,6 +27,7 @@ from .preferences import (
     AtomicPreferenceProvider,
     PreferenceSnapshot,
     build_snapshot,
+    evaluation_preference_context,
     evaluate_constraints,
     explicit_exclusion_match,
     seed_entries,
@@ -350,11 +355,18 @@ class PromotionPipeline:
                 b=self.b,
             )
             if score < self.threshold:
-                if self._audit_selected(content_hash):
+                if (
+                    constraint.matched_interest_ids
+                    and self._audit_selected(content_hash)
+                ):
                     return await self._audit_below_threshold(
                         promotion,
                         normalized,
-                        snapshot.rendered_profile,
+                        evaluation_preference_context(
+                            snapshot,
+                            normalized,
+                            constraint.matched_interest_ids,
+                        ),
                         score,
                     )
                 return self._record(
@@ -387,6 +399,22 @@ class PromotionPipeline:
                         auto_forward_candidate=True,
                     ),
                 )
+        if not constraint.matched_interest_ids:
+            return self._record(
+                promotion,
+                PipelineResult(
+                    Decision.DISCARD,
+                    "interest_admission",
+                    "interest_candidate_miss",
+                    score=score,
+                    auto_forward_candidate=auto_forward_candidate,
+                ),
+            )
+        preference_context = evaluation_preference_context(
+            snapshot,
+            normalized,
+            constraint.matched_interest_ids,
+        )
         if not self.gemini_evaluation_enabled:
             if exceptional_uncertain:
                 reason = "gemini_evaluation_disabled:uncertain_exceptional"
@@ -412,7 +440,18 @@ class PromotionPipeline:
             )
         try:
             evaluation = await self._evaluate(
-                promotion, normalized, snapshot.rendered_profile
+                promotion, normalized, preference_context
+            )
+        except DailyBudgetEvaluationError:
+            return self._record(
+                promotion,
+                PipelineResult(
+                    Decision.DISCARD,
+                    "llm",
+                    "llm_daily_budget_exhausted",
+                    score=score,
+                    auto_forward_candidate=auto_forward_candidate,
+                ),
             )
         except RetryableEvaluationError as exc:
             retry_after_seconds = getattr(exc, "retry_after_seconds", None)
@@ -474,9 +513,54 @@ class PromotionPipeline:
             return evaluation
         snapshot = self.preference_provider.get_snapshot()
         normalized = promotion_text(promotion)
-        evaluation = await self._evaluate(
-            promotion, normalized, snapshot.rendered_profile
+        constraint = evaluate_constraints(
+            promotion, normalized, snapshot.constraints, snapshot.aliases
         )
+        if constraint.violation is not None:
+            evaluation = Evaluation(Decision.DISCARD, constraint.violation)
+            self._record(
+                promotion,
+                PipelineResult(
+                    evaluation.decision,
+                    "llm_retry",
+                    evaluation.reason,
+                ),
+            )
+            return evaluation
+        if not constraint.matched_interest_ids:
+            evaluation = Evaluation(Decision.DISCARD, "interest_candidate_miss")
+            self._record(
+                promotion,
+                PipelineResult(
+                    evaluation.decision,
+                    "llm_retry",
+                    evaluation.reason,
+                ),
+            )
+            return evaluation
+        try:
+            evaluation = await self._evaluate(
+                promotion,
+                normalized,
+                evaluation_preference_context(
+                    snapshot,
+                    normalized,
+                    constraint.matched_interest_ids,
+                ),
+            )
+        except DailyBudgetEvaluationError:
+            evaluation = Evaluation(
+                Decision.DISCARD, "retry_daily_budget_exhausted"
+            )
+            self._record(
+                promotion,
+                PipelineResult(
+                    evaluation.decision,
+                    "llm_retry",
+                    evaluation.reason,
+                ),
+            )
+            return evaluation
         if evaluation.decision == Decision.FORWARD:
             await self._deliver(promotion, evaluation.reason)
         self._record(

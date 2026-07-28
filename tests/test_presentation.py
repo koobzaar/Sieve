@@ -428,6 +428,58 @@ async def test_sparse_source_fallback_keeps_title_price_and_offer_button(tmp_pat
     store.close()
 
 
+async def test_disabled_presentation_is_deterministic_and_keeps_pelando_enrichment(
+    tmp_path,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503)
+
+    store = SQLiteStateStore(tmp_path / "state.db", media_dir=tmp_path / "media")
+    account = store.bootstrap_admin(telegram_user_id=1, telegram_chat_id=2)
+    promotion = Promotion(
+        id="pelando",
+        source="pelando",
+        title="Câmera <b>compacta</b>",
+        text="Câmera <b>compacta</b>\n\nOferta do dia magalu",
+        price=Decimal("39"),
+        url="https://example.test/camera",
+    )
+    store.enqueue_delivery(
+        account.id,
+        2,
+        promotion,
+        "above_threshold_with_deterministic_gates",
+        language="pt-BR",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http:
+        presenter = PromotionPresenter(
+            store=store,
+            gemini=GeminiStructuredClient(
+                api_key="secret", model="test", client=http
+            ),
+            media_resolver=MediaResolver(tmp_path / "media", client=http),
+            settings={"presentation_enabled": False},
+        )
+        card = await presenter.prepare(store.due_deliveries()[0])
+
+    assert calls == 0
+    assert card.fallback is False
+    assert "R$ 39,00" in card.text
+    assert "Oferta do dia magalu" in card.text
+    assert "<b>compacta</b>" in card.text
+    assert "Combina com seus interesses configurados." in card.text
+    assert "above_threshold" not in card.text
+    assert {entity.type for entity in card.entities} == {"bold", "blockquote"}
+    assert card.button_url == "https://example.test/camera"
+    store.close()
+
+
 def _slice_utf16(text: str, offset: int, length: int) -> str:
     encoded = text.encode("utf-16-le")
     return encoded[offset * 2 : (offset + length) * 2].decode("utf-16-le")

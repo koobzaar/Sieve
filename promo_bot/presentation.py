@@ -980,6 +980,9 @@ class PromotionPresenter:
         self.gemini = gemini
         self.media_resolver = media_resolver
         self.settings = settings or {}
+        self.presentation_enabled = bool(
+            self.settings.get("presentation_enabled", True)
+        )
         stages = self.settings.get("stages", {})
         self.stage_settings = {
             "extraction": {"max_input_chars": 12_000, "max_output_tokens": 900, **stages.get("extraction", {})},
@@ -1007,38 +1010,18 @@ class PromotionPresenter:
         system_instruction: str,
         validator: Any,
     ) -> Any:
-        for attempt in range(self.gemini.retries):
-            raw = await self.gemini.generate_json(
-                prompt,
-                schema,
-                max_output_tokens=int(self.stage_settings[stage]["max_output_tokens"]),
-                temperature=0,
-                thinking_level=self.thinking_level,
-                system_instruction=system_instruction,
-                event_name=f"promotion_{stage}",
-                schema_version=self._version(stage, "schema"),
-                strict_json_schema=True,
-            )
-            try:
-                return validator(raw)
-            except PoisoningDetected:
-                raise
-            except PresentationError as exc:
-                if attempt + 1 >= self.gemini.retries:
-                    raise
-                logger.warning(
-                    "gemini_stage_validation_retry",
-                    extra={
-                        "event": "gemini_stage_validation_retry",
-                        "stage": stage,
-                        "schema_version": self._version(stage, "schema"),
-                        "attempt": attempt + 1,
-                        "failure_category": "malformed_or_ungrounded",
-                        "validation_error": str(exc)[:160],
-                    },
-                )
-                await asyncio.sleep(min(2.0, 0.25 * (2**attempt)))
-        raise PresentationError("validated Gemini stage exhausted retries")
+        raw = await self.gemini.generate_json(
+            prompt,
+            schema,
+            max_output_tokens=int(self.stage_settings[stage]["max_output_tokens"]),
+            temperature=0,
+            thinking_level=self.thinking_level,
+            system_instruction=system_instruction,
+            event_name=f"promotion_{stage}",
+            schema_version=self._version(stage, "schema"),
+            strict_json_schema=True,
+        )
+        return validator(raw)
 
     async def _facts(self, promotion: Promotion, content_hash: str) -> dict[str, Any]:
         cache_key = self._cache_key(
@@ -1260,6 +1243,103 @@ class PromotionPresenter:
             buttons=buttons,
         )
 
+    def _deterministic(
+        self,
+        promotion: Promotion,
+        reason: str,
+        language: str,
+        media: ResolvedMedia | None,
+    ) -> PreparedTelegramCard:
+        """Render normalized source facts without sending promotion text to Gemini."""
+        untitled = "Promoção" if language == "pt-BR" else "Promotion"
+        title = (
+            " ".join(_without_controls(promotion.title).split())[:500]
+            or untitled
+        )
+        source_text = _without_controls(
+            promotion.text, keep_newlines=True
+        ).strip()
+        if source_text == promotion.title.strip():
+            source_text = ""
+        elif source_text.startswith(promotion.title.strip() + "\n"):
+            source_text = source_text[len(promotion.title.strip()) :].strip()
+        safe_reason = " ".join(_without_controls(reason).split())[:500]
+        if reason == "above_threshold_with_deterministic_gates":
+            safe_reason = (
+                "Combina com seus interesses configurados."
+                if language == "pt-BR"
+                else "Matches your configured interests."
+            )
+        elif reason.startswith("pelando_temperature:"):
+            safe_reason = (
+                "Oferta popular no Pelando."
+                if language == "pt-BR"
+                else "Popular offer on Pelando."
+            )
+        elif reason.startswith(("explicit_phrase:", "stated_discount:")):
+            safe_reason = (
+                "Oferta excepcional identificada."
+                if language == "pt-BR"
+                else "Exceptional offer identified."
+            )
+        elif re.search(
+            r"\b(?:pipeline|prompt|gemini|model|filter|score|profile|stage)\b|_",
+            safe_reason,
+            re.IGNORECASE,
+        ):
+            safe_reason = (
+                "Combina com seus interesses configurados."
+                if language == "pt-BR"
+                else "Matches your configured interests."
+            )
+
+        card = _EntityBuilder()
+        card.add("🏷️ ")
+        card.line(((title, "bold"),))
+        if promotion.price is not None and promotion.price > 0:
+            card.line(((_money(str(promotion.price), language), "bold"),))
+        if source_text:
+            card.line()
+            card.add(source_text)
+        if safe_reason:
+            card.line()
+            card.line()
+            card.line(((f"▎{safe_reason}", "blockquote"),))
+        rendered = card.text.rstrip("\n")
+        maximum = 1_024 if media is not None else 4_096
+        followups: tuple[str, ...] = ()
+        entities = tuple(card.entities)
+        if len(rendered) > maximum:
+            compact = _EntityBuilder()
+            compact.add("🏷️ ")
+            compact.line(((title, "bold"),))
+            if promotion.price is not None and promotion.price > 0:
+                compact.line(((_money(str(promotion.price), language), "bold"),))
+            rendered = compact.text.rstrip("\n")[:maximum]
+            entities = tuple(
+                entity
+                for entity in compact.entities
+                if entity.offset + entity.length <= _utf16_length(rendered)
+            )
+            overflow = "\n\n".join(
+                value for value in (source_text, safe_reason) if value
+            )
+            followups = _chunks(overflow) if overflow else ()
+
+        buttons = _fallback_buttons(promotion, language)
+        primary = buttons[0] if buttons else None
+        return PreparedTelegramCard(
+            text=rendered,
+            entities=entities,
+            button_text=primary.text if primary else None,
+            button_url=primary.url if primary else None,
+            media_path=media.path if media else None,
+            media_mime_type=media.mime_type if media else None,
+            followup_texts=followups,
+            fallback=False,
+            buttons=buttons,
+        )
+
     async def prepare(self, job: DeliveryJob) -> PreparedTelegramCard:
         language = normalize_ui_language(job.language)
         media: ResolvedMedia | None = None
@@ -1275,6 +1355,13 @@ class PromotionPresenter:
                     "stage": "media",
                     "failure_category": type(exc).__name__,
                 },
+            )
+        if not self.presentation_enabled:
+            return self._deterministic(
+                job.promotion,
+                job.reason,
+                language,
+                media,
             )
         try:
             content_hash = promotion_content_hash(job.promotion)

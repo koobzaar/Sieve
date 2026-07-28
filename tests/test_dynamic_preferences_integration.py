@@ -279,9 +279,10 @@ async def test_live_matching_handles_reordering_aliases_and_model_boundaries(
 
     assert gpu.stage == drill.stage == "bm25_auto_forward"
     assert gpu.auto_forward_candidate and drill.auto_forward_candidate
-    assert partial.stage == "llm"
+    assert partial.stage == "interest_admission"
+    assert partial.reason == "interest_candidate_miss"
     assert not partial.auto_forward_candidate
-    assert len(evaluator.calls) == 1
+    assert len(evaluator.calls) == 0
     assert [item[0].id for item in sink.sent] == ["gpu-full", "drill-reordered"]
     state.close()
 
@@ -512,11 +513,11 @@ async def test_alias_change_fails_open_then_switches_atomically(tmp_path) -> Non
     )
     assert not state.alias_generation_ready({"storage": ("ssd",)})
     during = await pipeline.process(Promotion(id="1", source="x", title="SSD modelo A"))
-    assert during.stage == "llm"
+    assert during.stage == "interest_admission"
     while not state.rebuild_alias_batch(250)["complete"]:
         pass
     assert state.alias_generation_ready({"storage": ("ssd",)})
     after = await pipeline.process(Promotion(id="2", source="x", title="SSD modelo B"))
-    assert after.stage == "llm"
-    assert len(evaluator.calls) == 2
+    assert after.stage == "interest_admission"
+    assert len(evaluator.calls) == 0
     state.close()

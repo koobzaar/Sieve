@@ -80,6 +80,56 @@ class StateStore(Protocol):
         retry_after_seconds: float | None = None,
     ) -> bool: ...
 
+    def reserve_gemini_attempt(
+        self,
+        *,
+        quota_day: str,
+        reset_at: float,
+        model: str,
+        stage: str,
+        quota_stage: str,
+        daily_cap: int,
+        stage_cap: int | None,
+        rpm_cap: int,
+        now: float | None = None,
+    ) -> dict[str, object]: ...
+
+    def complete_gemini_attempt(
+        self,
+        reservation_id: int,
+        *,
+        outcome: str,
+        http_status: int | None = None,
+        prompt_tokens: int | None = None,
+        output_tokens: int | None = None,
+        thinking_tokens: int | None = None,
+        total_tokens: int | None = None,
+        now: float | None = None,
+    ) -> None: ...
+
+    def open_gemini_circuit(
+        self,
+        scope: str,
+        *,
+        open_until: float,
+        reason: str,
+        now: float | None = None,
+    ) -> None: ...
+
+    def close_gemini_circuit(self, scope: str) -> None: ...
+
+    def gemini_budget_status(
+        self,
+        *,
+        quota_day: str,
+        daily_cap: int,
+        evaluation_cap: int,
+        preference_cap: int,
+        now: float | None = None,
+    ) -> dict[str, object]: ...
+
+    def retry_depth(self) -> int: ...
+
     def prune(self) -> dict[str, int]: ...
 
     def close(self) -> None: ...

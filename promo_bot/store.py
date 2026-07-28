@@ -237,6 +237,40 @@ CREATE TABLE IF NOT EXISTS health_state (
     last_failure REAL,
     last_error TEXT
 );
+CREATE TABLE IF NOT EXISTS gemini_request_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quota_day TEXT NOT NULL,
+    reserved_at REAL NOT NULL,
+    completed_at REAL,
+    model TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    quota_stage TEXT NOT NULL CHECK(
+        quota_stage IN ('evaluation','preference','presentation')
+    ),
+    outcome TEXT NOT NULL DEFAULT 'reserved',
+    http_status INTEGER,
+    prompt_tokens INTEGER,
+    output_tokens INTEGER,
+    thinking_tokens INTEGER,
+    total_tokens INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_gemini_ledger_day_stage
+    ON gemini_request_ledger(quota_day, quota_stage, reserved_at);
+CREATE INDEX IF NOT EXISTS idx_gemini_ledger_reserved
+    ON gemini_request_ledger(reserved_at);
+CREATE TABLE IF NOT EXISTS gemini_circuit_state (
+    scope TEXT PRIMARY KEY,
+    opened_at REAL NOT NULL,
+    open_until REAL NOT NULL,
+    reason TEXT NOT NULL,
+    half_open_probe INTEGER NOT NULL DEFAULT 0,
+    probe_started_at REAL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gemini_local_metrics (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -362,6 +396,7 @@ class SQLiteStateStore:
         corpus_limit: int = 10_000,
         retry_limit: int = 100,
         retry_ttl_seconds: int = 3_600,
+        gemini_ledger_retention_days: int = 35,
         media_dir: str | Path | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -372,6 +407,7 @@ class SQLiteStateStore:
         self.corpus_limit = corpus_limit
         self.retry_limit = retry_limit
         self.retry_ttl_seconds = retry_ttl_seconds
+        self.gemini_ledger_retention_days = gemini_ledger_retention_days
         self.media_dir = Path(media_dir or (self.path.parent / "media")).resolve()
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.clock = clock
@@ -1823,6 +1859,21 @@ class SQLiteStateStore:
             count = int(self._connection.execute("SELECT COUNT(*) FROM retry_jobs").fetchone()[0])
             if count >= self.retry_limit:
                 return False
+            for row in self._connection.execute(
+                "SELECT promotion_json FROM retry_jobs WHERE user_id=?",
+                (owner_id,),
+            ):
+                try:
+                    existing = Promotion.from_dict(
+                        json.loads(row["promotion_json"])
+                    )
+                except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                    continue
+                if (
+                    existing.source == promotion.source
+                    and existing.id == promotion.id
+                ):
+                    return False
             delay = 5.0
             if retry_after_seconds is not None:
                 delay = max(delay, min(self.retry_ttl_seconds, float(retry_after_seconds)))
@@ -1917,6 +1968,375 @@ class SQLiteStateStore:
             )
             return True
 
+    @staticmethod
+    def _gemini_metric_locked(
+        connection: sqlite3.Connection, name: str
+    ) -> None:
+        connection.execute(
+            "INSERT INTO gemini_local_metrics(name,value) VALUES(?,1) "
+            "ON CONFLICT(name) DO UPDATE SET value=value+1",
+            (name,),
+        )
+
+    @staticmethod
+    def _gemini_circuit_locked(
+        connection: sqlite3.Connection,
+        scope: str,
+        *,
+        now: float,
+        open_until: float,
+        reason: str,
+        half_open_probe: bool = False,
+        probe_started_at: float | None = None,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO gemini_circuit_state("
+            "scope,opened_at,open_until,reason,half_open_probe,probe_started_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
+            "opened_at=excluded.opened_at,open_until=excluded.open_until,"
+            "reason=excluded.reason,half_open_probe=excluded.half_open_probe,"
+            "probe_started_at=excluded.probe_started_at,updated_at=excluded.updated_at",
+            (
+                scope,
+                now,
+                max(now, open_until),
+                reason[:200],
+                int(half_open_probe),
+                probe_started_at,
+                now,
+            ),
+        )
+
+    def reserve_gemini_attempt(
+        self,
+        *,
+        quota_day: str,
+        reset_at: float,
+        model: str,
+        stage: str,
+        quota_stage: str,
+        daily_cap: int,
+        stage_cap: int | None,
+        rpm_cap: int,
+        now: float | None = None,
+    ) -> dict[str, object]:
+        """Atomically admit and account for one imminent provider HTTP attempt."""
+        if quota_stage not in {"evaluation", "preference", "presentation"}:
+            raise StoreError(f"invalid Gemini quota stage: {quota_stage}")
+        current = self.clock() if now is None else float(now)
+        stage_scope = f"stage:{quota_stage}"
+        with self._lock:
+            connection = self._begin()
+            try:
+                for scope, metric in (
+                    ("daily:project", "daily_circuit"),
+                    (stage_scope, f"{quota_stage}_circuit"),
+                ):
+                    row = connection.execute(
+                        "SELECT open_until,reason FROM gemini_circuit_state "
+                        "WHERE scope=?",
+                        (scope,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    open_until = float(row["open_until"])
+                    if open_until > current:
+                        self._gemini_metric_locked(connection, metric)
+                        connection.execute("COMMIT")
+                        return {
+                            "allowed": False,
+                            "kind": "daily",
+                            "scope": scope,
+                            "reason": str(row["reason"]),
+                            "retry_after_seconds": max(0.0, open_until - current),
+                            "reset_at": open_until,
+                        }
+                    connection.execute(
+                        "DELETE FROM gemini_circuit_state WHERE scope=?", (scope,)
+                    )
+
+                half_open_probe = False
+                temporary = connection.execute(
+                    "SELECT open_until,reason,half_open_probe,probe_started_at "
+                    "FROM gemini_circuit_state WHERE scope='temporary:project'"
+                ).fetchone()
+                if temporary is not None:
+                    open_until = float(temporary["open_until"])
+                    if open_until > current:
+                        self._gemini_metric_locked(
+                            connection, "temporary_circuit"
+                        )
+                        connection.execute("COMMIT")
+                        return {
+                            "allowed": False,
+                            "kind": "temporary",
+                            "scope": "temporary:project",
+                            "reason": str(temporary["reason"]),
+                            "retry_after_seconds": max(0.0, open_until - current),
+                            "reset_at": open_until,
+                        }
+                    probe_started = (
+                        float(temporary["probe_started_at"])
+                        if temporary["probe_started_at"] is not None
+                        else None
+                    )
+                    if (
+                        bool(temporary["half_open_probe"])
+                        and probe_started is not None
+                        and current - probe_started < 120
+                    ):
+                        delay = max(1.0, 120.0 - (current - probe_started))
+                        self._gemini_metric_locked(connection, "half_open_blocked")
+                        connection.execute("COMMIT")
+                        return {
+                            "allowed": False,
+                            "kind": "temporary",
+                            "scope": "temporary:project",
+                            "reason": "half_open_probe_in_progress",
+                            "retry_after_seconds": delay,
+                            "reset_at": current + delay,
+                        }
+                    connection.execute(
+                        "UPDATE gemini_circuit_state SET half_open_probe=1,"
+                        "probe_started_at=?,updated_at=? "
+                        "WHERE scope='temporary:project'",
+                        (current, current),
+                    )
+                    half_open_probe = True
+
+                daily_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM gemini_request_ledger WHERE quota_day=?",
+                        (quota_day,),
+                    ).fetchone()[0]
+                )
+                if daily_count >= daily_cap:
+                    self._gemini_circuit_locked(
+                        connection,
+                        "daily:project",
+                        now=current,
+                        open_until=reset_at,
+                        reason="local_daily_request_cap",
+                    )
+                    self._gemini_metric_locked(connection, "daily_budget")
+                    connection.execute("COMMIT")
+                    return {
+                        "allowed": False,
+                        "kind": "daily",
+                        "scope": "daily:project",
+                        "reason": "local_daily_request_cap",
+                        "retry_after_seconds": max(0.0, reset_at - current),
+                        "reset_at": reset_at,
+                    }
+
+                if stage_cap is not None:
+                    stage_count = int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM gemini_request_ledger "
+                            "WHERE quota_day=? AND quota_stage=?",
+                            (quota_day, quota_stage),
+                        ).fetchone()[0]
+                    )
+                    if stage_count >= stage_cap:
+                        self._gemini_circuit_locked(
+                            connection,
+                            stage_scope,
+                            now=current,
+                            open_until=reset_at,
+                            reason=f"local_{quota_stage}_request_cap",
+                        )
+                        self._gemini_metric_locked(
+                            connection, f"{quota_stage}_budget"
+                        )
+                        connection.execute("COMMIT")
+                        return {
+                            "allowed": False,
+                            "kind": "daily",
+                            "scope": stage_scope,
+                            "reason": f"local_{quota_stage}_request_cap",
+                            "retry_after_seconds": max(0.0, reset_at - current),
+                            "reset_at": reset_at,
+                        }
+
+                recent = connection.execute(
+                    "SELECT COUNT(*) AS count,MIN(reserved_at) AS oldest "
+                    "FROM gemini_request_ledger WHERE reserved_at>?",
+                    (current - 60.0,),
+                ).fetchone()
+                if int(recent["count"]) >= rpm_cap:
+                    oldest = float(recent["oldest"])
+                    retry_at = max(current + 0.001, oldest + 60.0)
+                    self._gemini_circuit_locked(
+                        connection,
+                        "temporary:project",
+                        now=current,
+                        open_until=retry_at,
+                        reason="local_rpm_cap",
+                    )
+                    self._gemini_metric_locked(connection, "rpm_budget")
+                    connection.execute("COMMIT")
+                    return {
+                        "allowed": False,
+                        "kind": "temporary",
+                        "scope": "temporary:project",
+                        "reason": "local_rpm_cap",
+                        "retry_after_seconds": max(0.001, retry_at - current),
+                        "reset_at": retry_at,
+                    }
+
+                cursor = connection.execute(
+                    "INSERT INTO gemini_request_ledger("
+                    "quota_day,reserved_at,model,stage,quota_stage,outcome"
+                    ") VALUES(?,?,?,?,?,'reserved')",
+                    (quota_day, current, model[:200], stage[:200], quota_stage),
+                )
+                reservation_id = int(cursor.lastrowid)
+                connection.execute("COMMIT")
+                return {
+                    "allowed": True,
+                    "reservation_id": reservation_id,
+                    "half_open_probe": half_open_probe,
+                }
+            except sqlite3.Error as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(
+                    f"cannot reserve Gemini request attempt: {exc}"
+                ) from exc
+
+    def complete_gemini_attempt(
+        self,
+        reservation_id: int,
+        *,
+        outcome: str,
+        http_status: int | None = None,
+        prompt_tokens: int | None = None,
+        output_tokens: int | None = None,
+        thinking_tokens: int | None = None,
+        total_tokens: int | None = None,
+        now: float | None = None,
+    ) -> None:
+        current = self.clock() if now is None else float(now)
+        with self._lock:
+            self._connection.execute(
+                "UPDATE gemini_request_ledger SET completed_at=?,outcome=?,"
+                "http_status=?,prompt_tokens=?,output_tokens=?,thinking_tokens=?,"
+                "total_tokens=? WHERE id=?",
+                (
+                    current,
+                    outcome[:100],
+                    http_status,
+                    prompt_tokens,
+                    output_tokens,
+                    thinking_tokens,
+                    total_tokens,
+                    int(reservation_id),
+                ),
+            )
+
+    def open_gemini_circuit(
+        self,
+        scope: str,
+        *,
+        open_until: float,
+        reason: str,
+        now: float | None = None,
+    ) -> None:
+        current = self.clock() if now is None else float(now)
+        with self._lock:
+            self._gemini_circuit_locked(
+                self._connection,
+                scope,
+                now=current,
+                open_until=open_until,
+                reason=reason,
+            )
+
+    def close_gemini_circuit(self, scope: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                "DELETE FROM gemini_circuit_state WHERE scope=?", (scope,)
+            )
+
+    def gemini_budget_status(
+        self,
+        *,
+        quota_day: str,
+        daily_cap: int,
+        evaluation_cap: int,
+        preference_cap: int,
+        now: float | None = None,
+    ) -> dict[str, object]:
+        current = self.clock() if now is None else float(now)
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT model,quota_stage,COUNT(*) AS attempts,"
+                "COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,"
+                "COALESCE(SUM(output_tokens),0) AS output_tokens,"
+                "COALESCE(SUM(thinking_tokens),0) AS thinking_tokens,"
+                "COALESCE(SUM(total_tokens),0) AS total_tokens "
+                "FROM gemini_request_ledger WHERE quota_day=? "
+                "GROUP BY model,quota_stage ORDER BY quota_stage,model",
+                (quota_day,),
+            ).fetchall()
+            circuits = [
+                {
+                    "scope": str(row["scope"]),
+                    "reason": str(row["reason"]),
+                    "reset_at": float(row["open_until"]),
+                    "half_open_probe": bool(row["half_open_probe"]),
+                }
+                for row in self._connection.execute(
+                    "SELECT scope,reason,open_until,half_open_probe "
+                    "FROM gemini_circuit_state WHERE open_until>? ORDER BY scope",
+                    (current,),
+                )
+            ]
+            prevented = {
+                str(row["name"]): int(row["value"])
+                for row in self._connection.execute(
+                    "SELECT name,value FROM gemini_local_metrics ORDER BY name"
+                )
+            }
+        usage = [
+            {
+                "model": str(row["model"]),
+                "stage": str(row["quota_stage"]),
+                "attempts": int(row["attempts"]),
+                "prompt_tokens": int(row["prompt_tokens"]),
+                "output_tokens": int(row["output_tokens"]),
+                "thinking_tokens": int(row["thinking_tokens"]),
+                "total_tokens": int(row["total_tokens"]),
+            }
+            for row in rows
+        ]
+        by_stage = {
+            stage: sum(
+                int(item["attempts"]) for item in usage if item["stage"] == stage
+            )
+            for stage in ("evaluation", "preference", "presentation")
+        }
+        total = sum(by_stage.values())
+        return {
+            "quota_day": quota_day,
+            "attempts": total,
+            "remaining": max(0, daily_cap - total),
+            "stage_remaining": {
+                "evaluation": max(0, evaluation_cap - by_stage["evaluation"]),
+                "preference": max(0, preference_cap - by_stage["preference"]),
+            },
+            "usage": usage,
+            "circuits": circuits,
+            "locally_prevented": prevented,
+        }
+
+    def retry_depth(self) -> int:
+        with self._lock:
+            return int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM retry_jobs"
+                ).fetchone()[0]
+            )
+
     def record_health(self, name: str, error: str | None = None) -> int:
         with self._lock:
             now = self.clock()
@@ -1985,6 +2405,9 @@ class SQLiteStateStore:
 
     def prune(self) -> dict[str, int]:
         cutoff = self.clock() - self.retention_days * 86_400
+        gemini_cutoff = (
+            self.clock() - self.gemini_ledger_retention_days * 86_400
+        )
         removed: dict[str, int] = {}
         with self._lock:
             connection = self._begin()
@@ -2008,6 +2431,13 @@ class SQLiteStateStore:
                     (cutoff,),
                 )
                 removed["presentation_cache"] = max(0, cursor.rowcount)
+                cursor = connection.execute(
+                    "DELETE FROM gemini_request_ledger WHERE id IN "
+                    "(SELECT id FROM gemini_request_ledger WHERE reserved_at<? "
+                    "ORDER BY reserved_at LIMIT 500)",
+                    (gemini_cutoff,),
+                )
+                removed["gemini_request_ledger"] = max(0, cursor.rowcount)
                 for table, column in (
                     ("seen_ids", "seen_at"),
                     ("seen_content", "seen_at"),

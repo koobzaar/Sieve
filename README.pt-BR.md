@@ -84,12 +84,14 @@ flowchart TD
     A -->|não| D
     A -->|sim| GA[Gemini para auditoria]
     GA -->|registrar rótulo, sem entregar| D
-    B -->|2 até menos de 7| G
+    B -->|2 até menos de 7| I{Interesse concreto?}
     B -->|7 ou mais| K{Gates determinísticos?}
-    K -->|não| G
+    K -->|não| I
     K -->|sim e shadow BM25| S[Marcar candidato]
-    S --> G
+    S --> I
     K -->|sim e live validado| O
+    I -->|não| D
+    I -->|sim| G
     G -->|forward| O
     G -->|discard| D
     O --> X[Outbox persistente por usuário]
@@ -111,18 +113,16 @@ Uma violação de preço identificada com segurança nunca é ignorada por uma o
 uma oferta excepcional parece relevante, mas não é possível comprovar um atributo obrigatório, ela
 vai ao Gemini em vez de ser descartada pelo BM25.
 
-A avaliação de promoções pelo Gemini é opcional, mas a apresentação segura por Gemini é obrigatória
-para toda promoção aceita. Com `pipeline.gemini_evaluation_enabled: false`, as mensagens de
-preferência em linguagem natural ainda usam Gemini, mas a decisão sobre promoções fica determinística. Somente ofertas excepcionais
+A avaliação de promoções pelo Gemini é opcional e a apresentação é determinística por padrão.
+Com `pipeline.gemini_evaluation_enabled: false`, as mensagens de preferência em linguagem natural
+ainda usam Gemini, mas a decisão sobre promoções fica determinística. Somente ofertas excepcionais
 comprovadas e candidatos acima do limiar superior do BM25, aprovados por todos os gates e em modo
 `live`, podem ser entregues. Casos intermediários ou incertos, corpus frio, rebuild de aliases,
 auditorias e retries pendentes são descartados sem chamar Gemini.
 
-Depois da aceitação, chamadas stateless separadas fazem extração, verificação independente contra
-envenenamento, localização por `ui_language` e reescrita do motivo por usuário. A extração agrupa
-até três ofertas distintas, preserva cupons alternativos por oferta e só pode selecionar IDs de
-URLs capturadas deterministicamente da mensagem; Gemini nunca cria ou reescreve links. O cartão
-pode exibir vários cupons verificados e até três botões de oferta. A mídia nunca é
+Depois da aceitação, o cartão é montado deterministicamente com os dados normalizados da promoção,
+incluindo preço e comentário enriquecidos do Pelando. Marcações hostis continuam como texto
+simples, e até três links capturados deterministicamente podem virar botões. A mídia nunca é
 enviada ao modelo: fotos do Telegram e imagens do Pelando são validadas, limitadas a 10 MB,
 armazenadas em `/state/media` e removidas quando todas as entregas terminam.
 
@@ -292,7 +292,7 @@ não autorizadas não consomem. O estado persiste após reinicializações.
 - Docker com Docker Compose, ou Python 3.12+;
 - credenciais de aplicativo do Telegram em [my.telegram.org](https://my.telegram.org);
 - um bot criado pelo BotFather e uma conversa privada já aberta com ele;
-- uma chave da API Gemini obrigatória, pois toda promoção aceita usa a apresentação isolada.
+- uma chave da API Gemini para avaliação e comandos de preferência em linguagem natural.
 
 O Sieve usa duas identidades diferentes:
 
@@ -384,6 +384,7 @@ antigas de proprietário/chat e o destino de chat no sink foram removidos e gera
 | `state` | caminho SQLite, retenção, corpus e tentativas |
 | `pipeline` | opção de avaliação Gemini, limiares e modo BM25, auditoria, perfil, aliases e regras |
 | `evaluator` | modelo Gemini, timeout e tentativas |
+| `gemini` | modelo/provedor, apresentação, limites diários por estágio e RPM, e retenção do ledger |
 | `preferences` | administrador, `max_users`, polling, confirmações, limites e parser |
 | `sink` | token do bot, API e timeout |
 | `sources` | origens Telegram/Pelando habilitadas e configurações |
@@ -429,8 +430,12 @@ pipeline:
 
 Desativar a avaliação troca o fallback do Gemini por descarte. A escala do BM25 não é universal;
 colecione evidências com replay e shadow e ajuste `bm25_auto_forward_threshold` manualmente antes de
-usar `live`. Desativar a avaliação não desativa a apresentação das promoções aceitas;
-`GEMINI_API_KEY` continua obrigatória.
+usar `live`. Promoções aceitas continuam usando apresentação determinística.
+
+Cada tentativa Gemini é serializada e persistida antes da requisição HTTP. Os padrões permitem 400
+tentativas por dia de cota do Pacífico, no máximo 350 avaliações e 25 chamadas de preferências, com
+limite móvel de cinco requisições por minuto. O esgotamento diário falha localmente até a próxima
+meia-noite do Pacífico e não aumenta a fila de retry.
 
 ## CLI
 

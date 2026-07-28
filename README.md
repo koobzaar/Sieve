@@ -54,11 +54,11 @@ Treat “graphics card” and “GPU” as the same thing
 Stop showing me perfume deals
 ```
 
-The point is cost and noise control. Most promotions never reach a Gemini presentation call: fixed spam checks and
+The point is cost and noise control. Most promotions never reach Gemini: fixed spam checks and
 prioritized, declarative hard rules reject unwanted categories; deduplication kills reposts; a
-rolling Okapi BM25 score against the profile kills weak lexical matches. Only what's left is sent
-to the configured evaluator, which returns a structured `forward` / `discard` decision. Every
-accepted promotion is then interpreted and rendered through the isolated Gemini card pipeline.
+rolling Okapi BM25 score kills weak lexical matches; and an alias-aware structured-interest gate
+rejects broad candidates. Only concrete interest matches are sent to the configured evaluator.
+Accepted promotions are rendered deterministically from normalized source data.
 
 It's designed to sit on a Raspberry Pi 4B (2 GB) indefinitely: one process, a bounded queue, a
 256 MB container cap, a 220 MB in-app tripwire that restarts before the OOM killer does, and a
@@ -101,33 +101,25 @@ flowchart TD
     AUDIT -->|no| X3[discard]
     AUDIT -->|yes| ALLM[Gemini audit]
     ALLM -->|record label, never deliver| X3
-    BM -->|2 &le; score &lt; 7| LLM
+    BM -->|2 &le; score &lt; 7| INT{Concrete interest match?}
     BM -->|score &ge; 7| GATE{Deterministic gates?}
-    GATE -->|no| LLM
+    GATE -->|no| INT
     GATE -->|yes + BM25 shadow| CAND[Mark candidate]
-    CAND --> LLM[Gemini structured decision]
+    CAND --> INT
     GATE -->|yes + validated live mode| DEL
+    INT -->|no| X4[discard: interest candidate miss]
+    INT -->|yes| LLM[Gemini structured decision]
 
     LLM -->|forward| DEL
-    LLM -->|discard| X4[discard]
+    LLM -->|discard| X4
     LLM -->|transient error| RQ[Retry queue<br/>100 items / 1h TTL]
     RQ --> LLM
 
     DEL --> OBOX[Persistent per-user outbox]
-    OBOX --> EXT[Untrusted-source extraction<br/><i>once per promotion</i>]
-    EXT --> VER[Independent grounding +<br/>poisoning verification]
-    VER --> LOC[Localization<br/><i>once per selected language</i>]
-    VER --> RR[Match-reason rewrite<br/><i>once per distinct reason/language</i>]
+    OBOX --> CARD[Deterministic normalized card<br/>plain text + UTF-16 entities]
     OBOX --> MEDIA[Media resolver<br/><i>never sent to Gemini</i>]
-    LOC --> CARD[Plain text + UTF-16 entities]
-    RR --> CARD
     MEDIA --> CARD
-    EXT -. unsafe / unavailable .-> SAFE[Original-content fallback]
-    VER -. unsafe / ungrounded .-> SAFE
-    LOC -. unavailable .-> SAFE
-    RR -. unavailable .-> SAFE
     CARD --> OUT[sendPhoto or sendMessage<br/><i>audible, localized delivery</i>]
-    SAFE --> OUT
 ```
 
 ### Stage notes
@@ -139,13 +131,14 @@ flowchart TD
 | **Constraints**        | Reliably matched interest price violations and excluded attributes are discarded before any exceptional bypass. Missing required attributes remain undecided. |
 | **Exceptional bypass** | Normally skips BM25 and the LLM. If a promotion may match an interest but its required attributes cannot be proven, it skips BM25 and goes to Gemini instead. |
 | **BM25**               | Weighted Okapi BM25 (`k1=1.2`, `b=0.75`) with lower `2.0` and experimental upper `7.0` routing thresholds. Importance `0–100` maps to `0.5×–1.5×`. BM25 fails open to Gemini during cold start and alias rebuilds. |
-| **Gemini evaluation**  | Optional structured decision before acceptance, minimal thinking, no conversation history, and bounded transient retries. |
-| **Gemini presentation** | Required after acceptance: separate stateless extraction, verification, per-language localization, and per-reason rewrite calls. Every call has its own static system instruction, strict schema, input/output bound, and independently versioned cache key. |
+| **Interest admission** | Gemini is called only after an alias-aware structured-interest match. At most five matching interests, applicable context, and aliases are sent in a 2,500-character context; unrelated profile content and enforced exclusions/rules are omitted. |
+| **Gemini evaluation**  | Optional structured decision before acceptance, minimal thinking, serialized requests, persisted Pacific-day/stage budgets, and at most two actual attempts for transport/5xx failures. A 429 is never retried immediately. |
+| **Presentation** | Deterministic by default from normalized promotion data, including enriched Pelando price/comment data. Telegram entities keep untrusted markup plain; the original safe fallback remains available. |
 | **Delivery**           | Per-user persistent outbox with restart recovery, still-image cards, bounded retries, visible permanent failures, and safe original-content fallback. Delivery is at least once, so an ambiguous timeout may rarely duplicate a notification rather than lose it. |
 
-Gemini promotion *evaluation* is optional; Gemini promotion *presentation* is mandatory for every
-accepted item. When `pipeline.gemini_evaluation_enabled` is `false`, natural-language preference
-messages can still use Gemini, but promotion decisions are deterministic.
+Gemini promotion evaluation is optional and presentation is deterministic by default. When
+`pipeline.gemini_evaluation_enabled` is `false`, natural-language preference messages can still
+use Gemini, but promotion decisions remain deterministic.
 Only proven exceptional deals and candidates above the configured BM25 auto-forward threshold
 that pass every gate in `live` mode can be delivered. Intermediate or uncertain candidates, cold
 corpus items, alias-rebuild items, audits, and pending evaluation retries are discarded without a
@@ -169,44 +162,21 @@ Gemini request.
   database errors, LLM outages and memory pressure. Pelando schema drift stays visible in structured
   logs and the persisted health snapshot without sending Telegram alerts.
 
-### Poisoning-resistant card pipeline
+### Deterministic card pipeline
 
-Gemini runs only after at least one user accepts a promotion. Presentation uses fresh
-`generateContent` requests with no chat history or accumulated promotions:
+Accepted promotions are rendered without Gemini. Sieve uses the normalized title and price, retains
+source text such as Pelando's publication comment, and creates buttons only from captured HTTP(S)
+URLs. Untrusted angle-bracket markup stays literal because Telegram formatting is expressed through
+explicit UTF-16 entities rather than a parsing mode.
 
-1. **Extraction, once per accepted promotion.** Only bounded, control-character-stripped source
-   title, description, stated price, and offer URL are marked as untrusted data. No user profile,
-   user/chat identifier, token, secret, Telegram markup, filesystem path, or prior promotion is
-   included. Every non-null fact carries exact source evidence.
-2. **Verification, once per accepted promotion.** A new request receives only that untrusted source
-   object and candidate extraction. It decides support and evidence validity field by field, detects
-   conflicting prices, and produces an independent injection/unsafe-instruction verdict.
-3. **Localization, once per selected language.** A new request receives verified canonical values
-   without source text or evidence. `ui_language` is normalized to `en` or `pt-BR` by the
-   application; source content cannot override it. Users sharing a language reuse the same validated
-   cache entry, while English and Brazilian Portuguese always use separate entries.
-4. **Reason rewrite, once per distinct reason and language.** A final bounded request receives only
-   the validated internal reason, selected language, and short verified product name. It returns one
-   plain sentence without internal terminology.
+Still images are resolved only after acceptance, validated, bounded to 10 MB, reference-counted
+under `/state/media`, and removed after every delivery finishes. If media resolution or a definite
+Telegram photo send fails, the same card is delivered as safe text. Oversized captions become a
+minimal caption plus bounded plain-text follow-ups.
 
-All four stages use separate strict schemas, static `systemInstruction` values, temperature zero,
-minimal thinking, per-stage input/output limits, and bounded retries. Unknown JSON keys, unsupported
-evidence, generated URLs/markup/commands/entities, unsafe control characters, and invalid enums are
-rejected in application code. Only validated typed objects are cached; keys include exact content or
-reason hashes, model, language where applicable, and independently configured prompt/schema
-versions. Failures and poisoning verdicts are never cached.
-
-Operational logs contain stage, latency, model, schema version, safe failure category, poisoning
-verdict, and provider token counts (`prompt`, visible output, thinking, and total) when returned.
-They never contain raw source text, prompts, responses, profiles, API keys, bot tokens, or user/chat
-identifiers.
-
-If extraction, verification, localization, reason rewriting, or media resolution fails, the accepted
-promotion is not discarded. Sieve sends the validated original still image when available, plain
-original source text with no parsing mode, and the source-provided HTTP(S) offer button. An oversized
-image caption becomes a minimal caption followed by one or more plain text messages. A definite
-Telegram media rejection is retried immediately as text; ambiguous transport and rate-limit failures
-retain the normal durable retry behavior.
+Optional Gemini presentation remains available behind `gemini.presentation_enabled`, but is off in
+the production configuration. Each enabled stage performs one validated logical request and falls
+back immediately on invalid output.
 
 ### The math
 
@@ -291,7 +261,7 @@ avoids treating missing information as evidence either way.
   the groups
 - A separate Telegram **bot** that already has an open private conversation with your account —
   this is what delivers
-- A Gemini API key — mandatory because every accepted promotion uses isolated Gemini presentation
+- A Gemini API key for evaluation and natural-language preference commands
 
 ### 1. Configure secrets
 
@@ -423,16 +393,16 @@ owner/chat keys, or sink chat destinations cause a clear validation error and mu
 | `state`     | `path`, `media_path` (`/state/media`), retention/corpus limits, and retry bounds                                             |
 | `pipeline`  | `gemini_evaluation_enabled`, BM25 thresholds/mode/audit parameters, profile, aliases and rules                         |
 | `evaluator` | Decision-evaluator factory and its decision-specific `max_output_tokens` override                                           |
-| `gemini`    | Shared required key env, model, provider URL, timeout, retries, thinking level, plus per-stage prompt/schema versions and input/output token bounds |
+| `gemini`    | Shared key/model/provider settings; presentation toggle; Pacific daily, evaluation, preference and RPM caps; ledger retention; optional presentation stage bounds |
 | `preferences` | enablement, admin Telegram user-ID env var, `max_users`, polling/queue limits, confirmation TTL, state caps, parser overrides |
 | `sink`      | `factory`, token env var, API URL, timeout                                                                                  |
 | `sources`   | list of `{name, factory, enabled, settings}`                                                                                |
 
 </details>
 
-The **profile** is a free-text paragraph describing what you want and what you don't. It's used two
-ways: tokenized into the BM25 query, and passed to Gemini as the judging criterion. Tuning it is
-most of the calibration work.
+The **profile** is imported as a baseline note and contributes BM25 terms. Gemini evaluation is
+admitted only by live structured interests and receives only the matching subset, not the complete
+profile.
 
 **Aliases** are bidirectional — `placa_video: ["gpu", "graphics card", "geforce", "radeon"]` means a
 listing mentioning any of those terms matches the profile's mention of any other.
@@ -456,8 +426,12 @@ pipeline:
 
 Disabling evaluation changes the fallback from Gemini to discard. BM25 has no universal score
 scale, so collect replay and shadow evidence and tune `bm25_auto_forward_threshold` manually before
-using `live`. Disabling decision evaluation does not disable accepted-promotion presentation, so
-`GEMINI_API_KEY` remains mandatory.
+using `live`. Accepted promotions still use deterministic presentation.
+
+Gemini attempts are serialized and persisted before each HTTP request. The defaults allow 400
+attempts per Pacific quota day, including at most 350 evaluations and 25 preference calls, with a
+five-request rolling minute limit. Daily exhaustion fails locally until the next Pacific midnight;
+it does not grow the retry backlog.
 
 ### Live preference commands
 
@@ -520,17 +494,14 @@ Gemini-backed mutations are limited persistently to five per minute and twenty p
 consume the limit, while queries and confirmations do not.
 
 Promotion notifications default to a still-image `sendPhoto` card and use `sendMessage` when no
-image is available. Sieve assembles plain caption text in application code and supplies explicit
-UTF-16 `bold`, `strikethrough`, `code`, and `blockquote` entities—Gemini never writes Telegram
-markup. The category chooses one restrained allowlisted emoji. Discount percentages are calculated
-locally from verified prices. Extraction groups up to three distinct offers, keeps alternative
-coupon codes attached to the correct offer, and refers only to URL candidates captured
-deterministically from the source. Sieve can therefore render several grounded coupons and up to
-three offer buttons without allowing Gemini to invent or rewrite a URL. Captions stay within 1,024
-characters by dropping highlights first, then seller and availability; product names, effective
-prices, coupons, and offer buttons are preserved.
+image is available. Sieve assembles the title, normalized Brazilian price, source description or
+publication comment, localized match reason, and captured offer URLs in application code. It uses
+explicit UTF-16 `bold` and `blockquote` entities instead of a Telegram parse mode, so hostile source
+markup stays literal and Gemini never writes notification text or links. Captions stay within
+Telegram's 1,024-character photo-caption limit, with a safe plain-text fallback when media or
+entity delivery fails.
 
-For example, this untrusted source promotion:
+For example, this source promotion:
 
 ```text
 Tênis Nike Court Lite 4 (38 a 44)
@@ -540,43 +511,19 @@ Loja Oficial Nike no ML
 menor preço histórico
 ```
 
-becomes this image card for a user whose selected language is Brazilian Portuguese:
+becomes a deterministic card for a user whose selected language is Brazilian Portuguese:
 
 ```text
-👟 Tênis Nike Court Lite 4
-Tamanhos 38 a 44
+🏷️ Tênis Nike Court Lite 4 (38 a 44)
+R$ 308,00
 
-R$ 308,00   R$ 589,00
-48% OFF · Menor preço histórico
-
-🎟️ Cupom
-PRAMODA
-Aplique no carrinho
-
-🏪 Loja Oficial Nike no ML
+De R$ 589 por R$ 308
+Use o Cupom: PRAMODA
+Loja Oficial Nike no ML
+menor preço histórico
 
 ▎Apareceu porque está no menor preço histórico.
 [Ver oferta]
-```
-
-The same accepted promotion for an English user reuses extraction and verification, but receives
-separate localized copy and reason:
-
-```text
-👟 Nike Court Lite 4 Shoes
-Sizes 38 to 44
-
-R$ 308.00   R$ 589.00
-48% OFF · Lowest historical price
-
-🎟️ Coupon
-PRAMODA
-Apply at checkout
-
-🏪 Loja Oficial Nike no ML
-
-▎It appeared because it is at its lowest historical price.
-[View offer]
 ```
 
 Cards never expose source names, raw/internal match reasons, stages, poisoning verdicts, or Gemini
@@ -695,8 +642,8 @@ promo_bot/
 ├── preference_interpreter.py # Gemini natural-language operation parser
 ├── preference_bot.py # authorized Telegram Bot API long polling and commands
 ├── telegram_smoke.py # dedicated-session, non-mutating live Telegram gate
-├── gemini.py         # shared structured-output REST client
-├── presentation.py   # isolated extraction/verification/localization/reason + media/cards
+├── gemini.py         # persisted request broker + structured-output REST client
+├── presentation.py   # deterministic/optional presentation + media/cards
 ├── protocols.py      # Source / Stage / Evaluator / Sink / Store interfaces
 ├── config.py         # YAML loading, factory resolution, env secrets
 ├── filters.py        # fixed spam checks and prioritized token-aware hard rules

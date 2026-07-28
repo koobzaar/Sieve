@@ -8,7 +8,13 @@ from typing import Any
 import httpx
 
 from .config import env_secret
-from .gemini import GeminiError, GeminiStructuredClient, RetryableGeminiError
+from .gemini import (
+    DailyGeminiBudgetExhausted,
+    GeminiError,
+    GeminiRequestBroker,
+    GeminiStructuredClient,
+    RetryableGeminiError,
+)
 from .models import Decision, Evaluation, Promotion
 from .telegram_formatter import normalize_ui_language
 
@@ -28,6 +34,13 @@ class RetryableEvaluationError(EvaluationError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class DailyBudgetEvaluationError(EvaluationError):
+    def __init__(self, message: str, *, reset_at: float, scope: str) -> None:
+        super().__init__(message)
+        self.reset_at = reset_at
+        self.scope = scope
+
+
 class GeminiEvaluator:
     def __init__(
         self,
@@ -43,6 +56,7 @@ class GeminiEvaluator:
         retries: int = 3,
         thinking_level: str = "minimal",
         client: httpx.AsyncClient | None = None,
+        broker: GeminiRequestBroker | None = None,
         random_source: Any | None = None,
         language_provider: Callable[[], str] | None = None,
     ) -> None:
@@ -57,6 +71,7 @@ class GeminiEvaluator:
             timeout_seconds=timeout_seconds,
             retries=retries,
             client=client,
+            broker=broker,
             random_source=random_source,
         )
 
@@ -78,11 +93,16 @@ class GeminiEvaluator:
             self.language_provider() if self.language_provider is not None else "en"
         )
         reason_language = "Brazilian Portuguese" if language == "pt-BR" else "English"
+        context = (
+            preference_context
+            if preference_context is not None
+            else self.profile
+        )[:2_500]
         prompt = (
-            "You evaluate promotions for one person. Use the complete preference profile below. "
-            "Return forward only when the offer concretely matches that profile. Write reason as "
+            "You evaluate promotions for one person. Use only the matched preference context below. "
+            "Return forward only when the offer concretely matches that context. Write reason as "
             f"one short plain-text sentence in {reason_language}.\n\n"
-            f"COMPLETE PROFILE:\n{preference_context if preference_context is not None else self.profile}\n\n"
+            f"MATCHED PREFERENCE CONTEXT:\n{context}\n\n"
             f"NORMALIZED PROMOTION:\n{normalized}\n\n"
             f"ESSENTIAL METADATA:\n{json.dumps(metadata, ensure_ascii=False)}"
         )
@@ -142,6 +162,12 @@ class GeminiEvaluator:
                 event_name="promotion_evaluation_request",
             )
             return self._parse(payload)
+        except DailyGeminiBudgetExhausted as exc:
+            raise DailyBudgetEvaluationError(
+                str(exc),
+                reset_at=exc.reset_at,
+                scope=exc.scope,
+            ) from exc
         except RetryableGeminiError as exc:
             raise RetryableEvaluationError(
                 str(exc),
@@ -159,6 +185,7 @@ def create_gemini_evaluator(
     *,
     profile: str,
     client: httpx.AsyncClient | None = None,
+    broker: GeminiRequestBroker | None = None,
 ) -> GeminiEvaluator:
     secret_name = str(settings.get("api_key_env", "GEMINI_API_KEY"))
     model = str(settings.get("model", "")).strip()
@@ -179,4 +206,5 @@ def create_gemini_evaluator(
         retries=int(settings.get("retries", 3)),
         thinking_level=str(settings.get("thinking_level", "minimal")),
         client=client,
+        broker=broker,
     )

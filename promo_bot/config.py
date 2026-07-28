@@ -229,6 +229,12 @@ def load_config(path: str | Path) -> AppConfig:
         "timeout_seconds": evaluator_settings.get("timeout_seconds", 20),
         "retries": evaluator_settings.get("retries", 3),
         "thinking_level": "minimal",
+        "presentation_enabled": False,
+        "daily_cap": 400,
+        "evaluation_cap": 350,
+        "preference_cap": 25,
+        "rpm_cap": 5,
+        "ledger_retention_days": 35,
         "stages": {},
         **gemini_raw,
     }
@@ -245,6 +251,33 @@ def load_config(path: str | Path) -> AppConfig:
         "low",
     }:
         raise ConfigurationError("gemini.thinking_level must be minimal or low")
+    gemini_settings["presentation_enabled"] = _boolean(
+        gemini_settings.get("presentation_enabled", False),
+        "gemini.presentation_enabled",
+    )
+    for key, minimum, maximum in (
+        ("daily_cap", 1, 500),
+        ("evaluation_cap", 1, 500),
+        ("preference_cap", 1, 500),
+        ("rpm_cap", 1, 60),
+        ("ledger_retention_days", 1, 365),
+    ):
+        try:
+            value = int(gemini_settings[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigurationError(f"gemini.{key} must be an integer") from exc
+        if not minimum <= value <= maximum:
+            raise ConfigurationError(
+                f"gemini.{key} must be between {minimum} and {maximum}"
+            )
+        gemini_settings[key] = value
+    reserved_stage_requests = (
+        gemini_settings["evaluation_cap"] + gemini_settings["preference_cap"]
+    )
+    if reserved_stage_requests > gemini_settings["daily_cap"]:
+        raise ConfigurationError(
+            "gemini evaluation and preference caps cannot exceed the daily cap"
+        )
     stage_defaults = {
         "extraction": (12_000, 900),
         "verification": (20_000, 700),

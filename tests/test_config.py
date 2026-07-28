@@ -108,6 +108,12 @@ def test_bm25_routing_defaults_and_validation(tmp_path) -> None:
     assert set(config.gemini["stages"]) == {
         "extraction", "verification", "localization", "reason"
     }
+    assert config.gemini["daily_cap"] == 400
+    assert config.gemini["evaluation_cap"] == 350
+    assert config.gemini["preference_cap"] == 25
+    assert config.gemini["rpm_cap"] == 5
+    assert config.gemini["ledger_retention_days"] == 35
+    assert config.gemini["presentation_enabled"] is False
     assert not hasattr(config, "mode")
 
     data["pipeline"]["bm25_auto_forward_threshold"] = 2.0
@@ -183,6 +189,8 @@ def test_tracked_config_is_complete_safe_and_valid() -> None:
     assert example.state_media_path == "/state/media"
     assert raw["gemini"]["api_key_env"] == "GEMINI_API_KEY"
     assert raw["gemini"]["thinking_level"] == "minimal"
+    assert raw["gemini"]["presentation_enabled"] is False
+    assert raw["gemini"]["daily_cap"] == 400
     assert all(
         raw["gemini"]["stages"][stage]["schema_version"]
         and raw["gemini"]["stages"][stage]["prompt_version"]

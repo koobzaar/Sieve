@@ -19,12 +19,15 @@ from promo_bot.preferences import (
     OperationAction,
     PreferenceClarificationContext,
     PreferenceError,
+    PreferenceEntry,
     PreferenceKind,
     PreferenceOperation,
     PreferenceProposal,
     PreferenceIntent,
     StaleRevisionError,
+    build_snapshot,
     evaluate_constraints,
+    evaluation_preference_context,
     explicit_exclusion_match,
     importance_multiplier,
     requires_confirmation,
@@ -846,3 +849,91 @@ def test_restore_creates_a_new_audited_revision_instead_of_deleting_history(tmp_
     ).fetchall()
     assert [tuple(row) for row in rows] == [(0, None, None), (1, 0, None), (2, 1, 0)]
     state.close()
+
+
+def test_constraint_matches_return_ids_and_context_is_ranked_bounded_and_minimal() -> None:
+    entries = [
+        PreferenceEntry(
+            "baseline",
+            PreferenceKind.BASELINE_NOTE,
+            {"text": "UNRELATED BASELINE PROFILE"},
+        ),
+        PreferenceEntry(
+            "exclude",
+            PreferenceKind.EXCLUSION,
+            {"terms": ["lottery"]},
+        ),
+        PreferenceEntry(
+            "context",
+            PreferenceKind.CONTEXT,
+            {"text": "Prefers local Brazilian retailers."},
+        ),
+        PreferenceEntry(
+            "alias",
+            PreferenceKind.ALIAS,
+            {"canonical": "armazenamento", "synonyms": ["ssd", "nvme"]},
+        ),
+        PreferenceEntry(
+            "hard",
+            PreferenceKind.HARD_RULE,
+            {
+                "rule_id": "deny_bet",
+                "priority": 100,
+                "action": "deny",
+                "any": ["bet"],
+                "all": [],
+            },
+        ),
+    ]
+    for index, (importance, terms) in enumerate(
+        (
+            (95, ["ssd"]),
+            (90, ["ssd nvme"]),
+            (90, ["ssd"]),
+            (80, ["armazenamento"]),
+            (70, ["nvme"]),
+            (60, ["ssd"]),
+            (50, ["ssd"]),
+        ),
+        start=1,
+    ):
+        entries.append(
+            PreferenceEntry(
+                f"interest-{index}",
+                PreferenceKind.INTEREST,
+                {
+                    "name": f"Interest {index}",
+                    "importance": importance,
+                    "search_terms": terms,
+                    "constraints": {},
+                },
+            )
+        )
+    snapshot = build_snapshot(1, entries)
+    normalized = "ssd nvme 1tb armazenamento"
+    result = evaluate_constraints(
+        Promotion(id="one", source="x", title="SSD NVMe 1TB"),
+        normalized,
+        snapshot.constraints,
+        snapshot.aliases,
+    )
+
+    assert result.may_match_interest
+    assert result.matched_interest_ids == tuple(
+        f"interest-{index}" for index in range(1, 8)
+    )
+    context = evaluation_preference_context(
+        snapshot,
+        normalized,
+        result.matched_interest_ids,
+    )
+    assert len(context) <= 2_500
+    positions = [context.index(f'"id":"interest-{index}"') for index in range(1, 6)]
+    assert positions == sorted(positions)
+    assert '"id":"interest-6"' not in context
+    assert '"id":"interest-7"' not in context
+    assert "Prefers local Brazilian retailers." in context
+    assert "armazenamento: ssd, nvme" in context
+    assert "UNRELATED BASELINE PROFILE" not in context
+    assert "lottery" not in context
+    assert "deny_bet" not in context
