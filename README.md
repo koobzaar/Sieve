@@ -127,7 +127,7 @@ flowchart TD
 | Stage                  | Behaviour                                                                                                                                                                                                                                                                                                                              |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Spam / exclusions / hard rules** | Fixed spam checks run first, followed by live explicit exclusions. Ordered, token-aware `allow`/`deny` rules use the first matching priority, so narrow exceptions can precede broader category denials. |
-| **Deduplication**      | Global native replay protection plus per-user, cross-group URL/product fingerprints persisted for 24 hours. |
+| **Deduplication**      | Global native replay protection plus per-user, cross-source URL/product fingerprints for 10 minutes. Equal or higher-priced reposts are suppressed; a lower price becomes the new minimum to beat. |
 | **Constraints**        | Reliably matched interest price violations and excluded attributes are discarded before any exceptional bypass. Missing required attributes remain undecided. |
 | **Exceptional bypass** | Normally skips BM25 and the LLM. If a promotion may match an interest but its required attributes cannot be proven, it skips BM25 and goes to Gemini instead. |
 | **BM25**               | Weighted Okapi BM25 (`k1=1.2`, `b=0.75`) with lower `2.0` and experimental upper `7.0` routing thresholds. Importance `0–100` maps to `0.5×–1.5×`. BM25 fails open to Gemini during cold start and alias rebuilds. |
@@ -287,7 +287,7 @@ GEMINI_API_KEY=
 > `config/config.yaml` is complete and contains no secrets; secrets are resolved from environment
 > variable names.
 
-Edit `config/config.yaml`: set your profile, aliases and hard rules; add Telegram `chat_ids`;
+Edit `config/config.yaml`: set your profile, aliases and hard rules; optionally add initial Telegram `chat_ids`;
 set `preferences.admin_telegram_user_id_env`; and explicitly set `enabled: true` only for the sources,
 Gemini evaluation and preference bot integrations you intend to run. The tracked config starts
 with every external integration disabled.
@@ -302,8 +302,9 @@ docker compose run --rm sieve \
 ```
 
 Scan the terminal QR code from Telegram's **Settings → Devices → Link Desktop Device**. Enter only
-your 2FA password if Telegram requests it. Then set the source's numeric `chat_ids` and `enabled:
-true` in `config/config.yaml`.
+your 2FA password if Telegram requests it. Then set the source to `enabled: true` in
+`config/config.yaml`. Its `chat_ids` are only a one-time bootstrap for a fresh SQLite database;
+they may be empty when groups will be selected from the administrator's **Groups** menu.
 
 ### 3. Validate and run
 
@@ -341,7 +342,7 @@ All sources are disabled in the tracked configuration. Enable only the adapters 
 
 | Source | Coverage | Default | Required settings |
 | --- | --- | --- | --- |
-| Telegram groups/channels | Any groups or channels accessible to your Telegram user account | Disabled | Telethon API credentials, a persisted user session, and `chat_ids` |
+| Telegram groups/channels | Any groups or channels accessible to your Telegram user account | Disabled | Telethon API credentials and a persisted user session; optional bootstrap `chat_ids` |
 | [Pelando `/recentes`](https://www.pelando.com.br/recentes) | Brazil-focused deal website | Disabled | No account; optional polling interval, timeout, and user agent |
 
 Enable or disable each source independently in `config/config.yaml`:
@@ -361,6 +362,13 @@ At least one source must be enabled before `run`. To add another website, implem
 `PromotionSource` protocol and a factory that accepts the configured settings, `name`, shared HTTP
 client, and health reporter; then reference it with a `module:factory` path under `sources`. The
 pipeline does not need source-specific changes.
+
+For each Telegram source, YAML `chat_ids` are imported as enabled groups only the first time that
+source is seen in a fresh database. SQLite is authoritative afterward: disabling a group in the
+administrator-only **Groups** menu survives restarts and later YAML changes. The Telethon account
+refreshes its visible groups/channels into that menu; newly discovered dialogs remain disabled
+until selected. Zero enabled groups is valid—the account stays connected for discovery but emits
+no promotions.
 
 ---
 

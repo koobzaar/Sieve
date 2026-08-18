@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS user_delivery_settings (
         CHECK(exceptional_offers_enabled IN (0,1)),
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telegram_source_seeds (
+    source TEXT PRIMARY KEY,
+    seeded_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS telegram_source_dialogs (
+    source TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    dialog_type TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    discovered_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (source, chat_id)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_source_dialogs_enabled
+    ON telegram_source_dialogs(source, enabled, title, chat_id);
 CREATE TRIGGER IF NOT EXISTS users_id_immutable
 BEFORE UPDATE OF id ON users
 BEGIN
@@ -675,6 +691,176 @@ class SQLiteStateStore:
                 raise StoreError(
                     f"cannot update exceptional-offer setting: {exc}"
                 ) from exc
+
+    def seed_telegram_groups(
+        self, source: str, chat_ids: Sequence[int]
+    ) -> bool:
+        """Import configured chat IDs once, leaving SQLite authoritative afterward."""
+        source = str(source).strip()
+        if not source:
+            raise StoreError("Telegram source name must be nonempty")
+        try:
+            normalized_ids = tuple(
+                dict.fromkeys(int(chat_id) for chat_id in chat_ids)
+            )
+        except (TypeError, ValueError) as exc:
+            raise StoreError("Telegram chat IDs must be integers") from exc
+        with self._lock:
+            connection = self._begin()
+            try:
+                seeded = connection.execute(
+                    "SELECT 1 FROM telegram_source_seeds WHERE source=?",
+                    (source,),
+                ).fetchone()
+                if seeded is not None:
+                    connection.execute("COMMIT")
+                    return False
+                now = self.clock()
+                connection.executemany(
+                    "INSERT INTO telegram_source_dialogs("
+                    "source,chat_id,title,dialog_type,enabled,discovered_at,updated_at) "
+                    "VALUES(?,?,?,'configured',1,?,?) "
+                    "ON CONFLICT(source,chat_id) DO NOTHING",
+                    (
+                        (source, chat_id, str(chat_id), now, now)
+                        for chat_id in normalized_ids
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO telegram_source_seeds(source,seeded_at) VALUES(?,?)",
+                    (source, now),
+                )
+                connection.execute("COMMIT")
+                return True
+            except sqlite3.Error as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(f"cannot seed Telegram groups: {exc}") from exc
+
+    def upsert_telegram_dialogs(
+        self, source: str, dialogs: Sequence[Mapping[str, object]]
+    ) -> int:
+        """Cache discovered group/channel metadata without enabling new dialogs."""
+        source = str(source).strip()
+        if not source:
+            raise StoreError("Telegram source name must be nonempty")
+        normalized: list[tuple[int, str, str]] = []
+        try:
+            for dialog in dialogs:
+                chat_id = int(dialog["chat_id"])
+                title = str(dialog.get("title", "")).strip() or str(chat_id)
+                dialog_type = (
+                    str(dialog.get("dialog_type", "")).strip() or "group"
+                )
+                normalized.append((chat_id, title[:500], dialog_type[:50]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise StoreError("invalid Telegram dialog metadata") from exc
+        now = self.clock()
+        with self._lock:
+            connection = self._begin()
+            try:
+                for chat_id, title, dialog_type in normalized:
+                    connection.execute(
+                        "INSERT INTO telegram_source_dialogs("
+                        "source,chat_id,title,dialog_type,enabled,discovered_at,updated_at) "
+                        "VALUES(?,?,?,?,0,?,?) ON CONFLICT(source,chat_id) DO UPDATE SET "
+                        "title=excluded.title,dialog_type=excluded.dialog_type,"
+                        "updated_at=excluded.updated_at",
+                        (source, chat_id, title, dialog_type, now, now),
+                    )
+                connection.execute("COMMIT")
+                return len(normalized)
+            except sqlite3.Error as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(f"cannot cache Telegram dialogs: {exc}") from exc
+
+    def list_telegram_dialogs(
+        self, source: str | None = None, *, enabled_only: bool = False
+    ) -> list[dict[str, object]]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if source is not None:
+            clauses.append("source=?")
+            parameters.append(str(source))
+        if enabled_only:
+            clauses.append("enabled=1")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT source,chat_id,title,dialog_type,enabled,"
+                "discovered_at,updated_at FROM telegram_source_dialogs"
+                + where
+                + " ORDER BY source,title COLLATE NOCASE,chat_id",
+                tuple(parameters),
+            ).fetchall()
+        return [
+            {
+                "source": str(row["source"]),
+                "chat_id": int(row["chat_id"]),
+                "title": str(row["title"]),
+                "dialog_type": str(row["dialog_type"]),
+                "enabled": bool(row["enabled"]),
+                "discovered_at": float(row["discovered_at"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def enabled_telegram_chat_ids(self, source: str) -> set[int]:
+        return {
+            int(dialog["chat_id"])
+            for dialog in self.list_telegram_dialogs(
+                source, enabled_only=True
+            )
+        }
+
+    def set_telegram_dialog_enabled(
+        self,
+        actor_id: str,
+        source: str,
+        chat_id: int,
+        enabled: bool,
+    ) -> dict[str, object]:
+        with self._lock:
+            connection = self._begin()
+            try:
+                self._require_admin_locked(connection, actor_id)
+                changed = connection.execute(
+                    "UPDATE telegram_source_dialogs SET enabled=?,updated_at=? "
+                    "WHERE source=? AND chat_id=?",
+                    (
+                        int(bool(enabled)),
+                        self.clock(),
+                        str(source),
+                        int(chat_id),
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise StoreError("unknown Telegram source dialog")
+                row = connection.execute(
+                    "SELECT source,chat_id,title,dialog_type,enabled,"
+                    "discovered_at,updated_at FROM telegram_source_dialogs "
+                    "WHERE source=? AND chat_id=?",
+                    (str(source), int(chat_id)),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except (MembershipError, StoreError):
+                connection.execute("ROLLBACK")
+                raise
+            except (TypeError, ValueError, sqlite3.Error) as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(
+                    f"cannot update Telegram source dialog: {exc}"
+                ) from exc
+        assert row is not None
+        return {
+            "source": str(row["source"]),
+            "chat_id": int(row["chat_id"]),
+            "title": str(row["title"]),
+            "dialog_type": str(row["dialog_type"]),
+            "enabled": bool(row["enabled"]),
+            "discovered_at": float(row["discovered_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
 
     @staticmethod
     def _invitation_hash(token: str) -> str:

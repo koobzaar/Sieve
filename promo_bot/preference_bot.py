@@ -30,7 +30,7 @@ from .preferences import (
     requires_confirmation,
 )
 from .protocols import PreferenceInterpreter
-from .telegram_formatter import TelegramFormatter
+from .telegram_formatter import TelegramFormatter, telegram_source_token
 from .tenancy import InvitationError, MembershipError, UnauthorizedMembershipError, User
 from .translation import translations
 
@@ -319,6 +319,7 @@ class PreferenceCommandProcessor:
         account: User | None = None,
         membership_state: Any | None = None,
         ephemeral_replies: list[OutboxReply] | None = None,
+        telegram_sources: Mapping[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.interpreter = interpreter
@@ -330,6 +331,7 @@ class PreferenceCommandProcessor:
         self.account = account
         self.membership_state = membership_state
         self.ephemeral_replies = ephemeral_replies
+        self.telegram_sources = dict(telegram_sources or {})
         self.account_id = account.id if account is not None else store.user_id
         self.account_role = (
             account.role
@@ -345,6 +347,11 @@ class PreferenceCommandProcessor:
         )
         self.delivery_state = membership_state or getattr(
             store, "delivery_state", None
+        )
+        self.can_admin_groups = (
+            self.is_admin
+            and self.membership_state is not None
+            and hasattr(self.membership_state, "list_telegram_dialogs")
         )
 
     @staticmethod
@@ -471,6 +478,20 @@ class PreferenceCommandProcessor:
 
     def _history_text(self, actor_id: int) -> str:
         return self._ui(actor_id).history(self.store.history(10), self.zone)
+
+    def _groups_screen(
+        self,
+        actor_id: int,
+        page: int = 1,
+        *,
+        refresh_state: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        ui = self._ui(actor_id)
+        dialogs = self.membership_state.list_telegram_dialogs()
+        text, page, pages = ui.groups(
+            dialogs, page, refresh_state=refresh_state
+        )
+        return text, ui.groups_markup(dialogs, page, pages)
 
     def _record_reply(
         self,
@@ -1090,8 +1111,110 @@ class PreferenceCommandProcessor:
             )
             return
 
+        groups_page_match = re.fullmatch(r"pref:groups:(\d+)", text.casefold())
+        groups_refresh_match = re.fullmatch(
+            r"pref:groups:refresh:(\d+)", text.casefold()
+        )
+        group_toggle_match = re.fullmatch(
+            r"pref:group:(enable|disable):([0-9a-f]{8}):(-?\d+):(\d+)",
+            text.casefold(),
+        )
+        if groups_page_match or groups_refresh_match or group_toggle_match:
+            if not self.can_admin_groups:
+                self._record_reply(
+                    update_id,
+                    actor_id,
+                    text,
+                    "admin_required",
+                    ui.notice_key("admin_required"),
+                    callback_query_id=callback_query_id,
+                    reply_markup=ui.menu_markup(screen="groups"),
+                    operation="edit",
+                    target_message_id=target_message_id,
+                )
+                return
+            page = int(
+                (groups_page_match or groups_refresh_match).group(1)
+                if group_toggle_match is None
+                else group_toggle_match.group(4)
+            )
+            outcome = "groups"
+            refresh_state = None
+            if groups_refresh_match:
+                failures = 0
+                for source in self.telegram_sources.values():
+                    try:
+                        await source.discover_dialogs()
+                    except Exception as exc:
+                        failures += 1
+                        logger.warning(
+                            "telegram_dialog_menu_refresh_failed",
+                            extra={
+                                "event": "telegram_dialog_menu_refresh_failed",
+                                "source": getattr(source, "name", "telegram"),
+                                "error_type": type(exc).__name__,
+                                "error": str(exc)[:500],
+                            },
+                        )
+                refresh_state = (
+                    "refreshed"
+                    if self.telegram_sources and failures == 0
+                    else "unavailable"
+                )
+                outcome = f"groups_refresh_{refresh_state}"
+            elif group_toggle_match:
+                action, source_token, chat_id_text, _ = (
+                    group_toggle_match.groups()
+                )
+                chat_id = int(chat_id_text)
+                source_name = next(
+                    (
+                        str(dialog["source"])
+                        for dialog in self.membership_state.list_telegram_dialogs()
+                        if int(dialog["chat_id"]) == chat_id
+                        and telegram_source_token(str(dialog["source"]))
+                        == source_token
+                    ),
+                    None,
+                )
+                if source_name is None:
+                    self._record_reply(
+                        update_id,
+                        actor_id,
+                        text,
+                        "groups_error",
+                        ui.notice_key("membership_error"),
+                        callback_query_id=callback_query_id,
+                        reply_markup=ui.menu_markup(screen="groups"),
+                        operation="edit",
+                        target_message_id=target_message_id,
+                    )
+                    return
+                self.membership_state.set_telegram_dialog_enabled(
+                    self.account_id,
+                    source_name,
+                    chat_id,
+                    action == "enable",
+                )
+                outcome = f"group_{action}d"
+            rendered, markup = self._groups_screen(
+                actor_id, page, refresh_state=refresh_state
+            )
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                outcome,
+                rendered,
+                callback_query_id=callback_query_id,
+                reply_markup=markup,
+                operation="edit",
+                target_message_id=target_message_id,
+            )
+            return
+
         menu_match = re.fullmatch(
-            r"pref:menu:(home|preferences|history|help|language|account|members|offer_settings)",
+            r"pref:menu:(home|preferences|history|help|language|account|members|offer_settings|groups)",
             text.casefold(),
         )
         if menu_match:
@@ -1129,6 +1252,14 @@ class PreferenceCommandProcessor:
                 )
                 rendered = ui.offer_settings(enabled)
                 markup = ui.offer_settings_markup(enabled)
+            elif (
+                destination == "groups"
+                and self.can_admin_groups
+            ):
+                rendered, markup = self._groups_screen(actor_id)
+            elif destination == "groups":
+                rendered = ui.notice_key("admin_required")
+                markup = ui.menu_markup(screen="groups")
             elif (
                 destination == "members"
                 and self.can_admin_members
@@ -1424,6 +1555,7 @@ class MultiUserCommandProcessor:
         max_users: int = 10,
         rate_per_minute: int = 5,
         rate_per_hour: int = 20,
+        telegram_sources: Mapping[str, Any] | None = None,
     ) -> None:
         self.state = state
         self.interpreter = interpreter
@@ -1431,6 +1563,7 @@ class MultiUserCommandProcessor:
         self.max_users = max_users
         self.rate_per_minute = rate_per_minute
         self.rate_per_hour = rate_per_hour
+        self.telegram_sources = dict(telegram_sources or {})
         admin = state.user_by_id(admin_store.user_id)
         if admin is None or admin.role != "admin":
             raise ValueError("admin_store must belong to the administrator")
@@ -1528,6 +1661,7 @@ class MultiUserCommandProcessor:
                 account=user,
                 membership_state=self.state,
                 ephemeral_replies=self.ephemeral_replies,
+                telegram_sources=self.telegram_sources,
             )
             self._processors[user.id] = processor
         return processor

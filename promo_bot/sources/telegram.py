@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import re
 from datetime import timezone
 from pathlib import Path
@@ -13,6 +15,7 @@ from ..protocols import PromotionEmitter
 from .pelando import HealthReporter
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
 
 def promotion_from_telethon_event(event: Any, *, source_name: str = "telegram") -> Promotion:
@@ -71,6 +74,7 @@ class TelegramSource:
         name: str = "telegram",
         health_reporter: HealthReporter | None = None,
         client: Any | None = None,
+        state_store: Any | None = None,
     ) -> None:
         self.name = name
         self.api_id = api_id
@@ -79,7 +83,12 @@ class TelegramSource:
         self.chat_ids = chat_ids
         self.health_reporter = health_reporter
         self.client = client
+        self.state_store = state_store
         self._handler_registered = False
+        self._discovery_complete = False
+        self._discovery_lock = asyncio.Lock()
+        if self.state_store is not None:
+            self.state_store.seed_telegram_groups(self.name, self.chat_ids)
 
     def _build_client(self) -> Any:
         from telethon import TelegramClient
@@ -98,15 +107,78 @@ class TelegramSource:
         if self.health_reporter:
             await self.health_reporter(self.name, error)
 
+    def _chat_enabled(self, chat_id: object) -> bool:
+        try:
+            resolved = int(chat_id)
+        except (TypeError, ValueError):
+            return False
+        if self.state_store is None:
+            return resolved in self.chat_ids
+        return resolved in self.state_store.enabled_telegram_chat_ids(self.name)
+
+    async def discover_dialogs(self) -> list[dict[str, object]]:
+        """Refresh visible groups/channels, leaving newly found dialogs disabled."""
+        if self.state_store is None:
+            return []
+        async with self._discovery_lock:
+            self.client = self.client or self._build_client()
+            is_connected = getattr(self.client, "is_connected", None)
+            connected = is_connected() if callable(is_connected) else True
+            if inspect.isawaitable(connected):
+                connected = await connected
+            if not connected:
+                await self.client.connect()
+            if not await self.client.is_user_authorized():
+                raise RuntimeError(
+                    "Telethon session is not authorized; run sieve auth-telegram"
+                )
+            dialogs = await self.client.get_dialogs()
+            discovered: list[dict[str, object]] = []
+            for dialog in dialogs:
+                if bool(getattr(dialog, "is_user", False)):
+                    continue
+                is_group = bool(getattr(dialog, "is_group", False))
+                is_channel = bool(getattr(dialog, "is_channel", False))
+                if not is_group and not is_channel:
+                    continue
+                entity = getattr(dialog, "entity", None)
+                if bool(getattr(entity, "megagroup", False)):
+                    dialog_type = "megagroup"
+                elif is_channel:
+                    dialog_type = "channel"
+                else:
+                    dialog_type = "group"
+                chat_id = int(getattr(dialog, "id"))
+                title = str(
+                    getattr(dialog, "name", None)
+                    or getattr(entity, "title", None)
+                    or chat_id
+                )
+                discovered.append(
+                    {
+                        "chat_id": chat_id,
+                        "title": title,
+                        "dialog_type": dialog_type,
+                    }
+                )
+            self.state_store.upsert_telegram_dialogs(self.name, discovered)
+            self._discovery_complete = True
+            return self.state_store.list_telegram_dialogs(self.name)
+
     async def run(self, emit: PromotionEmitter, stop: asyncio.Event) -> None:
         from telethon import events
 
         self.client = self.client or self._build_client()
         if not self._handler_registered:
             async def handler(event: Any) -> None:
+                chat_id = getattr(event, "chat_id", None) or getattr(
+                    getattr(event, "message", None), "chat_id", None
+                )
+                if not self._chat_enabled(chat_id):
+                    return
                 await emit(promotion_from_telethon_event(event, source_name=self.name))
 
-            self.client.add_event_handler(handler, events.NewMessage(chats=self.chat_ids))
+            self.client.add_event_handler(handler, events.NewMessage())
             self._handler_registered = True
 
         failures = 0
@@ -117,6 +189,19 @@ class TelegramSource:
                     raise RuntimeError(
                         "Telethon session is not authorized; run sieve auth-telegram"
                     )
+                if not self._discovery_complete and self.state_store is not None:
+                    try:
+                        await self.discover_dialogs()
+                    except Exception as exc:
+                        logger.warning(
+                            "telegram_dialog_discovery_failed",
+                            extra={
+                                "event": "telegram_dialog_discovery_failed",
+                                "source": self.name,
+                                "error_type": type(exc).__name__,
+                                "error": str(exc)[:500],
+                            },
+                        )
                 failures = 0
                 await self._health(None)
                 stop_task = asyncio.create_task(stop.wait())
@@ -150,13 +235,12 @@ def create_telegram_source(
     name: str = "telegram",
     client: Any | None = None,
     health_reporter: HealthReporter | None = None,
+    state_store: Any | None = None,
     **_: Any,
 ) -> TelegramSource:
     api_id = int(env_secret(str(settings.get("api_id_env", "TELEGRAM_API_ID"))))
     api_hash = env_secret(str(settings.get("api_hash_env", "TELEGRAM_API_HASH")))
     chat_ids = [int(value) for value in settings.get("chat_ids", [])]
-    if not chat_ids:
-        raise ValueError(f"Telegram source {name} needs at least one numeric chat ID")
     return TelegramSource(
         api_id=api_id,
         api_hash=api_hash,
@@ -165,4 +249,5 @@ def create_telegram_source(
         name=name,
         health_reporter=health_reporter,
         client=client,
+        state_store=state_store,
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import signal
 import time
@@ -196,6 +197,26 @@ class Service:
         self.preference_interpreter = None
         self.preference_bot = None
         self.preference_owner_id: int | None = administrator.telegram_user_id
+        self.sources = []
+        for item in config.sources:
+            if not item.enabled:
+                continue
+            factory = load_factory(item.factory)
+            parameters = inspect.signature(factory).parameters
+            keyword_arguments: dict[str, Any] = {
+                "name": item.name,
+                "http_client": self.http,
+                "health_reporter": self.report_health,
+            }
+            if "state_store" in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                keyword_arguments["state_store"] = self.store
+            self.sources.append(factory(item.settings, **keyword_arguments))
+        self.media_resolver.set_telegram_sources(
+            {source.name: source for source in self.sources if hasattr(source, "name")}
+        )
         if preference_settings.enabled:
             def language_provider() -> str:
                 return self.preference_store.ui_language(
@@ -228,6 +249,11 @@ class Service:
                 max_users=preference_settings.max_users,
                 rate_per_minute=preference_settings.rate_per_minute,
                 rate_per_hour=preference_settings.rate_per_hour,
+                telegram_sources={
+                    source.name: source
+                    for source in self.sources
+                    if hasattr(source, "discover_dialogs")
+                },
             )
             self.preference_bot = TelegramPreferenceBot(
                 api=bot_api,
@@ -237,19 +263,6 @@ class Service:
                 polling_timeout=preference_settings.polling_timeout,
                 queue_capacity=preference_settings.queue_capacity,
             )
-        self.sources = [
-            load_factory(item.factory)(
-                item.settings,
-                name=item.name,
-                http_client=self.http,
-                health_reporter=self.report_health,
-            )
-            for item in config.sources
-            if item.enabled
-        ]
-        self.media_resolver.set_telegram_sources(
-            {source.name: source for source in self.sources if hasattr(source, "name")}
-        )
 
     def _preference_snapshot_changed(
         self,

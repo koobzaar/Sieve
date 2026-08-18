@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import math
 import re
 from datetime import datetime
@@ -37,10 +38,15 @@ def _button(text: str, callback_data: str) -> dict[str, str]:
     return {"text": text, "callback_data": callback_data}
 
 
+def telegram_source_token(source: str) -> str:
+    return hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:8]
+
+
 class TelegramFormatter:
     """Safe HTML presentation and localized Telegram-native navigation."""
 
     preference_page_size = 5
+    group_page_size = 5
 
     def __init__(self, language: str | None = "en") -> None:
         self.language = normalize_ui_language(language)
@@ -124,7 +130,11 @@ class TelegramFormatter:
         ]
         if is_admin:
             rows.insert(
-                2, [_button(self.t("button.members"), "pref:menu:members")]
+                2,
+                [
+                    _button(self.t("button.members"), "pref:menu:members"),
+                    _button(self.t("button.groups"), "pref:menu:groups"),
+                ],
             )
         return {"inline_keyboard": rows}
 
@@ -564,6 +574,96 @@ class TelegramFormatter:
             )
         rows.append(
             [_button(self.t("button.home"), "pref:menu:home")]
+        )
+        return {"inline_keyboard": rows}
+
+    def groups(
+        self,
+        dialogs: Sequence[Mapping[str, Any]],
+        page: int = 1,
+        *,
+        refresh_state: str | None = None,
+    ) -> tuple[str, int, int]:
+        total_pages = max(1, math.ceil(len(dialogs) / self.group_page_size))
+        page = max(1, min(int(page), total_pages))
+        start = (page - 1) * self.group_page_size
+        visible = dialogs[start : start + self.group_page_size]
+        lines = [
+            f"<b>{self.t('groups.title')}</b>",
+            "",
+            self.t("groups.summary", count=len(dialogs)),
+            self.t("groups.body"),
+        ]
+        if refresh_state in {"refreshed", "unavailable"}:
+            lines.extend(["", self.t(f"groups.refresh.{refresh_state}")])
+        lines.append("")
+        if not visible:
+            lines.extend([self.t("groups.empty"), ""])
+        for dialog in visible:
+            type_key = f"dialog_type.{dialog['dialog_type']}"
+            dialog_type = (
+                self.t(type_key)
+                if type_key in translations.catalogs[self.language]
+                else str(dialog["dialog_type"])
+            )
+            status = self.t(
+                "status.active" if dialog["enabled"] else "status.disabled"
+            )
+            lines.extend(
+                [
+                    f"<b>{_clean(dialog['title'], 180)}</b>",
+                    self.t(
+                        "groups.item",
+                        source=_clean(dialog["source"], 80),
+                        dialog_type=_clean(dialog_type, 80),
+                        status=_clean(status, 80),
+                        chat_id=_clean(dialog["chat_id"], 40),
+                    ),
+                    "",
+                ]
+            )
+        return self._rendered("groups", "\n".join(lines)), page, total_pages
+
+    def groups_markup(
+        self,
+        dialogs: Sequence[Mapping[str, Any]],
+        page: int,
+        pages: int,
+    ) -> dict[str, Any]:
+        page = max(1, min(int(page), max(1, int(pages))))
+        start = (page - 1) * self.group_page_size
+        visible = dialogs[start : start + self.group_page_size]
+        rows: list[list[dict[str, str]]] = []
+        for dialog in visible:
+            action = "disable" if dialog["enabled"] else "enable"
+            label = str(dialog["title"]).strip() or str(dialog["chat_id"])
+            rows.append(
+                [
+                    _button(
+                        f"{self.t(f'button.{action}')} · {label[:24]}",
+                        f"pref:group:{action}:"
+                        f"{telegram_source_token(str(dialog['source']))}:"
+                        f"{int(dialog['chat_id'])}:{page}",
+                    )
+                ]
+            )
+        previous = max(1, page - 1)
+        following = min(max(1, pages), page + 1)
+        rows.append(
+            [
+                _button("‹", f"pref:groups:{previous}" if page > 1 else "pref:noop"),
+                _button(f"{page}/{max(1, pages)}", "pref:noop"),
+                _button(
+                    "›",
+                    f"pref:groups:{following}" if page < pages else "pref:noop",
+                ),
+            ]
+        )
+        rows.extend(
+            [
+                [_button(self.t("button.refresh"), f"pref:groups:refresh:{page}")],
+                [_button(self.t("button.home"), "pref:menu:home")],
+            ]
         )
         return {"inline_keyboard": rows}
 

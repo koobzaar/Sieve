@@ -307,7 +307,7 @@ Copy-Item .env.example .env
 ```
 
 Preencha `.env` apenas com as credenciais das integrações que pretende ativar. Depois edite
-`config/config.yaml`: configure perfil, aliases, regras, `chat_ids`,
+`config/config.yaml`: configure perfil, aliases, regras e, opcionalmente, os `chat_ids` iniciais,
 `preferences.admin_telegram_user_id_env` e preferências; ative explicitamente somente as fontes,
 a avaliação Gemini e o bot de preferências que pretende usar. A configuração rastreada começa com
 todas as integrações externas desativadas. Nunca faça commit de tokens, chaves, estado SQLite ou
@@ -395,7 +395,7 @@ Todas as fontes começam desativadas no modelo copiado. Ative apenas os adaptado
 
 | Fonte | Cobertura | Padrão | Configuração necessária |
 | --- | --- | --- | --- |
-| Grupos/canais do Telegram | Qualquer grupo ou canal acessível à conta de usuário | Desativada | Credenciais do Telethon, sessão persistida e `chat_ids` |
+| Grupos/canais do Telegram | Qualquer grupo ou canal acessível à conta de usuário | Desativada | Credenciais do Telethon e sessão persistida; `chat_ids` de bootstrap opcionais |
 | [Pelando `/recentes`](https://www.pelando.com.br/recentes) | Site de promoções voltado ao Brasil | Desativada | Sem conta; intervalo, timeout e user agent são opcionais |
 
 Ative ou desative cada fonte separadamente em `config/config.yaml`:
@@ -415,6 +415,14 @@ Pelo menos uma fonte precisa estar ativa antes de executar `run`. Para adicionar
 implemente o protocolo `PromotionSource` e uma factory que receba as configurações, o `name`, o
 cliente HTTP compartilhado e o health reporter; depois use o caminho `module:factory` em `sources`.
 Não é necessário alterar o pipeline.
+
+Para cada fonte Telegram, os `chat_ids` do YAML são importados como grupos ativos somente na
+primeira vez em que a fonte aparece em um banco novo. Depois disso, o SQLite é autoritativo:
+desativar um grupo no menu **Grupos**, exclusivo do administrador, persiste entre reinícios e não
+é desfeito por mudanças posteriores no YAML. A conta Telethon atualiza nesse menu os grupos e
+canais que consegue enxergar; novos diálogos permanecem desativados até serem selecionados. É
+válido manter zero grupos ativos—a conta continua conectada para descoberta, mas não emite
+promoções.
 
 ### Filtragem determinística de promoções
 
