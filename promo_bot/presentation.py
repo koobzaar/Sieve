@@ -897,7 +897,7 @@ def render_localized_card(
                 for item in localized_offer["highlights"]:
                     card.line(((f"• {item}", None),))
         card.line()
-        card.line(((f"▎{reason}", "blockquote"),))
+        card.line(((reason, "blockquote"),))
         return card
 
     for options in (
@@ -1304,7 +1304,7 @@ class PromotionPresenter:
         if safe_reason:
             card.line()
             card.line()
-            card.line(((f"▎{safe_reason}", "blockquote"),))
+            card.line(((safe_reason, "blockquote"),))
         rendered = card.text.rstrip("\n")
         maximum = 1_024 if media is not None else 4_096
         followups: tuple[str, ...] = ()

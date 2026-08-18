@@ -474,6 +474,7 @@ async def test_disabled_presentation_is_deterministic_and_keeps_pelando_enrichme
     assert "Oferta do dia magalu" in card.text
     assert "<b>compacta</b>" in card.text
     assert "Combina com seus interesses configurados." in card.text
+    assert "▎" not in card.text
     assert "above_threshold" not in card.text
     assert {entity.type for entity in card.entities} == {"bold", "blockquote"}
     assert card.button_url == "https://example.test/camera"
@@ -520,7 +521,26 @@ def test_semantic_entities_use_utf16_offsets_with_non_bmp_and_combining_text() -
     assert ("bold", "R$ 308,00") in slices
     assert ("strikethrough", "R$ 589,00") in slices
     assert ("code", "PRAMODA") in slices
-    assert any(kind == "blockquote" and value.startswith("▎Apareceu") for kind, value in slices)
+    assert any(kind == "blockquote" and value.startswith("Apareceu") for kind, value in slices)
+    assert "▎" not in text
+
+
+def test_exceptional_reason_uses_only_telegrams_blockquote_entity() -> None:
+    presenter = object.__new__(PromotionPresenter)
+    card = presenter._deterministic(
+        Promotion(id="hot", source="telegram", title="Notebook em promoção"),
+        "explicit_phrase:erro de preço",
+        "pt-BR",
+        None,
+    )
+
+    quotes = [
+        _slice_utf16(card.text, entity.offset, entity.length)
+        for entity in card.entities
+        if entity.type == "blockquote"
+    ]
+    assert quotes == ["Oferta excepcional identificada."]
+    assert "▎" not in card.text
 
 
 async def test_media_download_validation_reference_counts_and_cleanup(tmp_path) -> None:
