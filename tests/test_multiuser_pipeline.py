@@ -195,3 +195,108 @@ async def test_disabled_user_is_not_evaluated_or_delivered(tmp_path) -> None:
     assert len(evaluator.calls) == 1
     assert [job.user_id for job in state.due_deliveries()] == [admin.id]
     state.close()
+
+
+async def test_exceptional_setting_defaults_on_and_persists_across_restart(
+    tmp_path,
+) -> None:
+    path = tmp_path / "state.db"
+    state = SQLiteStateStore(path)
+    admin = state.bootstrap_admin(telegram_user_id=101, telegram_chat_id=201)
+    assert state.exceptional_offers_enabled(admin.id) is True
+    assert state.set_exceptional_offers_enabled(admin.id, False) is False
+    state.close()
+
+    reopened = SQLiteStateStore(path)
+    assert reopened.exceptional_offers_enabled(admin.id) is False
+    reopened.close()
+
+
+async def test_disabled_exceptional_offer_uses_normal_interest_filtering(
+    tmp_path,
+) -> None:
+    state, admin, member, stores, evaluator, multi = setup(tmp_path)
+    state.disable_user(admin.id, member.id)
+    add_interest(stores[admin.id], admin.telegram_user_id, "ssd")
+    state.set_exceptional_offers_enabled(admin.id, False)
+
+    matching = await multi.process(
+        Promotion(
+            id="hot-ssd",
+            source="pelando",
+            title="SSD NVMe 1TB",
+            temperature=500,
+        )
+    )
+    unrelated = await multi.process(
+        Promotion(
+            id="hot-pan",
+            source="pelando",
+            title="Jogo de panelas",
+            temperature=500,
+        )
+    )
+
+    assert matching[admin.id].decision == Decision.FORWARD
+    assert matching[admin.id].stage == "llm"
+    assert unrelated[admin.id].decision == Decision.DISCARD
+    assert unrelated[admin.id].stage == "interest_admission"
+    assert len(evaluator.calls) == 1
+    assert [job.promotion.id for job in state.due_deliveries()] == ["hot-ssd"]
+    state.close()
+
+
+async def test_idle_user_skips_dedup_corpus_and_evaluation_while_peer_continues(
+    tmp_path,
+) -> None:
+    state, admin, member, stores, evaluator, multi = setup(tmp_path)
+    state.set_exceptional_offers_enabled(admin.id, False)
+    add_interest(stores[member.id], member.telegram_user_id, "ssd")
+
+    results = await multi.process(
+        Promotion(
+            id="shared",
+            source="telegram",
+            title="SSD Kingston NV3 SNV3S 1TB",
+            price=None,
+        )
+    )
+
+    assert results[admin.id].stage == "idle"
+    assert results[admin.id].reason == "no_interests_and_exceptional_disabled"
+    assert results[member.id].decision == Decision.FORWARD
+    assert len(evaluator.calls) == 1
+    assert state._connection.execute(
+        "SELECT COUNT(*) FROM corpus_docs"
+    ).fetchone()[0] == 1
+    fingerprint_users = {
+        row[0]
+        for row in state._connection.execute(
+            "SELECT DISTINCT user_id FROM near_duplicate_fingerprints"
+        )
+    }
+    assert fingerprint_users == {member.id}
+    assert [job.user_id for job in state.due_deliveries()] == [member.id]
+    state.close()
+
+
+async def test_all_idle_users_do_not_touch_promotion_work_tables(tmp_path) -> None:
+    state, admin, member, _, evaluator, multi = setup(tmp_path)
+    state.set_exceptional_offers_enabled(admin.id, False)
+    state.set_exceptional_offers_enabled(member.id, False)
+
+    results = await multi.process(
+        Promotion(id="idle", source="telegram", title="SSD NVMe 1TB")
+    )
+
+    assert all(result.stage == "idle" for result in results.values())
+    assert evaluator.calls == []
+    for table in (
+        "near_duplicate_fingerprints",
+        "corpus_docs",
+        "delivery_outbox",
+    ):
+        assert state._connection.execute(
+            f"SELECT COUNT(*) FROM {table}"
+        ).fetchone()[0] == 0
+    state.close()

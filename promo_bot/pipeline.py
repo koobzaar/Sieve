@@ -307,11 +307,22 @@ class PromotionPipeline:
             corpus_size = self.store.add_corpus_document(document_tokens)
             bm25_ready = True
 
+        exceptional_enabled = True
+        if self.user_id is not None and hasattr(
+            self.store, "exceptional_offers_enabled"
+        ):
+            exceptional_enabled = self.store.exceptional_offers_enabled(
+                self.user_id
+            )
         exceptional = detect_exceptional(promotion, self.exceptional_temperature)
-        exceptional_uncertain = exceptional.exceptional and (
+        exceptional_uncertain = exceptional_enabled and exceptional.exceptional and (
             constraint.may_match_interest and not constraint.all_proven
         )
-        if exceptional.exceptional and not exceptional_uncertain:
+        if (
+            exceptional_enabled
+            and exceptional.exceptional
+            and not exceptional_uncertain
+        ):
             await self._deliver(promotion, exceptional.reason)
             return self._record(
                 promotion,
@@ -610,8 +621,32 @@ class MultiUserPromotionPipeline:
         accounts = self.store.active_users()
         if not accounts:
             return {}
+        idle: set[str] = set()
+        for account in accounts:
+            snapshot = self.preference_store_factory(account).current_snapshot()
+            if (
+                not snapshot.interests
+                and not self.store.exceptional_offers_enabled(account.id)
+            ):
+                idle.add(account.id)
+        participants = [account for account in accounts if account.id not in idle]
+        results: dict[str, PipelineResult] = {
+            account.id: self._record_external(
+                account.id,
+                promotion,
+                PipelineResult(
+                    Decision.DISCARD,
+                    "idle",
+                    "no_interests_and_exceptional_disabled",
+                ),
+            )
+            for account in accounts
+            if account.id in idle
+        }
+        if not participants:
+            return results
         if self.store.check_and_mark_native(promotion):
-            return {
+            results.update({
                 account.id: self._record_external(
                     account.id,
                     promotion,
@@ -621,21 +656,21 @@ class MultiUserPromotionPipeline:
                         "native_replay",
                     ),
                 )
-                for account in accounts
-            }
+                for account in participants
+            })
+            return results
         duplicates: dict[str, str] = {}
-        for account in accounts:
+        for account in participants:
             reason = self.store.check_near_duplicate(account.id, promotion)
             if reason is not None:
                 duplicates[account.id] = reason
-        if len(duplicates) < len(accounts):
+        if len(duplicates) < len(participants):
             raw_tokens = tokenize(promotion_text(promotion))
             self.store.add_corpus_document(
                 raw_tokens,
                 raw_tokens=raw_tokens,
             )
-        results: dict[str, PipelineResult] = {}
-        for account in accounts:
+        for account in participants:
             if account.id in duplicates:
                 results[account.id] = self._record_external(
                     account.id,

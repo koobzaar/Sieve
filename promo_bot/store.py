@@ -51,6 +51,12 @@ CREATE VIEW IF NOT EXISTS resolved_users AS
 SELECT u.*, COALESCE(l.locale,u.ui_language) AS resolved_ui_language
 FROM users u LEFT JOIN user_locales l ON l.user_id=u.id;
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status, role, created_at);
+CREATE TABLE IF NOT EXISTS user_delivery_settings (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    exceptional_offers_enabled INTEGER NOT NULL DEFAULT 1
+        CHECK(exceptional_offers_enabled IN (0,1)),
+    updated_at REAL NOT NULL
+);
 CREATE TRIGGER IF NOT EXISTS users_id_immutable
 BEFORE UPDATE OF id ON users
 BEGIN
@@ -620,6 +626,54 @@ class SQLiteStateStore:
                 ).fetchall()
                 if (user := self._user_from_row(row)) is not None
             ]
+
+    def exceptional_offers_enabled(self, user_id: str) -> bool:
+        """Return the per-user exceptional-delivery policy, defaulting to enabled."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT exceptional_offers_enabled FROM user_delivery_settings "
+                "WHERE user_id=?",
+                (str(user_id),),
+            ).fetchone()
+            if row is None:
+                exists = self._connection.execute(
+                    "SELECT 1 FROM users WHERE id=?", (str(user_id),)
+                ).fetchone()
+                if exists is None:
+                    raise StoreError("unknown user UUID")
+                return True
+            return bool(row["exceptional_offers_enabled"])
+
+    def set_exceptional_offers_enabled(
+        self, user_id: str, enabled: bool
+    ) -> bool:
+        """Persist an immediate per-user exceptional-delivery policy change."""
+        with self._lock:
+            connection = self._begin()
+            try:
+                exists = connection.execute(
+                    "SELECT 1 FROM users WHERE id=?", (str(user_id),)
+                ).fetchone()
+                if exists is None:
+                    raise StoreError("unknown user UUID")
+                connection.execute(
+                    "INSERT INTO user_delivery_settings("
+                    "user_id,exceptional_offers_enabled,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET "
+                    "exceptional_offers_enabled=excluded.exceptional_offers_enabled,"
+                    "updated_at=excluded.updated_at",
+                    (str(user_id), int(bool(enabled)), self.clock()),
+                )
+                connection.execute("COMMIT")
+                return bool(enabled)
+            except StoreError:
+                connection.execute("ROLLBACK")
+                raise
+            except sqlite3.Error as exc:
+                connection.execute("ROLLBACK")
+                raise StoreError(
+                    f"cannot update exceptional-offer setting: {exc}"
+                ) from exc
 
     @staticmethod
     def _invitation_hash(token: str) -> str:

@@ -114,6 +114,12 @@ class TelegramFormatter:
                 _button(self.t("button.language"), "pref:menu:language"),
                 _button(self.t("button.account"), "pref:menu:account"),
             ],
+            [
+                _button(
+                    self.t("button.offer_settings"),
+                    "pref:menu:offer_settings",
+                )
+            ],
             [_button(self.t("button.help"), "pref:menu:help")],
         ]
         if is_admin:
@@ -207,6 +213,33 @@ class TelegramFormatter:
             f"<b>{self.t('language.changed.title')}</b>\n\n"
             f"{self.t('language.changed.body')}",
         )
+
+    def offer_settings(self, exceptional_enabled: bool) -> str:
+        state = self.t(
+            "offer_settings.status.enabled"
+            if exceptional_enabled
+            else "offer_settings.status.disabled"
+        )
+        return self._rendered(
+            "offer_settings",
+            f"<b>{self.t('offer_settings.title')}</b>\n\n"
+            f"{self.t('offer_settings.body')}\n\n"
+            f"{self.t('offer_settings.current', state=state)}",
+        )
+
+    def offer_settings_markup(self, exceptional_enabled: bool) -> dict[str, Any]:
+        action = "disable" if exceptional_enabled else "enable"
+        label = (
+            "button.exceptional_disable"
+            if exceptional_enabled
+            else "button.exceptional_enable"
+        )
+        return {
+            "inline_keyboard": [
+                [_button(self.t(label), f"pref:offers:{action}")],
+                [_button(self.t("button.home"), "pref:menu:home")],
+            ]
+        }
 
     def preferences(
         self, snapshot: PreferenceSnapshot, page: int = 1

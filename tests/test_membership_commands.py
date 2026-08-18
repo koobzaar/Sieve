@@ -207,3 +207,38 @@ async def test_role_aware_home_and_members_screen_edit_in_place(
     assert members_screen.target_message_id == 90
     assert member.id in members_screen.text
     state.close()
+
+
+async def test_each_user_can_toggle_exceptional_offers_from_offer_settings(
+    tmp_path,
+) -> None:
+    state, admin, processor = setup(tmp_path)
+    token = state.create_invitation(admin.id)
+    await processor.process_update(update(1, 102, 202, f"/start {token}"))
+    member = state.user_for_telegram(102)
+    assert member is not None
+
+    await processor.process_update(
+        callback_update(2, 102, 202, "pref:menu:offer_settings")
+    )
+    member_store = SQLitePreferenceStore(state, user_id=member.id)
+    screen = member_store.next_outbox()[-1]
+    assert "Exceptional offers: enabled" in screen.text
+    assert screen.operation == "edit"
+    assert screen.reply_markup["inline_keyboard"][0][0]["callback_data"] == (
+        "pref:offers:disable"
+    )
+
+    await processor.process_update(
+        callback_update(3, 102, 202, "pref:offers:disable")
+    )
+    changed = member_store.next_outbox()[-1]
+    assert state.exceptional_offers_enabled(member.id) is False
+    assert "Exceptional offers: disabled" in changed.text
+    assert state.exceptional_offers_enabled(admin.id) is True
+
+    await processor.process_update(
+        callback_update(4, 102, 202, "pref:offers:enable")
+    )
+    assert state.exceptional_offers_enabled(member.id) is True
+    state.close()

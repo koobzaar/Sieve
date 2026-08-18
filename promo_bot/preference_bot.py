@@ -343,6 +343,9 @@ class PreferenceCommandProcessor:
         self.can_admin_members = (
             self.is_admin and self.membership_state is not None
         )
+        self.delivery_state = membership_state or getattr(
+            store, "delivery_state", None
+        )
 
     @staticmethod
     def _envelope(
@@ -1064,8 +1067,31 @@ class PreferenceCommandProcessor:
             )
             return
 
+        offer_match = re.fullmatch(
+            r"pref:offers:(enable|disable)", text.casefold()
+        )
+        if offer_match and self.delivery_state is not None:
+            enabled = offer_match.group(1) == "enable"
+            self.delivery_state.set_exceptional_offers_enabled(
+                self.account_id, enabled
+            )
+            self._record_reply(
+                update_id,
+                actor_id,
+                text,
+                "exceptional_offers_enabled"
+                if enabled
+                else "exceptional_offers_disabled",
+                ui.offer_settings(enabled),
+                callback_query_id=callback_query_id,
+                reply_markup=ui.offer_settings_markup(enabled),
+                operation="edit",
+                target_message_id=target_message_id,
+            )
+            return
+
         menu_match = re.fullmatch(
-            r"pref:menu:(home|preferences|history|help|language|account|members)",
+            r"pref:menu:(home|preferences|history|help|language|account|members|offer_settings)",
             text.casefold(),
         )
         if menu_match:
@@ -1094,6 +1120,15 @@ class PreferenceCommandProcessor:
                     self.account_status,
                 )
                 markup = ui.menu_markup(screen="account")
+            elif (
+                destination == "offer_settings"
+                and self.delivery_state is not None
+            ):
+                enabled = self.delivery_state.exceptional_offers_enabled(
+                    self.account_id
+                )
+                rendered = ui.offer_settings(enabled)
+                markup = ui.offer_settings_markup(enabled)
             elif (
                 destination == "members"
                 and self.can_admin_members

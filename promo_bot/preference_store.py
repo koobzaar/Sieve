@@ -494,6 +494,9 @@ class SQLitePreferenceStore:
         self.command_log_cap = command_log_cap
         self.provider = provider
         self.on_snapshot = on_snapshot
+        self.delivery_state = (
+            state if hasattr(state, "exceptional_offers_enabled") else None
+        )
         self._owns_connection = not hasattr(state, "_connection")
         if self._owns_connection:
             path = Path(state)
