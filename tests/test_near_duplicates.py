@@ -24,7 +24,7 @@ def users(store: SQLiteStateStore):
     return admin, member
 
 
-def test_equivalent_destination_url_is_per_user_and_different_price_is_not_duplicate(
+def test_equivalent_destination_url_is_per_user_and_lower_price_is_preserved(
     tmp_path,
 ) -> None:
     store = SQLiteStateStore(tmp_path / "state.db")
@@ -132,7 +132,7 @@ def test_fingerprint_expires_survives_restart_and_records_reason(tmp_path) -> No
         "SELECT reason FROM near_duplicate_suppressions ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert row["reason"] == "near_duplicate:product_price"
-    clock.value += 86_401
+    clock.value += 600
     assert reopened.check_near_duplicate(admin.id, repost) is None
     reopened.close()
 
@@ -163,3 +163,135 @@ def test_concurrent_reposts_create_one_fingerprint_and_one_winner(tmp_path) -> N
     ).fetchone()[0] == 1
     store.close()
 
+
+def test_url_reposts_must_keep_beating_the_ten_minute_minimum(tmp_path) -> None:
+    store = SQLiteStateStore(tmp_path / "state.db")
+    admin, _ = users(store)
+
+    def offer(identifier: str, price: str) -> Promotion:
+        return Promotion(
+            id=identifier,
+            source="telegram" if identifier.startswith("t") else "pelando",
+            title="Notebook Lenovo IdeaPad 3i",
+            price=Decimal(price),
+            url="https://shop.test/notebook?utm_source=" + identifier,
+        )
+
+    assert store.check_near_duplicate(admin.id, offer("t1", "3000")) is None
+    assert store.check_near_duplicate(admin.id, offer("p2", "3000")) == (
+        "near_duplicate:url"
+    )
+    assert store.check_near_duplicate(admin.id, offer("t3", "3200")) == (
+        "near_duplicate:url"
+    )
+    assert store.check_near_duplicate(admin.id, offer("p4", "2800")) is None
+    assert store.check_near_duplicate(admin.id, offer("t5", "2900")) == (
+        "near_duplicate:url"
+    )
+    assert store.check_near_duplicate(admin.id, offer("p6", "2799")) is None
+    store.close()
+
+
+def test_lower_price_passes_in_either_arrival_order_but_higher_never_does(
+    tmp_path,
+) -> None:
+    state = SQLiteStateStore(tmp_path / "state.db")
+    admin, member = users(state)
+    high = Promotion(
+        id="high",
+        source="telegram",
+        title="Monitor LG 27GP850-B 27 inch",
+        price=Decimal("1999"),
+    )
+    low = Promotion(
+        id="low",
+        source="pelando",
+        title="LG Monitor 27GP850-B 27 inch promocao",
+        price=Decimal("1799"),
+    )
+
+    assert state.check_near_duplicate(admin.id, high) is None
+    assert state.check_near_duplicate(admin.id, low) is None
+    assert state.check_near_duplicate(member.id, low) is None
+    assert state.check_near_duplicate(member.id, high) == (
+        "near_duplicate:product_price"
+    )
+    state.close()
+
+
+def test_exact_url_promotes_known_price_over_unknown_and_suppresses_unknown_repost(
+    tmp_path,
+) -> None:
+    state = SQLiteStateStore(tmp_path / "state.db")
+    admin, member = users(state)
+    unknown = Promotion(
+        id="unknown",
+        source="telegram",
+        title="SSD Kingston NV3 SNV3S 1TB",
+        url="https://shop.test/ssd",
+    )
+    known = Promotion(
+        id="known",
+        source="pelando",
+        title="SSD Kingston NV3 SNV3S 1TB",
+        price=Decimal("399"),
+        url="https://shop.test/ssd",
+    )
+
+    assert state.check_near_duplicate(admin.id, unknown) is None
+    assert state.check_near_duplicate(admin.id, known) is None
+    assert state.check_near_duplicate(member.id, known) is None
+    assert state.check_near_duplicate(member.id, unknown) == "near_duplicate:url"
+    state.close()
+
+
+def test_fuzzy_matching_stays_conservative_when_either_price_is_unknown(
+    tmp_path,
+) -> None:
+    state = SQLiteStateStore(tmp_path / "state.db")
+    admin, member = users(state)
+    unknown = Promotion(
+        id="unknown",
+        source="telegram",
+        title="SSD Kingston NV3 SNV3S 1TB",
+    )
+    known = Promotion(
+        id="known",
+        source="pelando",
+        title="Kingston SSD NV3 SNV3S 1TB promocao",
+        price=Decimal("399"),
+    )
+
+    assert state.check_near_duplicate(admin.id, unknown) is None
+    assert state.check_near_duplicate(admin.id, known) is None
+    assert state.check_near_duplicate(member.id, known) is None
+    assert state.check_near_duplicate(member.id, unknown) is None
+    state.close()
+
+
+def test_ten_minute_boundary_is_exclusive(tmp_path) -> None:
+    clock = Clock()
+    state = SQLiteStateStore(tmp_path / "state.db", clock=clock)
+    admin, member = users(state)
+    offer = Promotion(
+        id="one",
+        source="telegram",
+        title="Monitor LG 27GP850-B 27 inch",
+        price=Decimal("1999"),
+    )
+    repost = Promotion(
+        id="two",
+        source="pelando",
+        title="LG Monitor 27GP850-B 27 inch",
+        price=Decimal("1999"),
+    )
+
+    assert state.check_near_duplicate(admin.id, offer) is None
+    clock.value += 599.999
+    assert state.check_near_duplicate(admin.id, repost) == (
+        "near_duplicate:product_price"
+    )
+    assert state.check_near_duplicate(member.id, offer) is None
+    clock.value += 600
+    assert state.check_near_duplicate(member.id, repost) is None
+    state.close()

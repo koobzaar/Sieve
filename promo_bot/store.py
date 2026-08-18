@@ -11,6 +11,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
@@ -938,7 +939,7 @@ class SQLiteStateStore:
         user_id: str,
         promotion: Promotion,
         *,
-        window_seconds: int = 86_400,
+        window_seconds: int = 600,
     ) -> str | None:
         """Atomically retain a per-user fingerprint or return its suppression reason."""
         if window_seconds <= 0:
@@ -962,24 +963,33 @@ class SQLiteStateStore:
                     "WHERE user_id=? AND seen_at>?",
                     (str(user_id), cutoff),
                 ).fetchall()
+                exact_url_rows = [
+                    row
+                    for row in rows
+                    if canonical_url
+                    and canonical_url == str(row["canonical_url"])
+                ]
                 reason: str | None = None
+                if exact_url_rows:
+                    previous_prices = [
+                        Decimal(str(row["price"]))
+                        for row in exact_url_rows
+                        if row["price"] is not None
+                    ]
+                    if price is None or (
+                        previous_prices
+                        and Decimal(price) >= min(previous_prices)
+                    ):
+                        reason = "near_duplicate:url"
                 for row in rows:
+                    if reason is not None:
+                        break
                     previous_price = (
                         str(row["price"]) if row["price"] is not None else None
                     )
-                    if canonical_url and canonical_url == str(row["canonical_url"]):
-                        both_different = (
-                            price is not None
-                            and previous_price is not None
-                            and price != previous_price
-                        )
-                        if not both_different:
-                            reason = "near_duplicate:url"
-                            break
                     if (
                         price is None
                         or previous_price is None
-                        or price != previous_price
                         or not strong_model
                     ):
                         continue
@@ -995,7 +1005,10 @@ class SQLiteStateStore:
                         if denominator
                         else 0.0
                     )
-                    if overlap >= 0.8:
+                    if (
+                        overlap >= 0.8
+                        and Decimal(price) >= Decimal(previous_price)
+                    ):
                         reason = "near_duplicate:product_price"
                         break
                 if reason is not None:
