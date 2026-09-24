@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 
 import pytest
 from telethon.errors import SessionPasswordNeededError
@@ -81,3 +80,34 @@ def test_telegram_commands_have_no_phone_argument() -> None:
         assert not hasattr(args, "phone")
         with pytest.raises(SystemExit):
             _parser().parse_args([command, "--phone", "+5511999999999"])
+
+
+def test_cli_uses_environment_defaults_and_explicit_overrides(monkeypatch):
+    monkeypatch.setenv("SIEVE_CONFIG", "/state/local.yaml")
+    monkeypatch.setenv("SIEVE_LOG_LEVEL", "debug")
+    args = _parser().parse_args(["validate-config", "--runtime"])
+    assert args.config == "/state/local.yaml"
+    assert args.log_level == "DEBUG"
+    assert args.runtime
+    args = _parser().parse_args(["--config", "other.yaml", "--log-level", "warning", "run"])
+    assert args.config == "other.yaml"
+    assert args.log_level == "WARNING"
+
+
+def test_health_reads_database_paths_containing_uri_characters(tmp_path, capsys):
+    import json
+    import yaml
+    from promo_bot.cli import _health
+    from promo_bot.store import SQLiteStateStore
+    from tests.test_config import base_config
+
+    path = tmp_path / "state #1.db"
+    state = SQLiteStateStore(path)
+    state.record_health("runtime")
+    state.close()
+    data = base_config()
+    data["state"]["path"] = str(path)
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    assert _health(str(config)) == 0
+    assert json.loads(capsys.readouterr().out)["healthy"] is True

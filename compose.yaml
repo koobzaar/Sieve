@@ -2,15 +2,24 @@ name: sieve
 
 services:
   sieve:
-    container_name: sieve
     build: .
+    init: true
     restart: unless-stopped
+    stop_grace_period: 60s
     env_file:
       - .env
+    environment:
+      SIEVE_CONFIG: /app/config/config.yaml
+      SIEVE_LOG_LEVEL: ${SIEVE_LOG_LEVEL:-INFO}
     command: ["--config", "/app/config/config.yaml", "run"]
     volumes:
       - sieve-state:/state
-      - ./config:/app/config:ro
+      - type: bind
+        source: ${SIEVE_CONFIG_FILE:-./config/config.yaml}
+        target: /app/config/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

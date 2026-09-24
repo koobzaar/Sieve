@@ -2283,12 +2283,21 @@ class TelegramPreferenceBot:
             asyncio.create_task(self._work(stop), name="preference-command"),
             asyncio.create_task(self._deliver(stop), name="preference-outbox"),
         ]
+        stop_task = asyncio.create_task(stop.wait(), name="preference-stop")
         try:
-            await stop.wait()
+            done, _ = await asyncio.wait(
+                [stop_task, *tasks], return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done - {stop_task}:
+                if not task.cancelled() and task.exception() is not None:
+                    raise task.exception()
+                if not stop.is_set():
+                    raise RuntimeError(f"worker {task.get_name()} stopped unexpectedly")
         finally:
+            stop_task.cancel()
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(stop_task, *tasks, return_exceptions=True)
 
     async def close(self) -> None:
         await self.api.close()

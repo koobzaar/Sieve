@@ -27,7 +27,6 @@ from .preferences import (
     PreferenceSnapshot,
     StaleRevisionError,
     build_snapshot,
-    changed_entry_count,
     make_entry_id,
     merge_entry_data,
     seed_entries,
@@ -550,10 +549,6 @@ class SQLitePreferenceStore:
                     "ALTER TABLE telegram_reply_outbox "
                     "ADD COLUMN target_message_id INTEGER"
                 )
-
-    def attach_provider(self, provider: AtomicPreferenceProvider) -> None:
-        self.provider = provider
-        provider.swap(self.current_snapshot())
 
     def _begin(self) -> sqlite3.Connection:
         self._connection.execute("BEGIN IMMEDIATE")
@@ -1242,12 +1237,6 @@ class SQLitePreferenceStore:
                 connection.execute("ROLLBACK")
                 raise
         return self._published(snapshot, previous)
-
-    def undo_requires_confirmation(self) -> tuple[bool, int, int]:
-        current = self.current_snapshot()
-        target, revision = self.undo_target()
-        count = changed_entry_count(current, target)
-        return count > 1, revision, count
 
     def create_confirmation(
         self,

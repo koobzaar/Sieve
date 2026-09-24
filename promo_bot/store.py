@@ -9,7 +9,9 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -29,6 +31,25 @@ from .translation import translations
 
 class StoreError(RuntimeError):
     pass
+
+
+@dataclass
+class _AliasCorpusStats:
+    aliases: dict[str, list[str]]
+    frequencies: dict[str, int]
+    count: int = 0
+    total_length: int = 0
+
+    def adjust(self, raw_tokens: Sequence[str], delta: int) -> None:
+        tokens = canonical_match_tokens(raw_tokens, self.aliases)
+        self.count += delta
+        self.total_length += delta * len(tokens)
+        for term in self.frequencies.keys() & set(tokens):
+            self.frequencies[term] += delta
+
+    def result(self) -> tuple[int, float, dict[str, int]]:
+        average = self.total_length / self.count if self.count else 0.0
+        return self.count, average, dict(self.frequencies)
 
 
 SCHEMA = """
@@ -435,6 +456,8 @@ class SQLiteStateStore:
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.clock = clock
         self._lock = threading.RLock()
+        # Store only query frequencies, never entire normalized documents.
+        self._corpus_stats_cache: OrderedDict[tuple[str, tuple[str, ...]], _AliasCorpusStats] = OrderedDict()
         try:
             self._connection = sqlite3.connect(
                 self.path, timeout=10, isolation_level=None, check_same_thread=False
@@ -1463,6 +1486,7 @@ class SQLiteStateStore:
                     )
                 count = int(connection.execute("SELECT COUNT(*) FROM corpus_docs").fetchone()[0])
                 overflow = max(0, count - self.corpus_limit)
+                removed_tokens = []
                 if overflow:
                     old_ids = [
                         int(row[0])
@@ -1470,13 +1494,28 @@ class SQLiteStateStore:
                             "SELECT id FROM corpus_docs ORDER BY id LIMIT ?", (overflow,)
                         )
                     ]
+                    if self._corpus_stats_cache:
+                        removed_tokens = [
+                            json.loads(row[0])
+                            for row in connection.execute(
+                                "SELECT tokens_json FROM corpus_raw_tokens ORDER BY doc_id LIMIT ?",
+                                (overflow,),
+                            )
+                        ]
                     self._delete_corpus_docs(connection, old_ids)
                     count -= len(old_ids)
+                for cached in self._corpus_stats_cache.values():
+                    cached.adjust(raw, 1)
+                    for removed in removed_tokens:
+                        cached.adjust(removed, -1)
                 connection.execute("COMMIT")
                 return count
-            except sqlite3.Error as exc:
+            except Exception as exc:
+                self._corpus_stats_cache.clear()
                 connection.execute("ROLLBACK")
-                raise StoreError(f"corpus update failed: {exc}") from exc
+                if isinstance(exc, sqlite3.Error):
+                    raise StoreError(f"corpus update failed: {exc}") from exc
+                raise
 
     def add_corpus_document_dynamic(
         self,
@@ -1541,24 +1580,24 @@ class SQLiteStateStore:
         terms: Sequence[str],
         aliases: dict[str, list[str]] | dict[str, tuple[str, ...]],
     ) -> tuple[int, float, dict[str, int]]:
-        """Expand one UUID's aliases over the shared raw corpus on demand."""
+        """Stream once per query/alias set, then maintain counts on insert and eviction."""
+        encoded, _ = self._aliases_material(aliases)
+        key = encoded, tuple(sorted(set(terms)))
         with self._lock:
+            cached = self._corpus_stats_cache.get(key)
+            if cached is not None:
+                self._corpus_stats_cache.move_to_end(key)
+                return cached.result()
+            cached = _AliasCorpusStats(json.loads(encoded), dict.fromkeys(key[1], 0))
             rows = self._connection.execute(
                 "SELECT tokens_json FROM corpus_raw_tokens ORDER BY doc_id"
-            ).fetchall()
-        documents = [
-            canonical_match_tokens(json.loads(str(row["tokens_json"])), aliases)
-            for row in rows
-        ]
-        count = len(documents)
-        average = (
-            sum(len(document) for document in documents) / count if count else 0.0
-        )
-        frequencies = {
-            term: sum(term in set(document) for document in documents)
-            for term in set(terms)
-        }
-        return count, average, frequencies
+            )
+            for row in rows:
+                cached.adjust(json.loads(row["tokens_json"]), 1)
+            self._corpus_stats_cache[key] = cached
+            if len(self._corpus_stats_cache) > 16:
+                self._corpus_stats_cache.popitem(last=False)
+            return cached.result()
 
     def rebuild_alias_batch(self, batch_size: int = 250) -> dict[str, int | bool | None]:
         batch_size = max(1, min(int(batch_size), 1_000))

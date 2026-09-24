@@ -5,6 +5,7 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .models import Promotion
@@ -93,6 +94,19 @@ def _alias_marker(canonical: str) -> str:
     return "_".join(tokenize(canonical))
 
 
+@lru_cache(maxsize=32)
+def _compiled_aliases(
+    aliases: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[tuple[str, tuple[frozenset[str], ...]], ...]:
+    return tuple(
+        (
+            _alias_marker(canonical),
+            tuple(frozenset(significant_tokens(value)) for value in (canonical, *values)),
+        )
+        for canonical, values in aliases
+    )
+
+
 def canonical_match_tokens(
     value: str | Sequence[str], aliases: Mapping[str, Sequence[str]]
 ) -> list[str]:
@@ -101,18 +115,14 @@ def canonical_match_tokens(
     available = set(base)
     matched_tokens: set[str] = set()
     markers: list[str] = []
-    for canonical, values in aliases.items():
-        marker = _alias_marker(canonical)
+    compiled = _compiled_aliases(tuple((key, tuple(values)) for key, values in aliases.items()))
+    for marker, variants in compiled:
         if not marker:
             continue
-        variants = (
-            significant_tokens(canonical),
-            *(significant_tokens(item) for item in values),
-        )
         group_matches = [
-            set(variant)
+            variant
             for variant in variants
-            if variant and set(variant) <= available
+            if variant and variant <= available
         ]
         if not group_matches:
             continue

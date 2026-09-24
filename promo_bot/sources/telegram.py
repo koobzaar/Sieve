@@ -204,13 +204,16 @@ class TelegramSource:
                         )
                 failures = 0
                 await self._health(None)
-                stop_task = asyncio.create_task(stop.wait())
+                stop_task = asyncio.create_task(stop.wait(), name=f"telegram-stop:{self.name}")
                 disconnected = asyncio.ensure_future(self.client.disconnected)
-                done, pending = await asyncio.wait(
-                    {stop_task, disconnected}, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
+                try:
+                    done, _ = await asyncio.wait(
+                        {stop_task, disconnected}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    stop_task.cancel()
+                    disconnected.cancel()
+                    await asyncio.gather(stop_task, disconnected, return_exceptions=True)
                 if stop_task in done and stop.is_set():
                     break
                 raise ConnectionError("Telethon disconnected after reconnect attempts")

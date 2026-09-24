@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from promo_bot.models import Decision, Evaluation, PipelineResult, Promotion
+from promo_bot.models import Decision, Evaluation, Promotion
 from promo_bot.pipeline import MultiUserPromotionPipeline, PromotionPipeline
 from promo_bot.preference_store import SQLitePreferenceStore
 from promo_bot.preferences import (
-    AtomicPreferenceProvider,
     OperationAction,
     PreferenceKind,
     PreferenceOperation,
@@ -180,6 +179,64 @@ def test_user_aliases_score_independently_over_shared_raw_corpus(tmp_path) -> No
     assert plain[2]["storage"] == 0
     assert aliased[2]["storage"] == 1
     assert plain[:2] == aliased[:2]
+    state.close()
+
+
+def test_alias_corpus_statistics_count_documents_not_occurrences(tmp_path):
+    state = SQLiteStateStore(tmp_path / "stats.db", corpus_limit=3)
+    for tokens in (["ssd", "ssd", "oferta"], ["nvme"], [], ["gpu"]):
+        state.add_corpus_document(tokens)
+    size, average, frequencies = state.corpus_stats_for_aliases(
+        ["storage", "storage", "gpu", "absent"], {"storage": ["ssd", "nvme"]}
+    )
+    assert size == 3
+    assert average == 2 / 3
+    assert frequencies == {"storage": 1, "gpu": 1, "absent": 0}
+    assert state.corpus_stats_for_aliases([], {}) == (3, 2 / 3, {})
+    state.close()
+
+
+def test_cached_alias_statistics_follow_insert_eviction_and_alias_changes(tmp_path):
+    from promo_bot.normalization import canonical_match_tokens
+
+    state = SQLiteStateStore(tmp_path / "stats.db", corpus_limit=3)
+    documents = []
+    aliases = {"storage": ["ssd"]}
+    terms = ["storage", "gpu", "absent"]
+    for raw in (["ssd", "ssd"], ["gpu"], [], ["nvme"], ["ssd"]):
+        # Warm the cache before every mutation, including the empty corpus.
+        state.corpus_stats_for_aliases(terms, aliases)
+        state.add_corpus_document(raw)
+        documents = (documents + [raw])[-3:]
+        normalized = [canonical_match_tokens(document, aliases) for document in documents]
+        expected = (
+            len(documents),
+            sum(map(len, normalized)) / len(documents),
+            {term: sum(term in document for document in normalized) for term in terms},
+        )
+        result = state.corpus_stats_for_aliases(terms, aliases)
+        assert result == expected
+        result[2]["storage"] = 999  # A caller cannot mutate the cached result.
+        assert state.corpus_stats_for_aliases(terms, aliases) == expected
+    aliases["storage"].append("nvme")
+    assert state.corpus_stats_for_aliases(terms, aliases)[2]["storage"] == 2
+    state.close()
+
+
+def test_corpus_cache_is_rebuilt_after_rolled_back_insert(tmp_path):
+    import pytest
+    from promo_bot.store import StoreError
+
+    state = SQLiteStateStore(tmp_path / "stats.db")
+    state.add_corpus_document(["ssd"])
+    expected = state.corpus_stats_for_aliases(["ssd"], {})
+    state._connection.execute(
+        "CREATE TRIGGER reject_insert BEFORE INSERT ON corpus_docs "
+        "BEGIN SELECT RAISE(ABORT, 'test failure'); END"
+    )
+    with pytest.raises(StoreError):
+        state.add_corpus_document(["gpu"])
+    assert state.corpus_stats_for_aliases(["ssd"], {}) == expected
     state.close()
 
 

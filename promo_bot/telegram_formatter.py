@@ -58,10 +58,6 @@ class TelegramFormatter:
     def t(self, key: str, *, count: int | None = None, **values: Any) -> str:
         return translations.translate(key, locale=self.language, count=count, **values)
 
-    def pick(self, english: str, portuguese: str) -> str:
-        """Compatibility helper for non-UI summaries during incremental migration."""
-        return portuguese if self.is_pt else english
-
     def _rendered(self, screen: str, text: str) -> str:
         rendered = text.strip()[:4096]
         logger.debug(

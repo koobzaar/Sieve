@@ -66,11 +66,6 @@ class DailyGeminiBudgetExhausted(GeminiError):
         self.scope = scope
 
 
-# Explicit aliases keep the public names discoverable for callers using either order.
-GeminiTemporaryThrottle = TemporaryGeminiThrottle
-GeminiDailyBudgetExhausted = DailyGeminiBudgetExhausted
-
-
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
 

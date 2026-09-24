@@ -257,8 +257,7 @@ avoids treating missing information as evidence either way.
 ### Requirements
 
 - Docker and Docker Compose (or Python 3.12+ for local runs)
-- A Telegram **user account** with [API credentials](https://my.telegram.org) — this is what reads
-  the groups
+- For Telegram group ingestion, a Telegram **user account** with [API credentials](https://my.telegram.org)
 - A separate Telegram **bot** that already has an open private conversation with your account —
   this is what delivers
 - A Gemini API key for evaluation and natural-language preference commands
@@ -271,8 +270,9 @@ cd Sieve
 cp .env.example .env
 ```
 
-Fill in `.env`. `GEMINI_API_KEY` is always required at runtime; the Telegram credentials are
-required by the corresponding enabled source/bot integrations:
+Fill in `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ADMIN_USER_ID` in `.env`.
+The example enables Pelando and the private preference bot. Telegram group ingestion is optional
+and additionally needs `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` and the one-time login below:
 
 ```dotenv
 TELEGRAM_API_ID=
@@ -287,31 +287,36 @@ GEMINI_API_KEY=
 > `config/config.yaml` is complete and contains no secrets; secrets are resolved from environment
 > variable names.
 
-Edit `config/config.yaml`: set your profile, aliases and hard rules; optionally add initial Telegram `chat_ids`;
-set `preferences.admin_telegram_user_id_env`; and explicitly set `enabled: true` only for the sources,
-Gemini evaluation and preference bot integrations you intend to run. The tracked config starts
-with every external integration disabled.
+Common settings are in `.env`: `SIEVE_GEMINI_MODEL`, `SIEVE_GEMINI_EVALUATION_ENABLED`,
+`SIEVE_BM25_THRESHOLD`, `SIEVE_BM25_AUTO_FORWARD_THRESHOLD`, `SIEVE_BM25_AUTO_FORWARD_MODE`,
+`SIEVE_PELANDO_ENABLED`, `SIEVE_TELEGRAM_ENABLED`, `SIEVE_PREFERENCES_ENABLED` and `SIEVE_LOG_LEVEL`.
+Advanced limits, initial aliases/rules and optional initial Telegram `chat_ids` stay in
+`config/config.yaml`. Use the bot to add your product interests after startup.
+Without environment overrides, the tracked YAML keeps sources and preferences disabled.
 
 ### 2. Authenticate the Telegram user session
 
-Interactive, one time only. Telethon writes the session file into the persistent `/state` volume.
+Skip this step for Pelando-only setups. Otherwise, build the image and run the interactive login
+once. Telethon writes the session file into the persistent `/state` volume.
 
 ```bash
+docker compose build sieve
 docker compose run --rm sieve \
   --config /app/config/config.yaml auth-telegram --source telegram-principal
 ```
 
 Scan the terminal QR code from Telegram's **Settings → Devices → Link Desktop Device**. Enter only
-your 2FA password if Telegram requests it. Then set the source to `enabled: true` in
-`config/config.yaml`. Its `chat_ids` are only a one-time bootstrap for a fresh SQLite database;
+your 2FA password if Telegram requests it. Then set `SIEVE_TELEGRAM_ENABLED=true` in
+`.env`. Its `chat_ids` are only a one-time bootstrap for a fresh SQLite database;
 they may be empty when groups will be selected from the administrator's **Groups** menu.
 
 ### 3. Validate and run
 
 ```bash
-docker compose run --rm sieve --config /app/config/config.yaml validate-config
-docker compose config
-docker compose up -d --build
+docker compose config --quiet
+docker compose build sieve
+docker compose run --rm sieve validate-config --runtime
+docker compose up -d --wait
 docker compose logs -f sieve
 ```
 
@@ -319,6 +324,17 @@ Health is checked automatically every 60s via the `health` subcommand — it ver
 `PRAGMA quick_check` and a runtime heartbeat newer than 180 seconds. JSON logs report component,
 exception type, provider status/code, consecutive failures, retry timing, and alert decisions
 without logging message bodies, contact data, Telegram tokens, usernames, or display names.
+
+Send `/start` to the bot, then describe the products you want to track. After changing `.env` or
+YAML, run `docker compose up -d --force-recreate --wait`; no image rebuild is needed for settings.
+Preferences already saved in SQLite continue to be managed through the bot.
+
+For debugging, use `docker compose ps`, `docker compose exec sieve health` and
+`docker compose logs --since 10m sieve`. Set `SIEVE_LOG_LEVEL=DEBUG` in `.env` and recreate the
+container for more detail. `validate-config` checks YAML without requiring credentials;
+`validate-config --runtime` also checks startup requirements without making API requests.
+Shutdown allows 30 seconds to drain promotions before cancellation; durable outbox/retry entries
+remain available after restart. A `shutdown_queue_timeout` log identifies an incomplete drain.
 
 <details>
 <summary><b>Running without Docker</b></summary>
@@ -329,8 +345,10 @@ python -m venv .venv
 .venv/bin/sieve --config config/config.yaml run
 ```
 
-You'll need to point `state.path` and `session_path` at writable local directories instead of
-`/state`. On Windows use `.venv\Scripts\`.
+Export the variables from `.env` into your shell first: Python does not load dotenv files.
+Point `state.path`, `state.media_path` and `session_path` at writable local directories instead of
+`/state`. On Windows use `.venv\Scripts\`. `SIEVE_CONFIG` and `SIEVE_LOG_LEVEL` set CLI defaults;
+explicit `--config` and `--log-level` flags override them.
 
 </details>
 
@@ -374,9 +392,16 @@ no promotions.
 
 ## Configuration
 
-Edit the complete tracked [`config/config.yaml`](config/config.yaml). Every Sieve command uses this
-single file by default. Configuration inheritance is not supported. Secrets are read from
-environment variables named _by_ the config, never stored in YAML.
+The complete advanced settings live in [`config/config.yaml`](config/config.yaml). Configuration
+inheritance is not supported. To use an untracked complete local copy, copy it to
+`config/config.local.yaml` and set `SIEVE_CONFIG_FILE=./config/config.local.yaml` in `.env`.
+Compose mounts that file read-only at `/app/config/config.yaml`.
+
+Whole YAML values support `${VARIABLE:-default}`. Defaults retain their type: numeric and boolean
+defaults accept YAML values of those types; string defaults remain strings (including `off`).
+`${VARIABLE}` without a default requires a nonempty environment variable. Compose injects `.env`
+using `env_file`; interpolation inside the application happens after YAML parsing. Secrets remain
+environment variable names in `*_env` settings and are never stored in YAML.
 
 ### Upgrading from the layered configuration
 
@@ -397,7 +422,7 @@ owner/chat keys, or sink chat destinations cause a clear validation error and mu
 
 | Block       | Notable keys                                                                                                                |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `runtime`   | `queue_capacity`, `memory_limit_mb`, `failure_alert_threshold`, `llm_outage_alert_seconds`                            |
+| `runtime`   | `queue_capacity`, `memory_limit_mb`, `failure_alert_threshold`, `llm_outage_alert_seconds`, `shutdown_timeout_seconds` |
 | `state`     | `path`, `media_path` (`/state/media`), retention/corpus limits, and retry bounds                                             |
 | `pipeline`  | `gemini_evaluation_enabled`, BM25 thresholds/mode/audit parameters, profile, aliases and rules                         |
 | `evaluator` | Decision-evaluator factory and its decision-specific `max_output_tokens` override                                           |
@@ -550,7 +575,7 @@ The `sieve` entrypoint takes a global `--config` and `--log-level`, then a subco
 | `smoke-telegram-preferences [--source NAME] [--session-path PATH] [--timeout SECONDS]`   | Run the non-mutating live preference-bot gate with a dedicated user session.   |
 | `replay FIXTURE [--no-fail]`                                                             | Score pre-LLM filtering against a labeled JSONL file.                          |
 | `health`                                                                                 | Print JSON health status; exit 1 if unhealthy. Used by the Docker healthcheck. |
-| `validate-config`                                                                        | Parse the YAML without touching secrets.                                       |
+| `validate-config [--runtime]` | Validate settings; optionally check required environment variables and enabled factories without API calls. |
 
 ---
 
@@ -581,11 +606,17 @@ while **retaining ≥95% of relevant ones**. Use `--no-fail` to print metrics wi
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e ".[test]"
+.venv/bin/pip install -e ".[test,dev]"
+.venv/bin/python -m ruff check promo_bot tests
 .venv/bin/python -m pytest
 ```
 
 On Windows PowerShell, use `.venv\Scripts\pip` and `.venv\Scripts\python`.
+
+Docker installs the hash-verified runtime versions in `requirements.lock`. When changing
+dependencies, regenerate it with `uv pip compile pyproject.toml --python-version 3.12 --universal
+--generate-hashes --no-annotate --no-header --output-file requirements.lock`, then run the Docker
+gate. Developer conventions and required checks are in [`AGENTS.md`](AGENTS.md).
 
 The default suite never touches live services; the `contract` and Docker `system` gates are
 skipped unless explicitly enabled. Tests run against saved HTML/JSON-LD fixtures, synthetic events,
@@ -599,6 +630,7 @@ replay, and `soak`-marked promotion, 500-entry, 10,000-document rebuild and comm
 .venv/bin/python -m pytest -m "not soak"   # skip the long one
 SIEVE_RUN_GEMINI_CONTRACT=1 GEMINI_API_KEY=... .venv/bin/python -m pytest -m contract
 SIEVE_RUN_SYSTEM=1 .venv/bin/python -m pytest -m system
+RUN_SOAK=1 .venv/bin/python -m pytest -m soak
 ```
 
 Set `SIEVE_GEMINI_MODEL` to override the contract test's default
@@ -609,6 +641,12 @@ and removes its isolated SQLite volume unconditionally.
 ---
 
 ## Rollout
+
+`auto-deploy.sh` uses its own repository directory and the current Docker context. A scheduler
+can override these with `SIEVE_REPO_DIR` and `SIEVE_DOCKER_CONTEXT`; set
+`SIEVE_OTHER_DOCKER_CONTEXT` to check another context for a duplicate running bot. These are
+shell/scheduler variables, not container settings. Deployment validates configuration before
+recreating the service and refuses tracked working-tree changes.
 
 Promotion delivery has no shadow mode. Calibrate the independent BM25 auto-forward path before
 changing `pipeline.bm25_auto_forward_mode` to `live`:

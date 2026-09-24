@@ -1,8 +1,11 @@
+# Whole values support ${VARIABLE:-default}; Docker supplies variables from .env.
+# Credentials remain environment variable names and are never stored in this file.
 runtime:
   queue_capacity: 256
   memory_limit_mb: 220
   failure_alert_threshold: 3
   llm_outage_alert_seconds: 300
+  shutdown_timeout_seconds: 30
 
 state:
   path: /state/sieve.db
@@ -14,10 +17,10 @@ state:
   retry_ttl_seconds: 3600
 
 pipeline:
-  gemini_evaluation_enabled: true
-  bm25_threshold: 2.0
-  bm25_auto_forward_threshold: 7.0
-  bm25_auto_forward_mode: shadow
+  gemini_evaluation_enabled: ${SIEVE_GEMINI_EVALUATION_ENABLED:-true}
+  bm25_threshold: ${SIEVE_BM25_THRESHOLD:-2.0}
+  bm25_auto_forward_threshold: ${SIEVE_BM25_AUTO_FORWARD_THRESHOLD:-7.0}
+  bm25_auto_forward_mode: ${SIEVE_BM25_AUTO_FORWARD_MODE:-shadow}
   bm25_below_threshold_audit_rate: 0.05
   bm25_k1: 1.2
   bm25_b: 0.75
@@ -38,7 +41,7 @@ evaluator:
 
 gemini:
   api_key_env: GEMINI_API_KEY
-  model: gemini-3.5-flash-lite
+  model: ${SIEVE_GEMINI_MODEL:-gemini-3.5-flash-lite}
   provider_url: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
   timeout_seconds: 20
   retries: 2
@@ -72,7 +75,7 @@ gemini:
       max_output_tokens: 120
 
 preferences:
-  enabled: false
+  enabled: ${SIEVE_PREFERENCES_ENABLED:-false}
   admin_telegram_user_id_env: TELEGRAM_ADMIN_USER_ID
   max_users: 10
   token_env: TELEGRAM_BOT_TOKEN
@@ -99,7 +102,7 @@ sink:
 sources:
   - name: telegram-principal
     factory: promo_bot.sources.telegram:create_telegram_source
-    enabled: false
+    enabled: ${SIEVE_TELEGRAM_ENABLED:-false}
     settings:
       api_id_env: TELEGRAM_API_ID
       api_hash_env: TELEGRAM_API_HASH
@@ -108,7 +111,7 @@ sources:
 
   - name: pelando
     factory: promo_bot.sources.pelando:create_pelando_source
-    enabled: false
+    enabled: ${SIEVE_PELANDO_ENABLED:-false}
     settings:
       url: https://www.pelando.com.br/recentes
       interval_seconds: 120

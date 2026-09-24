@@ -11,7 +11,6 @@ from .preferences import (
 )
 
 PromotionEmitter = Callable[[Promotion], Awaitable[None]]
-FailureReporter = Callable[[str, Exception], Awaitable[None]]
 
 
 @runtime_checkable

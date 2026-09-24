@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from .config import AppConfig, env_secret, load_factory
+from .config import AppConfig, env_secret, load_factory, validate_runtime_config
 from .delivery import TelegramDeliveryWorker
 from .evaluator import RetryableEvaluationError
 from .gemini import GeminiRequestBroker, GeminiStructuredClient
@@ -51,6 +51,7 @@ def resident_memory_bytes() -> int:
 
 class Service:
     def __init__(self, config: AppConfig) -> None:
+        validate_runtime_config(config)
         self.config = config
         self.stop = asyncio.Event()
         self._failure_started: dict[str, float] = {}
@@ -498,46 +499,59 @@ class Service:
                 pass
 
     async def run(self) -> None:
-        if not self.sources:
-            raise RuntimeError("no enabled promotion sources")
-        if self.preference_bot is not None:
-            await self.preference_bot.drain_outbox()
-            await self.preference_bot.check_webhook()
         loop = asyncio.get_running_loop()
+        registered_signals = []
         for signal_name in (signal.SIGINT, signal.SIGTERM):
             with suppress(NotImplementedError):
                 loop.add_signal_handler(signal_name, self.stop.set)
-        tasks = [
-            asyncio.create_task(self._pipeline_worker(), name="pipeline"),
-            asyncio.create_task(self._retry_worker(), name="retry"),
-            asyncio.create_task(self._delivery_worker(), name="delivery"),
-            asyncio.create_task(self._maintenance(), name="maintenance"),
-            asyncio.create_task(self._memory_monitor(), name="memory"),
-            asyncio.create_task(self._alias_rebuild_worker(), name="alias-rebuild"),
-            *[
+                registered_signals.append(signal_name)
+        tasks: list[asyncio.Task] = []
+        source_tasks: list[asyncio.Task] = []
+        stop_task = asyncio.create_task(self.stop.wait(), name="stop")
+        try:
+            if not self.sources:
+                raise RuntimeError("no enabled promotion sources")
+            if self.preference_bot is not None:
+                await self.preference_bot.drain_outbox()
+                await self.preference_bot.check_webhook()
+            tasks = [
+                asyncio.create_task(self._pipeline_worker(), name="pipeline"),
+                asyncio.create_task(self._retry_worker(), name="retry"),
+                asyncio.create_task(self._delivery_worker(), name="delivery"),
+                asyncio.create_task(self._maintenance(), name="maintenance"),
+                asyncio.create_task(self._memory_monitor(), name="memory"),
+                asyncio.create_task(self._alias_rebuild_worker(), name="alias-rebuild"),
+            ]
+            source_tasks = [
                 asyncio.create_task(source.run(self.emit, self.stop), name=f"source:{source.name}")
                 for source in self.sources
-            ],
-        ]
-        if self.preference_bot is not None:
-            tasks.append(
-                asyncio.create_task(
-                    self.preference_bot.run(self.stop), name="preference-bot"
-                )
-            )
-        logger.info("service_started", extra={"event": "service_started", "sources": len(self.sources)})
-        try:
-            while not self.stop.is_set():
-                terminal = [task for task in tasks if task.done() and task.exception()]
-                if terminal:
-                    raise terminal[0].exception()  # type: ignore[misc]
-                await asyncio.sleep(0.5)
-            await self.queue.join()
+            ]
+            tasks.extend(source_tasks)
+            if self.preference_bot is not None:
+                tasks.append(asyncio.create_task(self.preference_bot.run(self.stop), name="preference-bot"))
+            logger.info("service_started", extra={"event": "service_started", "sources": len(self.sources)})
+            done, _ = await asyncio.wait([stop_task, *tasks], return_when=asyncio.FIRST_COMPLETED)
+            for task in done - {stop_task}:
+                if not task.cancelled() and task.exception() is not None:
+                    raise task.exception()
+                if not self.stop.is_set():
+                    raise RuntimeError(f"worker {task.get_name()} stopped unexpectedly")
+            # Stop producers before draining; otherwise a late emit can strand the queue.
+            for task in source_tasks:
+                task.cancel()
+            await asyncio.gather(*source_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(self.queue.join(), self.config.shutdown_timeout_seconds)
+            except TimeoutError:
+                logger.warning("shutdown_queue_timeout", extra={
+                    "event": "shutdown_queue_timeout", "queue_size": self.queue.qsize(),
+                })
         finally:
             self.stop.set()
+            stop_task.cancel()
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(stop_task, *tasks, return_exceptions=True)
             for source in self.sources:
                 with suppress(Exception):
                     await source.close()
@@ -554,8 +568,11 @@ class Service:
                 with suppress(Exception):
                     await self.preference_bot.close()
             await self.http.aclose()
-            self.preference_store.close()
+            for preference_store in self.preference_stores.values():
+                preference_store.close()
             self.store.close()
+            for signal_name in registered_signals:
+                loop.remove_signal_handler(signal_name)
             logger.info("service_stopped", extra={"event": "service_stopped"})
 
 

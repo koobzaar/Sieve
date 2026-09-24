@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
-from typing import Any
 
-from .config import ConfigurationError, env_secret, load_config
+from .config import ConfigurationError, env_secret, load_config, validate_runtime_config
 from .logging import configure_logging
 from .replay import calibrate, load_labeled_jsonl
 from .runtime import run_service
@@ -33,11 +34,22 @@ def _smoke_timeout(value: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sieve")
-    parser.add_argument("--config", default="config/config.yaml", help="YAML configuration")
-    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("SIEVE_CONFIG", "config/config.yaml"),
+        help="YAML configuration (or SIEVE_CONFIG)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("SIEVE_LOG_LEVEL", "INFO"),
+        type=str.upper,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("run", help="run the service")
-    auth = commands.add_parser("auth-telegram", help="create/update the persisted user session")
+    auth = commands.add_parser(
+        "auth-telegram", help="create/update the persisted user session"
+    )
     auth.add_argument("--source", help="configured Telegram source name")
     smoke = commands.add_parser(
         "smoke-telegram-preferences",
@@ -55,11 +67,20 @@ def _parser() -> argparse.ArgumentParser:
         default=90.0,
         help="whole smoke-test timeout in seconds (10-300; default: 90)",
     )
-    replay = commands.add_parser("replay", help="calibrate pre-LLM filtering against JSONL")
+    replay = commands.add_parser(
+        "replay", help="calibrate pre-LLM filtering against JSONL"
+    )
     replay.add_argument("fixture")
-    replay.add_argument("--no-fail", action="store_true", help="report metrics without acceptance exit")
+    replay.add_argument(
+        "--no-fail", action="store_true", help="report metrics without acceptance exit"
+    )
     commands.add_parser("health", help="check database and runtime heartbeat")
-    commands.add_parser("validate-config", help="parse configuration without reading secrets")
+    validate = commands.add_parser("validate-config", help="validate YAML settings")
+    validate.add_argument(
+        "--runtime",
+        action="store_true",
+        help="also check enabled sources, factories and required environment variables",
+    )
     return parser
 
 
@@ -77,7 +98,9 @@ async def _auth_telegram(config_path: str, source_name: str | None) -> None:
     try:
         await authorize_with_qr(client)
         me = await client.get_me()
-        print(f"Authorized Telegram session for user id {me.id} at {session_path}.session")
+        print(
+            f"Authorized Telegram session for user id {me.id} at {session_path}.session"
+        )
     finally:
         await client.disconnect()
 
@@ -89,28 +112,29 @@ def _health(config_path: str) -> int:
         print(json.dumps({"healthy": False, "reason": "state database is missing"}))
         return 1
     try:
-        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=2)
-        check = connection.execute("PRAGMA quick_check").fetchone()[0]
-        row = connection.execute(
-            "SELECT last_success FROM health_state WHERE name='runtime'"
-        ).fetchone()
-        active_users = connection.execute(
-            "SELECT COUNT(*) FROM users WHERE status='active'"
-        ).fetchone()[0]
-        corpus_documents = connection.execute(
-            "SELECT COUNT(*) FROM corpus_docs"
-        ).fetchone()[0]
-        outbox = connection.execute(
-            "SELECT "
-            "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),"
-            "MIN(CASE WHEN status='pending' THEN created_at END),"
-            "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) "
-            "FROM delivery_outbox"
-        ).fetchone()
-        retries = connection.execute(
-            "SELECT value FROM delivery_metrics WHERE name='retries'"
-        ).fetchone()
-        connection.close()
+        with closing(
+            sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+        ) as connection:
+            check = connection.execute("PRAGMA quick_check").fetchone()[0]
+            row = connection.execute(
+                "SELECT last_success FROM health_state WHERE name='runtime'"
+            ).fetchone()
+            active_users = connection.execute(
+                "SELECT COUNT(*) FROM users WHERE status='active'"
+            ).fetchone()[0]
+            corpus_documents = connection.execute(
+                "SELECT COUNT(*) FROM corpus_docs"
+            ).fetchone()[0]
+            outbox = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),"
+                "MIN(CASE WHEN status='pending' THEN created_at END),"
+                "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) "
+                "FROM delivery_outbox"
+            ).fetchone()
+            retries = connection.execute(
+                "SELECT value FROM delivery_metrics WHERE name='retries'"
+            ).fetchone()
     except sqlite3.Error as exc:
         print(json.dumps({"healthy": False, "reason": f"database error: {exc}"}))
         return 1
@@ -181,7 +205,9 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "health":
             raise SystemExit(_health(args.config))
         elif args.command == "validate-config":
-            load_config(args.config)
+            config = load_config(args.config)
+            if args.runtime:
+                validate_runtime_config(config)
             print("configuration is valid")
     except ConfigurationError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)

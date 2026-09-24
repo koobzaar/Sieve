@@ -798,7 +798,6 @@ class PelandoSource:
         self.last_modified: str | None = None
         self._detail_cache: OrderedDict[str, _DetailCacheEntry] = OrderedDict()
         self._detail_semaphore = asyncio.Semaphore(self.detail_concurrency)
-        self._closed = False
 
     @staticmethod
     def _canonical_detail_url(value: str | None) -> str | None:
@@ -993,7 +992,8 @@ class PelandoSource:
                 pass
 
     async def close(self) -> None:
-        self._closed = True
+        # The runtime owns and closes the shared HTTP client.
+        pass
 
 
 def create_pelando_source(

@@ -134,11 +134,10 @@ class PromotionPipeline:
         self.delivery_chat_id: int | None = None
         self.delivery_language = "en"
         try:
-            parameters = inspect.signature(self.evaluator.evaluate).parameters.values()
+            parameters = inspect.signature(self.evaluator.evaluate).parameters
             self._evaluator_accepts_context = (
-                "preference_context" in inspect.signature(self.evaluator.evaluate).parameters
-                or any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters)
-                or len(inspect.signature(self.evaluator.evaluate).parameters) >= 3
+                "preference_context" in parameters
+                or any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values())
             )
         except (TypeError, ValueError):
             self._evaluator_accepts_context = True

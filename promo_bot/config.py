@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -81,6 +82,7 @@ class AppConfig:
     preferences: PreferenceConfig = field(default_factory=PreferenceConfig)
     failure_alert_threshold: int = 3
     llm_outage_alert_seconds: int = 300
+    shutdown_timeout_seconds: int = 30
 
 
 def _mapping(value: Any, key: str) -> dict[str, Any]:
@@ -95,13 +97,55 @@ def _boolean(value: Any, key: str) -> bool:
     return value
 
 
+def _integer(value: Any, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigurationError(f"{key} must be an integer")
+    return value
+
+
+def _number(value: Any, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigurationError(f"{key} must be a number")
+    if not math.isfinite(value):
+        raise ConfigurationError(f"{key} must be finite")
+    return float(value)
+
+
+_ENV_VALUE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^\n]*))?\}")
+
+
+def _resolve_environment(value: Any) -> Any:
+    """Resolve whole YAML values, preserving boolean/number/list types."""
+    if isinstance(value, dict):
+        return {key: _resolve_environment(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_environment(item) for item in value]
+    match = _ENV_VALUE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return value
+    name, default = match.groups()
+    resolved = os.environ.get(name) or default
+    if resolved is None:
+        raise ConfigurationError(f"required environment variable {name} is not set")
+    try:
+        if default is not None and (
+            default == "" or isinstance(yaml.safe_load(default), str)
+        ):
+            return resolved
+        return yaml.safe_load(resolved)
+    except yaml.YAMLError:
+        raise ConfigurationError(
+            f"environment variable {name} contains invalid YAML"
+        ) from None
+
+
 def _load_raw_config(path: Path) -> dict[str, Any]:
     config_path = path.resolve()
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigurationError(f"cannot load {config_path}: {exc}") from exc
-    root = _mapping(raw, str(config_path))
+    root = _mapping(_resolve_environment(raw), str(config_path))
     if "extends" in root:
         raise ConfigurationError(
             f"{config_path}: extends is no longer supported; "
@@ -113,7 +157,9 @@ def _load_raw_config(path: Path) -> dict[str, Any]:
 def _phrases(value: Any, key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise ConfigurationError(f"{key} must be a nonempty list of phrases")
-    phrases = tuple(str(item).strip() for item in value)
+    if any(not isinstance(item, str) for item in value):
+        raise ConfigurationError(f"{key} must contain strings")
+    phrases = tuple(item.strip() for item in value)
     if any(not phrase for phrase in phrases):
         raise ConfigurationError(f"{key} cannot contain empty phrases")
     return phrases
@@ -130,20 +176,30 @@ def _hard_rules(pipeline: dict[str, Any]) -> tuple[HardFilterRule, ...]:
         rule = _mapping(raw_rule, f"pipeline.hard_rules[{index}]")
         rule_id = str(rule.get("id", "")).strip()
         if not rule_id or rule_id in ids:
-            raise ConfigurationError(f"hard rule id must be nonempty and unique: {rule_id!r}")
+            raise ConfigurationError(
+                f"hard rule id must be nonempty and unique: {rule_id!r}"
+            )
         try:
-            priority = int(rule["priority"])
+            priority = _integer(rule["priority"], f"hard rule {rule_id}.priority")
         except (KeyError, TypeError, ValueError) as exc:
-            raise ConfigurationError(f"hard rule {rule_id!r} needs an integer priority") from exc
+            raise ConfigurationError(
+                f"hard rule {rule_id!r} needs an integer priority"
+            ) from exc
         if priority in priorities:
             raise ConfigurationError(f"hard rule priority must be unique: {priority}")
         action = str(rule.get("action", "")).strip().casefold()
         if action not in {"allow", "deny"}:
-            raise ConfigurationError(f"hard rule {rule_id!r} action must be allow or deny")
-        any_phrases = _phrases(rule["any"], f"hard rule {rule_id}.any") if "any" in rule else ()
+            raise ConfigurationError(
+                f"hard rule {rule_id!r} action must be allow or deny"
+            )
+        any_phrases = (
+            _phrases(rule["any"], f"hard rule {rule_id}.any") if "any" in rule else ()
+        )
         raw_groups = rule.get("all", [])
         if not isinstance(raw_groups, list):
-            raise ConfigurationError(f"hard rule {rule_id}.all must be a list of phrase lists")
+            raise ConfigurationError(
+                f"hard rule {rule_id}.all must be a list of phrase lists"
+            )
         all_groups = tuple(
             _phrases(group, f"hard rule {rule_id}.all[{group_index}]")
             for group_index, group in enumerate(raw_groups)
@@ -189,16 +245,22 @@ def load_config(path: str | Path) -> AppConfig:
     if removed_preferences:
         key = sorted(removed_preferences)[0]
         raise ConfigurationError(
-            f"preferences.{key} was removed; use "
-            "preferences.admin_telegram_user_id_env"
+            f"preferences.{key} was removed; use preferences.admin_telegram_user_id_env"
         )
     if "chat_id_env" in _mapping(sink.get("settings", {}), "sink.settings"):
         raise ConfigurationError(
             "sink.settings.chat_id_env was removed; destinations come from UUID users"
         )
     source_items: list[SourceConfig] = []
+    source_names: set[str] = set()
     for raw_source in sources_raw:
         item = _mapping(raw_source, "source")
+        for key in ("name", "factory"):
+            if not isinstance(item.get(key), str) or not item[key].strip():
+                raise ConfigurationError(f"source.{key} must be a nonempty string")
+        if item["name"] in source_names:
+            raise ConfigurationError(f"duplicate source name: {item['name']}")
+        source_names.add(item["name"])
         if "mode" in item:
             raise ConfigurationError(
                 f"source {item.get('name')} mode was removed; delivery is always live"
@@ -207,7 +269,9 @@ def load_config(path: str | Path) -> AppConfig:
             SourceConfig(
                 name=str(item["name"]),
                 factory=str(item["factory"]),
-                enabled=bool(item.get("enabled", True)),
+                enabled=_boolean(
+                    item.get("enabled", True), f"source {item['name']}.enabled"
+                ),
                 settings=_mapping(
                     item.get("settings", {}),
                     f"source {item.get('name')} settings",
@@ -216,9 +280,15 @@ def load_config(path: str | Path) -> AppConfig:
         )
     sources = tuple(source_items)
     aliases = _mapping(pipeline.get("aliases", {}), "pipeline.aliases")
+    for key, values in aliases.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ConfigurationError("pipeline.aliases keys must be nonempty strings")
+        _phrases(values, f"pipeline.aliases.{key}")
     evaluator_settings = _mapping(llm.get("settings", {}), "evaluator.settings")
     if not str(gemini_raw.get("model") or evaluator_settings.get("model", "")).strip():
-        raise ConfigurationError("evaluator.settings.model must be explicitly configured")
+        raise ConfigurationError(
+            "evaluator.settings.model must be explicitly configured"
+        )
     gemini_settings = {
         "api_key_env": evaluator_settings.get("api_key_env", "GEMINI_API_KEY"),
         "model": evaluator_settings.get("model"),
@@ -242,9 +312,13 @@ def load_config(path: str | Path) -> AppConfig:
         raise ConfigurationError("gemini.api_key_env must be nonempty")
     if not str(gemini_settings.get("model", "")).strip():
         raise ConfigurationError("gemini.model must be explicitly configured")
-    if not 1 <= int(gemini_settings.get("retries", 3)) <= 5:
+    gemini_settings["retries"] = _integer(gemini_settings["retries"], "gemini.retries")
+    gemini_settings["timeout_seconds"] = _number(
+        gemini_settings["timeout_seconds"], "gemini.timeout_seconds"
+    )
+    if not 1 <= gemini_settings["retries"] <= 5:
         raise ConfigurationError("gemini.retries must be between 1 and 5")
-    if not 1 <= float(gemini_settings.get("timeout_seconds", 20)) <= 120:
+    if not 1 <= gemini_settings["timeout_seconds"] <= 120:
         raise ConfigurationError("gemini.timeout_seconds must be between 1 and 120")
     if str(gemini_settings.get("thinking_level", "minimal")) not in {
         "minimal",
@@ -262,10 +336,7 @@ def load_config(path: str | Path) -> AppConfig:
         ("rpm_cap", 1, 60),
         ("ledger_retention_days", 1, 365),
     ):
-        try:
-            value = int(gemini_settings[key])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ConfigurationError(f"gemini.{key} must be an integer") from exc
+        value = _integer(gemini_settings[key], f"gemini.{key}")
         if not minimum <= value <= maximum:
             raise ConfigurationError(
                 f"gemini.{key} must be between {minimum} and {maximum}"
@@ -292,15 +363,28 @@ def load_config(path: str | Path) -> AppConfig:
     for stage_name, (default_input, default_output) in stage_defaults.items():
         stage = _mapping(raw_stages.get(stage_name, {}), f"gemini.stages.{stage_name}")
         configured = {
-            "schema_version": str(stage.get("schema_version", f"promotion-{stage_name}-v1")),
-            "prompt_version": str(stage.get("prompt_version", f"promotion-{stage_name}-prompt-v1")),
-            "max_input_chars": int(stage.get("max_input_chars", default_input)),
-            "max_output_tokens": int(stage.get("max_output_tokens", default_output)),
+            "schema_version": str(
+                stage.get("schema_version", f"promotion-{stage_name}-v1")
+            ),
+            "prompt_version": str(
+                stage.get("prompt_version", f"promotion-{stage_name}-prompt-v1")
+            ),
+            "max_input_chars": _integer(
+                stage.get("max_input_chars", default_input),
+                f"gemini.stages.{stage_name}.max_input_chars",
+            ),
+            "max_output_tokens": _integer(
+                stage.get("max_output_tokens", default_output),
+                f"gemini.stages.{stage_name}.max_output_tokens",
+            ),
         }
         if any(
             not configured[key]
             or len(configured[key]) > 80
-            or not all(character.isalnum() or character in "._-" for character in configured[key])
+            or not all(
+                character.isalnum() or character in "._-"
+                for character in configured[key]
+            )
             for key in ("schema_version", "prompt_version")
         ):
             raise ConfigurationError(
@@ -326,29 +410,43 @@ def load_config(path: str | Path) -> AppConfig:
         "thinking_level",
     ):
         effective_evaluator_settings[shared_key] = gemini_settings[shared_key]
-    preference_parser = _mapping(
-        preference_raw.get("parser", {}), "preferences.parser"
-    )
+    preference_parser = _mapping(preference_raw.get("parser", {}), "preferences.parser")
     preference_config = PreferenceConfig(
-        enabled=bool(preference_raw.get("enabled", False)),
+        enabled=_boolean(preference_raw.get("enabled", False), "preferences.enabled"),
         admin_telegram_user_id_env=str(
-            preference_raw.get(
-                "admin_telegram_user_id_env", "TELEGRAM_ADMIN_USER_ID"
-            )
+            preference_raw.get("admin_telegram_user_id_env", "TELEGRAM_ADMIN_USER_ID")
         ),
-        max_users=int(preference_raw.get("max_users", 10)),
+        max_users=_integer(
+            preference_raw.get("max_users", 10), "preferences.max_users"
+        ),
         token_env=str(preference_raw.get("token_env", "TELEGRAM_BOT_TOKEN")),
         api_url=str(preference_raw.get("api_url", "https://api.telegram.org")),
-        polling_timeout=int(preference_raw.get("polling_timeout", 30)),
-        queue_capacity=int(preference_raw.get("queue_capacity", 20)),
-        rate_per_minute=int(preference_raw.get("rate_per_minute", 5)),
-        rate_per_hour=int(preference_raw.get("rate_per_hour", 20)),
-        confirmation_ttl_seconds=int(
-            preference_raw.get("confirmation_ttl_seconds", 600)
+        polling_timeout=_integer(
+            preference_raw.get("polling_timeout", 30), "preferences.polling_timeout"
         ),
-        max_entries=int(preference_raw.get("max_entries", 500)),
-        max_operations=int(preference_raw.get("max_operations", 25)),
-        max_state_bytes=int(preference_raw.get("max_state_bytes", 128 * 1024)),
+        queue_capacity=_integer(
+            preference_raw.get("queue_capacity", 20), "preferences.queue_capacity"
+        ),
+        rate_per_minute=_integer(
+            preference_raw.get("rate_per_minute", 5), "preferences.rate_per_minute"
+        ),
+        rate_per_hour=_integer(
+            preference_raw.get("rate_per_hour", 20), "preferences.rate_per_hour"
+        ),
+        confirmation_ttl_seconds=_integer(
+            preference_raw.get("confirmation_ttl_seconds", 600),
+            "preferences.confirmation_ttl_seconds",
+        ),
+        max_entries=_integer(
+            preference_raw.get("max_entries", 500), "preferences.max_entries"
+        ),
+        max_operations=_integer(
+            preference_raw.get("max_operations", 25), "preferences.max_operations"
+        ),
+        max_state_bytes=_integer(
+            preference_raw.get("max_state_bytes", 128 * 1024),
+            "preferences.max_state_bytes",
+        ),
         parser=dict(preference_parser),
     )
     if not 1 <= preference_config.queue_capacity <= 100:
@@ -362,7 +460,9 @@ def load_config(path: str | Path) -> AppConfig:
     if not 1 <= preference_config.polling_timeout <= 50:
         raise ConfigurationError("preferences.polling_timeout must be between 1 and 50")
     if preference_config.confirmation_ttl_seconds <= 0:
-        raise ConfigurationError("preferences.confirmation_ttl_seconds must be positive")
+        raise ConfigurationError(
+            "preferences.confirmation_ttl_seconds must be positive"
+        )
     if not 1 <= preference_config.max_operations <= 25:
         raise ConfigurationError("preferences.max_operations must be between 1 and 25")
     if not 1 <= preference_config.max_entries <= 500:
@@ -377,15 +477,19 @@ def load_config(path: str | Path) -> AppConfig:
         pipeline.get("gemini_evaluation_enabled", True),
         "pipeline.gemini_evaluation_enabled",
     )
-    bm25_threshold = float(pipeline.get("bm25_threshold", 2.0))
-    bm25_auto_forward_threshold = float(
-        pipeline.get("bm25_auto_forward_threshold", 7.0)
+    bm25_threshold = _number(
+        pipeline.get("bm25_threshold", 2.0), "pipeline.bm25_threshold"
+    )
+    bm25_auto_forward_threshold = _number(
+        pipeline.get("bm25_auto_forward_threshold", 7.0),
+        "pipeline.bm25_auto_forward_threshold",
     )
     bm25_auto_forward_mode = str(
         pipeline.get("bm25_auto_forward_mode", "shadow")
     ).casefold()
-    bm25_below_threshold_audit_rate = float(
-        pipeline.get("bm25_below_threshold_audit_rate", 0.05)
+    bm25_below_threshold_audit_rate = _number(
+        pipeline.get("bm25_below_threshold_audit_rate", 0.05),
+        "pipeline.bm25_below_threshold_audit_rate",
     )
     if not math.isfinite(bm25_threshold) or bm25_threshold < 0:
         raise ConfigurationError("pipeline.bm25_threshold must be nonnegative")
@@ -407,16 +511,26 @@ def load_config(path: str | Path) -> AppConfig:
         raise ConfigurationError(
             "pipeline.bm25_below_threshold_audit_rate must be between 0 and 1"
         )
-    return AppConfig(
-        queue_capacity=int(runtime.get("queue_capacity", 256)),
+    config = AppConfig(
+        queue_capacity=_integer(
+            runtime.get("queue_capacity", 256), "runtime.queue_capacity"
+        ),
         state_path=str(state.get("path", "/state/sieve.db")),
         state_media_path=str(state.get("media_path", "/state/media")),
-        retention_days=int(state.get("retention_days", 30)),
-        retention_cap=int(state.get("retention_cap", 50_000)),
-        corpus_limit=int(state.get("corpus_limit", 10_000)),
-        retry_limit=int(state.get("retry_limit", 100)),
-        retry_ttl_seconds=int(state.get("retry_ttl_seconds", 3_600)),
-        memory_limit_mb=int(runtime.get("memory_limit_mb", 220)),
+        retention_days=_integer(
+            state.get("retention_days", 30), "state.retention_days"
+        ),
+        retention_cap=_integer(
+            state.get("retention_cap", 50_000), "state.retention_cap"
+        ),
+        corpus_limit=_integer(state.get("corpus_limit", 10_000), "state.corpus_limit"),
+        retry_limit=_integer(state.get("retry_limit", 100), "state.retry_limit"),
+        retry_ttl_seconds=_integer(
+            state.get("retry_ttl_seconds", 3_600), "state.retry_ttl_seconds"
+        ),
+        memory_limit_mb=_integer(
+            runtime.get("memory_limit_mb", 220), "runtime.memory_limit_mb"
+        ),
         profile=str(pipeline.get("profile", "")),
         aliases={str(k): [str(v) for v in values] for k, values in aliases.items()},
         hard_rules=_hard_rules(pipeline),
@@ -425,20 +539,108 @@ def load_config(path: str | Path) -> AppConfig:
         bm25_auto_forward_threshold=bm25_auto_forward_threshold,
         bm25_auto_forward_mode=bm25_auto_forward_mode,  # type: ignore[arg-type]
         bm25_below_threshold_audit_rate=bm25_below_threshold_audit_rate,
-        bm25_k1=float(pipeline.get("bm25_k1", 1.2)),
-        bm25_b=float(pipeline.get("bm25_b", 0.75)),
-        cold_start_documents=int(pipeline.get("cold_start_documents", 500)),
-        exceptional_temperature=int(pipeline.get("exceptional_temperature", 300)),
+        bm25_k1=_number(pipeline.get("bm25_k1", 1.2), "pipeline.bm25_k1"),
+        bm25_b=_number(pipeline.get("bm25_b", 0.75), "pipeline.bm25_b"),
+        cold_start_documents=_integer(
+            pipeline.get("cold_start_documents", 500), "pipeline.cold_start_documents"
+        ),
+        exceptional_temperature=_integer(
+            pipeline.get("exceptional_temperature", 300),
+            "pipeline.exceptional_temperature",
+        ),
         sources=sources,
-        evaluator_factory=str(llm.get("factory", "promo_bot.evaluator:create_gemini_evaluator")),
+        evaluator_factory=str(
+            llm.get("factory", "promo_bot.evaluator:create_gemini_evaluator")
+        ),
         evaluator=effective_evaluator_settings,
         gemini=gemini_settings,
         sink_factory=str(sink.get("factory", "promo_bot.sink:create_telegram_sink")),
         sink=_mapping(sink.get("settings", {}), "sink.settings"),
         preferences=preference_config,
-        failure_alert_threshold=int(runtime.get("failure_alert_threshold", 3)),
-        llm_outage_alert_seconds=int(runtime.get("llm_outage_alert_seconds", 300)),
+        failure_alert_threshold=_integer(
+            runtime.get("failure_alert_threshold", 3), "runtime.failure_alert_threshold"
+        ),
+        llm_outage_alert_seconds=_integer(
+            runtime.get("llm_outage_alert_seconds", 300),
+            "runtime.llm_outage_alert_seconds",
+        ),
+        shutdown_timeout_seconds=_integer(
+            runtime.get("shutdown_timeout_seconds", 30),
+            "runtime.shutdown_timeout_seconds",
+        ),
     )
+    for key in (
+        "queue_capacity",
+        "memory_limit_mb",
+        "retention_days",
+        "retention_cap",
+        "corpus_limit",
+        "retry_limit",
+        "retry_ttl_seconds",
+        "failure_alert_threshold",
+        "llm_outage_alert_seconds",
+        "shutdown_timeout_seconds",
+    ):
+        if getattr(config, key) <= 0:
+            raise ConfigurationError(f"{key} must be positive")
+    if config.cold_start_documents < 0:
+        raise ConfigurationError("pipeline.cold_start_documents must be nonnegative")
+    if config.bm25_k1 <= 0:
+        raise ConfigurationError("pipeline.bm25_k1 must be positive")
+    if not 0 <= config.bm25_b <= 1:
+        raise ConfigurationError("pipeline.bm25_b must be between 0 and 1")
+    for key in ("state_path", "state_media_path"):
+        if not getattr(config, key).strip():
+            raise ConfigurationError(f"{key} must be nonempty")
+    for source in sources:
+        if source.factory == "promo_bot.sources.pelando:create_pelando_source":
+            for key in (
+                "interval_seconds",
+                "timeout_seconds",
+                "detail_failure_ttl_seconds",
+            ):
+                if (
+                    key in source.settings
+                    and _number(source.settings[key], f"source {source.name}.{key}")
+                    <= 0
+                ):
+                    raise ConfigurationError(
+                        f"source {source.name}.{key} must be positive"
+                    )
+            for key in ("detail_concurrency", "detail_cache_size"):
+                if (
+                    key in source.settings
+                    and _integer(source.settings[key], f"source {source.name}.{key}")
+                    <= 0
+                ):
+                    raise ConfigurationError(
+                        f"source {source.name}.{key} must be positive"
+                    )
+        elif source.factory == "promo_bot.sources.telegram:create_telegram_source":
+            chat_ids = source.settings.get("chat_ids", [])
+            if not isinstance(chat_ids, list) or any(
+                isinstance(value, bool) or not isinstance(value, int) or value == 0
+                for value in chat_ids
+            ):
+                raise ConfigurationError(
+                    f"source {source.name}.chat_ids must be a list of nonzero integers"
+                )
+    if config.sink_factory == "promo_bot.sink:create_telegram_sink":
+        for key in ("timeout_seconds", "media_timeout_seconds"):
+            if (
+                key in config.sink
+                and _number(config.sink[key], f"sink.settings.{key}") <= 0
+            ):
+                raise ConfigurationError(f"sink.settings.{key} must be positive")
+        if (
+            "media_max_bytes" in config.sink
+            and _integer(
+                config.sink["media_max_bytes"], "sink.settings.media_max_bytes"
+            )
+            <= 0
+        ):
+            raise ConfigurationError("sink.settings.media_max_bytes must be positive")
+    return config
 
 
 def env_secret(name: str) -> str:
@@ -446,6 +648,43 @@ def env_secret(name: str) -> str:
     if not value:
         raise ConfigurationError(f"required environment variable {name} is not set")
     return value
+
+
+def validate_runtime_config(config: AppConfig) -> None:
+    """Check startup requirements before opening databases or network clients."""
+    if not any(source.enabled for source in config.sources):
+        raise ConfigurationError(
+            "no enabled promotion sources; enable Telegram or Pelando"
+        )
+    env_secret(str(config.gemini["api_key_env"]))
+    if config.sink_factory == "promo_bot.sink:create_telegram_sink":
+        env_secret(str(config.sink.get("token_env", "TELEGRAM_BOT_TOKEN")))
+    numeric_variables = []
+    if config.preferences.enabled:
+        env_secret(config.preferences.token_env)
+        numeric_variables.append(config.preferences.admin_telegram_user_id_env)
+    for source in config.sources:
+        if source.enabled:
+            load_factory(source.factory)
+            if source.factory == "promo_bot.sources.telegram:create_telegram_source":
+                numeric_variables.append(
+                    str(source.settings.get("api_id_env", "TELEGRAM_API_ID"))
+                )
+                env_secret(
+                    str(source.settings.get("api_hash_env", "TELEGRAM_API_HASH"))
+                )
+    for name in numeric_variables:
+        value = env_secret(name)
+        try:
+            valid = int(value) > 0
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ConfigurationError(
+                f"environment variable {name} must be a positive integer"
+            )
+    load_factory(config.evaluator_factory)
+    load_factory(config.sink_factory)
 
 
 def load_factory(path: str) -> Callable[..., Any]:

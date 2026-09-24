@@ -2,10 +2,16 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 .venv/
 .env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
 /config/config.local.yaml
 /compose.override.yaml
 state/

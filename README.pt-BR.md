@@ -306,39 +306,65 @@ O Sieve usa duas identidades diferentes:
 Copy-Item .env.example .env
 ```
 
-Preencha `.env` apenas com as credenciais das integrações que pretende ativar. Depois edite
-`config/config.yaml`: configure perfil, aliases, regras e, opcionalmente, os `chat_ids` iniciais,
-`preferences.admin_telegram_user_id_env` e preferências; ative explicitamente somente as fontes,
-a avaliação Gemini e o bot de preferências que pretende usar. A configuração rastreada começa com
-todas as integrações externas desativadas. Nunca faça commit de tokens, chaves, estado SQLite ou
-arquivos de sessão do Telegram.
+Preencha `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN` e `TELEGRAM_ADMIN_USER_ID` em `.env`.
+O exemplo ativa o Pelando e o bot privado de preferências. A leitura de grupos do Telegram é
+opcional e também exige `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` e o login abaixo.
+
+As opções comuns ficam em `.env`: `SIEVE_GEMINI_MODEL`, `SIEVE_GEMINI_EVALUATION_ENABLED`,
+`SIEVE_BM25_THRESHOLD`, `SIEVE_BM25_AUTO_FORWARD_THRESHOLD`, `SIEVE_BM25_AUTO_FORWARD_MODE`,
+`SIEVE_PELANDO_ENABLED`, `SIEVE_TELEGRAM_ENABLED`, `SIEVE_PREFERENCES_ENABLED` e `SIEVE_LOG_LEVEL`.
+Limites avançados, aliases/regras iniciais e os `chat_ids` opcionais ficam em `config/config.yaml`.
+Sem variáveis de ambiente, o YAML mantém fontes e preferências desativadas. Nunca faça commit
+de tokens, chaves, estado SQLite ou arquivos de sessão do Telegram.
+
+Para usar uma cópia local completa, copie o YAML para `config/config.local.yaml` e defina
+`SIEVE_CONFIG_FILE=./config/config.local.yaml` em `.env`. O Compose monta esse arquivo somente
+para leitura. Valores completos aceitam `${VARIAVEL:-padrao}`: o padrão define o tipo, e padrões
+textuais preservam strings como `off`. `${VARIAVEL}` exige uma variável não vazia. Credenciais
+continuam referenciadas por nomes de variáveis em campos `*_env`.
 
 ### 2. Login único da conta que lê grupos
 
-No PowerShell, execute o comando interativo:
+Pule esta etapa se usar apenas Pelando. Para ler grupos, execute no PowerShell:
 
 ```powershell
+docker compose build sieve
 docker compose run --rm -it sieve --config /app/config/config.yaml `
   auth-telegram --source telegram-principal
 ```
 
 Escaneie o QR code em **Telegram → Configurações → Dispositivos → Conectar Desktop**. Somente a
-senha de 2FA pode ser solicitada. O bot de entrega usa `TELEGRAM_BOT_TOKEN` diretamente.
+senha de 2FA pode ser solicitada. Depois defina `SIEVE_TELEGRAM_ENABLED=true` em `.env`.
+O bot de entrega usa `TELEGRAM_BOT_TOKEN` diretamente.
 
 ### 3. Validar e iniciar
 
 ```powershell
-docker compose config
-docker compose run --rm sieve --config /app/config/config.yaml validate-config
-docker compose up -d --build
+docker compose config --quiet
+docker compose build sieve
+docker compose run --rm sieve validate-config --runtime
+docker compose up -d --wait
 docker compose logs -f sieve
 ```
 
-Se ativou o bot de preferências, abra a conversa privada com ele e envie `/start`.
+Abra a conversa privada com o bot, envie `/start` e descreva os produtos que deseja acompanhar.
+Após mudar `.env` ou YAML, execute `docker compose up -d --force-recreate --wait`; não é necessário
+reconstruir a imagem. Preferências já salvas no SQLite continuam sendo alteradas pelo bot.
 
 Os logs JSON informam componente, tipo da exceção, status/código do provedor, falhas consecutivas,
 tempo até nova tentativa e decisão de alerta sem registrar corpos de mensagens, contatos, tokens do
 Telegram, usernames ou nomes de exibição.
+
+Para investigar problemas, use `docker compose ps`, `docker compose exec sieve health` e
+`docker compose logs --since 10m sieve`. Para mais detalhes, defina `SIEVE_LOG_LEVEL=DEBUG` e
+recrie o container. `validate-config` verifica o YAML sem credenciais; `--runtime` também verifica
+fontes, factories e variáveis obrigatórias, sem chamadas de API. O encerramento permite 30 segundos
+para processar a fila; `shutdown_queue_timeout` indica processamento incompleto. Entregas e retries
+persistidos continuam disponíveis após reiniciar. O limite do Docker para encerrar é 60 segundos.
+
+Na execução local, exporte as variáveis no shell: Python não carrega `.env` automaticamente.
+Use caminhos graváveis em `state.path`, `state.media_path` e `session_path`. `SIEVE_CONFIG` e
+`SIEVE_LOG_LEVEL` definem os padrões da CLI; flags explícitas têm prioridade.
 
 ## Preferências e persistência
 
@@ -452,12 +478,15 @@ sieve [--config ARQUIVO] [--log-level NÍVEL] run
 sieve [--config ARQUIVO] auth-telegram [--source NOME]
 sieve [--config ARQUIVO] smoke-telegram-preferences [--source NOME] [--session-path CAMINHO] [--timeout SEGUNDOS]
 sieve [--config ARQUIVO] replay FIXTURE [--no-fail]
+sieve [--config ARQUIVO] health
+sieve [--config ARQUIVO] validate-config [--runtime]
 ```
 
 ## Testes
 
 ```powershell
-python -m pip install -e ".[test]"
+python -m pip install -e ".[test,dev]"
+python -m ruff check promo_bot tests
 python -m pytest
 $env:RUN_SOAK="1"; python -m pytest -m soak
 $env:SIEVE_RUN_GEMINI_CONTRACT="1"; $env:GEMINI_API_KEY="..."; python -m pytest -m contract
@@ -471,6 +500,11 @@ contra Gemini; defina também `SIEVE_GEMINI_MODEL` para substituir o modelo padr
 somente a pilha sintética `compose.system.yaml`, credenciais fictícias e um volume SQLite isolado.
 A suíte cobre autorização, idiomas, formatação HTML, offsets, outbox, revisões, parsing estruturado, restrições,
 BM25, reconstruções de aliases, integração e carga.
+
+O Docker instala as versões com hashes verificáveis de `requirements.lock`. Ao alterar
+dependências, regenere o arquivo com `uv pip compile pyproject.toml --python-version 3.12 --universal
+--generate-hashes --no-annotate --no-header --output-file requirements.lock` e execute o gate Docker.
+As regras de desenvolvimento e verificações obrigatórias estão em [`AGENTS.md`](AGENTS.md).
 
 ## Checklist pré-live
 
@@ -493,6 +527,12 @@ ambígua ou mudança de estado encerra o comando com falha. `--timeout` usa 90 s
 aceita de 10 a 300 segundos.
 
 ## Segurança operacional
+
+`auto-deploy.sh` usa o diretório do próprio script e o contexto atual do Docker. No shell ou
+agendador, `SIEVE_REPO_DIR` e `SIEVE_DOCKER_CONTEXT` substituem esses padrões;
+`SIEVE_OTHER_DOCKER_CONTEXT` ativa a verificação de um bot duplicado em outro contexto.
+São variáveis do agendador, não do container. O deploy valida a configuração antes de recriar
+o serviço e recusa alterações em arquivos rastreados.
 
 - chat e remetente precisam corresponder ao UUID ativo antes de qualquer chamada ao Gemini;
 - somente um administrador ativo pode convidar, listar, desabilitar ou reabilitar membros;

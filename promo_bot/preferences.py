@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import threading
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -875,20 +875,3 @@ def changed_entry_count(first: PreferenceSnapshot, second: PreferenceSnapshot) -
         entry.id: (entry.kind.value, thaw(entry.data)) for entry in second.entries
     }
     return sum(left.get(key) != right.get(key) for key in left.keys() | right.keys())
-
-
-def iter_entry_lines(snapshot: PreferenceSnapshot) -> Iterator[str]:
-    for entry in snapshot.entries:
-        if entry.kind == PreferenceKind.BASELINE_NOTE:
-            label = str(entry.data["text"]).splitlines()[0][:80]
-        elif entry.kind == PreferenceKind.INTEREST:
-            label = f"{entry.data['name']} ({entry.data['importance']}/100)"
-        elif entry.kind == PreferenceKind.EXCLUSION:
-            label = ", ".join(entry.data["terms"])
-        elif entry.kind == PreferenceKind.CONTEXT:
-            label = str(entry.data["text"])
-        elif entry.kind == PreferenceKind.ALIAS:
-            label = f"{entry.data['canonical']} = {', '.join(entry.data['synonyms'])}"
-        else:
-            label = f"{entry.data['rule_id']} ({entry.data['action']})"
-        yield f"[{entry.id}] {entry.kind.value}: {label}"

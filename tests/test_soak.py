@@ -109,3 +109,23 @@ async def test_500_preferences_10k_alias_rebuild_and_command_flood_stay_bounded(
     assert peak < 220 * 1024 * 1024
     assert not rss or rss < 220 * 1024 * 1024
     state.close()
+
+
+@pytest.mark.soak
+@pytest.mark.skipif(os.environ.get("RUN_SOAK") != "1", reason="set RUN_SOAK=1")
+def test_alias_corpus_cache_stays_bounded_under_query_churn(tmp_path) -> None:
+    state = SQLiteStateStore(tmp_path / "cache-soak.db", corpus_limit=1000)
+    for document in range(1000):
+        state.add_corpus_document(["ssd", "nvme", str(document)])
+    tracemalloc.start()
+    for query in range(64):
+        terms = ["storage", *(f"missing-{query}-{term}" for term in range(100))]
+        size, _, frequencies = state.corpus_stats_for_aliases(terms, {"storage": ["ssd"]})
+        assert size == 1000
+        assert frequencies["storage"] == 1000
+        state.add_corpus_document(["ssd", str(query)])
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert len(state._corpus_stats_cache) <= 16
+    assert peak < 10 * 1024 * 1024
+    state.close()

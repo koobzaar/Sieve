@@ -1,7 +1,8 @@
-.env
+.env*
 .git
 .venv
 .pytest_cache
+.ruff_cache
 __pycache__
 *.egg-info
 *.pyc
@@ -9,7 +10,10 @@ __pycache__
 *.db-shm
 *.db-wal
 *.session
+*.session-journal
 tests
 state
-config/config.yaml
 config/config.local.yaml
+assets
+fixtures
+AGENTS.md
