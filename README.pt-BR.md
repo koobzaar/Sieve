@@ -467,7 +467,7 @@ $env:SIEVE_RUN_SYSTEM="1"; python -m pytest -m system
 Por padrão, os testes usam HTTP falso, relógios determinísticos e bancos temporários e não chamam
 serviços reais. Os gates `contract` e `system` são opcionais. O primeiro valida o schema exato
 contra Gemini; defina também `SIEVE_GEMINI_MODEL` para substituir o modelo padrão
-`gemini-3.1-flash-lite`. O segundo exige o daemon do Docker, constrói a imagem de produção e usa
+`gemini-3.5-flash-lite`. O segundo exige o daemon do Docker, constrói a imagem de produção e usa
 somente a pilha sintética `compose.system.yaml`, credenciais fictícias e um volume SQLite isolado.
 A suíte cobre autorização, idiomas, formatação HTML, offsets, outbox, revisões, parsing estruturado, restrições,
 BM25, reconstruções de aliases, integração e carga.

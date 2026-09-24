@@ -602,7 +602,7 @@ SIEVE_RUN_SYSTEM=1 .venv/bin/python -m pytest -m system
 ```
 
 Set `SIEVE_GEMINI_MODEL` to override the contract test's default
-`gemini-3.1-flash-lite` model. The Docker gate requires a running Docker daemon. It builds the
+`gemini-3.5-flash-lite` model. The Docker gate requires a running Docker daemon. It builds the
 production image, starts only the synthetic `compose.system.yaml` stack with dummy credentials,
 and removes its isolated SQLite volume unconditionally.
 

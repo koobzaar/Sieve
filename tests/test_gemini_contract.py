@@ -20,7 +20,7 @@ pytestmark = pytest.mark.contract
 async def test_exact_interpreter_schema_is_accepted_by_configured_model() -> None:
     interpreter = GeminiPreferenceInterpreter(
         api_key=os.environ["GEMINI_API_KEY"],
-        model=os.environ.get("SIEVE_GEMINI_MODEL", "gemini-3.1-flash-lite"),
+        model=os.environ.get("SIEVE_GEMINI_MODEL", "gemini-3.5-flash-lite"),
         retries=1,
     )
     try:
