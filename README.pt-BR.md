@@ -368,6 +368,12 @@ Use caminhos graváveis em `state.path`, `state.media_path` e `session_path`. `S
 
 ## Preferências e persistência
 
+Ofertas excepcionais ficam **desativadas por padrão** para cada usuário, inclusive usuários
+existentes sem uma escolha salva. No menu **Configurações de ofertas**, cada usuário pode ativar
+ou desativar a opção; escolhas explícitas persistem após atualizações e reinícios. Quando desativada,
+ofertas quentes, grandes descontos e erros de preço precisam passar pela filtragem normal de
+interesses. Sem interesses salvos, o usuário não recebe promoções até ativar ofertas excepcionais.
+
 No primeiro início de um banco novo, um perfil YAML não vazio vira uma nota-base sem perda, e
 aliases e regras viram entradas individuais na revisão zero. A partir daí, SQLite é autoritativo;
 o YAML não é reimportado automaticamente. Excluir o banco de preferências é o único caminho de

@@ -254,28 +254,33 @@ async def test_disabled_user_is_not_evaluated_or_delivered(tmp_path) -> None:
     state.close()
 
 
-async def test_exceptional_setting_defaults_on_and_persists_across_restart(
+async def test_exceptional_setting_defaults_off_and_opt_in_persists_across_restart(
     tmp_path,
 ) -> None:
     path = tmp_path / "state.db"
     state = SQLiteStateStore(path)
     admin = state.bootstrap_admin(telegram_user_id=101, telegram_chat_id=201)
-    assert state.exceptional_offers_enabled(admin.id) is True
-    assert state.set_exceptional_offers_enabled(admin.id, False) is False
+    assert state.exceptional_offers_enabled(admin.id) is False
+    assert state.set_exceptional_offers_enabled(admin.id, True) is True
     state.close()
 
     reopened = SQLiteStateStore(path)
-    assert reopened.exceptional_offers_enabled(admin.id) is False
+    assert reopened.exceptional_offers_enabled(admin.id) is True
+    reopened.set_exceptional_offers_enabled(admin.id, False)
     reopened.close()
 
+    disabled = SQLiteStateStore(path)
+    assert disabled.exceptional_offers_enabled(admin.id) is False
+    disabled.close()
 
-async def test_disabled_exceptional_offer_uses_normal_interest_filtering(
+
+async def test_exceptional_offer_uses_normal_interest_filtering_by_default(
     tmp_path,
 ) -> None:
     state, admin, member, stores, evaluator, multi = setup(tmp_path)
     state.disable_user(admin.id, member.id)
     add_interest(stores[admin.id], admin.telegram_user_id, "ssd")
-    state.set_exceptional_offers_enabled(admin.id, False)
+    assert state.exceptional_offers_enabled(admin.id) is False
 
     matching = await multi.process(
         Promotion(
@@ -300,6 +305,21 @@ async def test_disabled_exceptional_offer_uses_normal_interest_filtering(
     assert unrelated[admin.id].stage == "interest_admission"
     assert len(evaluator.calls) == 1
     assert [job.promotion.id for job in state.due_deliveries()] == ["hot-ssd"]
+    state.close()
+
+
+async def test_only_opted_in_user_receives_exceptional_offer_without_interests(tmp_path):
+    state, admin, member, _, evaluator, multi = setup(tmp_path)
+    state.set_exceptional_offers_enabled(member.id, True)
+    results = await multi.process(
+        Promotion(id="hot-pan", source="pelando", title="Jogo de panelas", temperature=500)
+    )
+    assert results[admin.id].decision == Decision.DISCARD
+    assert results[admin.id].stage == "idle"
+    assert results[member.id].decision == Decision.FORWARD
+    assert results[member.id].stage == "exceptional"
+    assert evaluator.calls == []
+    assert [job.user_id for job in state.due_deliveries()] == [member.id]
     state.close()
 
 

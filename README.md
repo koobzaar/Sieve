@@ -468,6 +468,12 @@ it does not grow the retry backlog.
 
 ### Live preference commands
 
+Exceptional offers are **disabled by default** for every user, including existing users without
+a saved choice. In the bot's **Offer settings** menu, each user can enable or disable them;
+explicitly saved choices survive upgrades and restarts. When disabled, hot deals, large discounts
+and price-error offers must pass normal interest filtering. A user without saved interests receives
+no promotions unless they explicitly enable exceptional offers.
+
 On the first startup for a database, Sieve imports a nonblank YAML profile losslessly as a baseline
 note and imports each alias and hard rule as its own revision-zero entry. It never imports YAML
 again for that database; deleting the preference database is the automatic reseed path. During an

@@ -75,7 +75,7 @@ FROM users u LEFT JOIN user_locales l ON l.user_id=u.id;
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status, role, created_at);
 CREATE TABLE IF NOT EXISTS user_delivery_settings (
     user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    exceptional_offers_enabled INTEGER NOT NULL DEFAULT 1
+    exceptional_offers_enabled INTEGER NOT NULL DEFAULT 0
         CHECK(exceptional_offers_enabled IN (0,1)),
     updated_at REAL NOT NULL
 );
@@ -668,7 +668,7 @@ class SQLiteStateStore:
             ]
 
     def exceptional_offers_enabled(self, user_id: str) -> bool:
-        """Return the per-user exceptional-delivery policy, defaulting to enabled."""
+        """Return the per-user exceptional-delivery policy, disabled until opted in."""
         with self._lock:
             row = self._connection.execute(
                 "SELECT exceptional_offers_enabled FROM user_delivery_settings "
@@ -681,7 +681,7 @@ class SQLiteStateStore:
                 ).fetchone()
                 if exists is None:
                     raise StoreError("unknown user UUID")
-                return True
+                return False
             return bool(row["exceptional_offers_enabled"])
 
     def set_exceptional_offers_enabled(

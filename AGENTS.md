@@ -44,6 +44,8 @@ Copy `.env.example` to `.env` for local secrets. Never commit `.env`, Telegram s
 
 ## Performance, Lifecycle and Verification
 
+- Exceptional-offer recommendations are opt-in per user: missing delivery settings mean disabled. Preserve explicit saved choices across upgrades and restarts; never enable the exceptional bypass by default for a user. Keep the Offer settings menu and behavioral tests consistent with this policy.
+
 - Preserve BM25 scores and per-user alias isolation when optimizing. Count document frequency once per document. Stream corpus rebuilds, keep caches bounded, key them by query and alias content, and maintain cached aggregates during insertion, eviction and transaction rollback. The runtime uses one state-store writer per database; do not share a state volume across bot instances.
 - Supervise long-lived workers, treat unexpected exit/cancellation as a service failure, cancel and await child tasks, and bound shutdown queue draining. Durable delivery/retry queues must survive restart. Close resources even if asynchronous startup fails.
 - Remove helpers only after checking Python references, YAML factory paths, protocols and framework callbacks. Static unused-code reports alone do not prove a dynamically invoked function is dead.

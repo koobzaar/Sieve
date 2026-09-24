@@ -223,22 +223,22 @@ async def test_each_user_can_toggle_exceptional_offers_from_offer_settings(
     )
     member_store = SQLitePreferenceStore(state, user_id=member.id)
     screen = member_store.next_outbox()[-1]
-    assert "Exceptional offers: enabled" in screen.text
+    assert "Exceptional offers: disabled" in screen.text
     assert screen.operation == "edit"
     assert screen.reply_markup["inline_keyboard"][0][0]["callback_data"] == (
-        "pref:offers:disable"
+        "pref:offers:enable"
     )
 
     await processor.process_update(
-        callback_update(3, 102, 202, "pref:offers:disable")
+        callback_update(3, 102, 202, "pref:offers:enable")
     )
     changed = member_store.next_outbox()[-1]
-    assert state.exceptional_offers_enabled(member.id) is False
-    assert "Exceptional offers: disabled" in changed.text
-    assert state.exceptional_offers_enabled(admin.id) is True
+    assert state.exceptional_offers_enabled(member.id) is True
+    assert "Exceptional offers: enabled" in changed.text
+    assert state.exceptional_offers_enabled(admin.id) is False
 
     await processor.process_update(
-        callback_update(4, 102, 202, "pref:offers:enable")
+        callback_update(4, 102, 202, "pref:offers:disable")
     )
-    assert state.exceptional_offers_enabled(member.id) is True
+    assert state.exceptional_offers_enabled(member.id) is False
     state.close()
